@@ -1,145 +1,252 @@
-import os, math, time, json, torch, numpy as np
-import pandas as pd
+import torch
+import torch.nn as nn
 from torch.utils.data import DataLoader
 from torch.optim import AdamW
-from typing import Dict, List
-from .dataset import MultiModalTS
-from .models_tcn import TemporalConvNet
+import pandas as pd
+import numpy as np
+import os
+from pathlib import Path
+
+# Import our refactored components
 from .models_tst import TSTLite
-from .losses import mse_direction_sharpe
+from .dataset import MultiModalTS
+from .losses import multitask_transformer_loss
 
-def build_model(arch: str, in_feat: int, cfg: Dict):
-    if arch == "tcn":
-        return TemporalConvNet(in_feat, channels=tuple(cfg.get("tcn_channels",[64,128,128])),
-                               kernel=cfg.get("tcn_kernel",3), dropout=cfg.get("dropout",0.1))
-    elif arch == "tst":
-        return TSTLite(in_feat,
-                       d_model=cfg.get("d_model",128),
-                       nhead=cfg.get("nhead",4),
-                       num_layers=cfg.get("num_layers",3),
-                       dropout=cfg.get("dropout",0.1))
+# --- Configuration ---
+
+# TODO: Define your data and feature configuration here
+DATA_PATH = "path/to/your/features.parquet" # Or .csv
+ARTIFACT_DIR = Path("./model_artifacts")
+ARTIFACT_DIR.mkdir(exist_ok=True)
+
+# TODO: Define your feature columns
+FEATURE_BLOCKS = {
+    "price": ['open', 'high', 'low', 'close', 'volume'],
+    "ob": ['ob_imbalance_1s', 'ob_spread', 'ob_depth_ask_1', 'ob_depth_bid_1'],
+    "sent": ['sent_score_1m', 'sent_score_15m'],
+    "onch": ['onch_metric_1', 'onch_metric_2']
+}
+
+# TODO: Define your multi-task label columns
+PRICE_LABEL_COL = "next_return_15m"
+VOL_LABEL_COL = "next_vol_15m" #
+
+# --- Model & Training Hyperparameters ---
+SEQ_LEN = 60
+BATCH_SIZE = 64
+EPOCHS = 50
+LR = 1e-4
+DEVICE = 'cuda' if torch.cuda.is_available() else 'cpu'
+
+# Model parameters
+D_MODEL = 128
+NHEAD = 4
+NUM_LAYERS = 3
+DROPOUT = 0.1
+
+# Loss parameters [cite: 174-175, 180-181]
+PRICE_LOSS_PARAMS = {'alpha': 0.5, 'beta': 0.2, 'lam': 0.1}
+VOL_WEIGHT = 0.2 # Weight for the volatility task in the total loss
+
+class EarlyStopping:
+    """Utility to stop training when validation loss stops improving."""
+    def __init__(self, patience=5, min_delta=0, checkpoint_path='best_model.pth'):
+        self.patience = patience
+        self.min_delta = min_delta
+        self.counter = 0
+        self.best_loss = np.inf
+        self.early_stop = False
+        self.checkpoint_path = checkpoint_path
+
+    def __call__(self, val_loss, model):
+        if val_loss < self.best_loss - self.min_delta:
+            self.best_loss = val_loss
+            self.counter = 0
+            print(f"New best model found with val_loss {self.best_loss:.4f}. Saving...")
+            torch.save(model.state_dict(), self.checkpoint_path)
+        else:
+            self.counter += 1
+            if self.counter >= self.patience:
+                print("Early stopping.")
+                self.early_stop = True
+
+def train_one_epoch(model, loader, optimizer, device, price_loss_params, vol_weight):
+    model.train()
+    total_loss_epoch = 0
+    price_loss_epoch = 0
+    vol_loss_epoch = 0
+
+    for x, y_dict in loader:
+        x = x.to(device)
+        y_dict = {k: v.to(device) for k, v in y_dict.items()}
+
+        # Zero gradients
+        optimizer.zero_grad()
+
+        # Forward pass
+        pred_dict = model(x)
+
+        # Calculate loss
+        loss_components = multitask_transformer_loss(
+            pred_dict,
+            y_dict,
+            price_loss_params,
+            vol_weight
+        )
+        
+        loss = loss_components['total_loss']
+        
+        # Backward pass and optimize
+        loss.backward()
+        optimizer.step()
+
+        total_loss_epoch += loss.item()
+        price_loss_epoch += loss_components['price_loss'].item()
+        vol_loss_epoch += loss_components['vol_loss'].item()
+
+    avg_total_loss = total_loss_epoch / len(loader)
+    avg_price_loss = price_loss_epoch / len(loader)
+    avg_vol_loss = vol_loss_epoch / len(loader)
+    return avg_total_loss, avg_price_loss, avg_vol_loss
+
+def validate(model, loader, device, price_loss_params, vol_weight):
+    model.eval()
+    total_loss_epoch = 0
+    price_loss_epoch = 0
+    vol_loss_epoch = 0
+
+    with torch.no_grad():
+        for x, y_dict in loader:
+            x = x.to(device)
+            y_dict = {k: v.to(device) for k, v in y_dict.items()}
+
+            # Forward pass
+            pred_dict = model(x)
+
+            # Calculate loss
+            loss_components = multitask_transformer_loss(
+                pred_dict,
+                y_dict,
+                price_loss_params,
+                vol_weight
+            )
+            
+            total_loss_epoch += loss_components['total_loss'].item()
+            price_loss_epoch += loss_components['price_loss'].item()
+            vol_loss_epoch += loss_components['vol_loss'].item()
+
+    avg_total_loss = total_loss_epoch / len(loader)
+    avg_price_loss = price_loss_epoch / len(loader)
+    avg_vol_loss = vol_loss_epoch / len(loader)
+    return avg_total_loss, avg_price_loss, avg_vol_loss
+
+def run_training():
+    print(f"Using device: {DEVICE}")
+
+    # --- 1. Load Data ---
+    # TODO: Load your data into a pandas DataFrame
+    # This is just a placeholder, replace with your data loading
+    if not os.path.exists(DATA_PATH):
+        print(f"Warning: Data file not found at {DATA_PATH}. Using placeholder data.")
+        # Create a mock dataframe
+        T = 5000 # 5000 time steps
+        all_features = [col for cols in FEATURE_BLOCKS.values() for col in cols]
+        data = pd.DataFrame(
+            np.random.randn(T, len(all_features)),
+            columns=all_features
+        )
+        data[PRICE_LABEL_COL] = np.random.randn(T)
+        data[VOL_LABEL_COL] = np.random.rand(T)
     else:
-        raise ValueError("arch must be 'tcn' or 'tst'")
+        print(f"Loading data from {DATA_PATH}...")
+        # Assuming parquet, use read_csv if needed
+        data = pd.read_parquet(DATA_PATH) 
 
-def train_one(df: pd.DataFrame, feature_blocks: Dict[str,List[str]], label_col: str, out_dir: str,
-              arch="tst", seq_len=60, batch_size=256, epochs=20, lr=1e-3, 
-              val_split_pct: float = 0.1, device=None, cfg:Dict=None):
-    
-    os.makedirs(out_dir, exist_ok=True)
-    device = device or ("cuda" if torch.cuda.is_available() else "cpu")
-    print(f"Using device: {device}")
-    cfg = cfg or {}
+    # --- 2. Split and Create Datasets ---
+    # Simple time-series split
+    val_split = int(len(data) * 0.8)
+    train_df = data.iloc[:val_split]
+    val_df = data.iloc[val_split:]
 
-    # --- 1. SEQUENTIAL DATA SPLIT (FIXED) ---
-    # We split the DataFrame itself, not the Dataset object, to respect time.
-    n_total = len(df)
-    n_val = int(n_total * val_split_pct)
-    n_train = n_total - n_val
+    print(f"Train samples: {len(train_df)}, Validation samples: {len(val_df)}")
 
-    if n_train <= 0 or n_val <= 0:
-        raise ValueError(f"Not enough data for train/val split. Total rows: {n_total}, Val split: {val_split_pct}")
+    train_ds = MultiModalTS(
+        df=train_df,
+        feature_blocks=FEATURE_BLOCKS,
+        label_col=PRICE_LABEL_COL,
+        vol_label_col=VOL_LABEL_COL, # <-- New multi-task target
+        seq_len=SEQ_LEN
+    )
 
-    train_df = df.iloc[:n_train]
-    val_df = df.iloc[n_train:]
-    print(f"Data split: Total={n_total}, Train={len(train_df)}, Val={len(val_df)}")
+    val_ds = MultiModalTS(
+        df=val_df,
+        feature_blocks=FEATURE_BLOCKS,
+        label_col=PRICE_LABEL_COL,
+        vol_label_col=VOL_LABEL_COL, # <-- New multi-task target
+        seq_len=SEQ_LEN
+    )
 
-    # --- 2. CREATE DATASET OBJECTS (using new dataset.py) ---
-    train_ds = MultiModalTS(train_df, feature_blocks, label_col, seq_len=seq_len)
-    val_ds = MultiModalTS(val_df, feature_blocks, label_col, seq_len=seq_len)
-
-    if len(train_ds) == 0 or len(val_ds) == 0:
-        raise ValueError(f"Created datasets have 0 length. Check seq_len ({seq_len}) and data.")
-
-    # --- 3. NORMALIZATION (FIXED) ---
-    # Fit scaler ONLY on training data
-    print("Fitting scaler on training data...")
+    # --- 3. Apply Normalization --- 
+    print("Applying feature scaler...")
     mean, std = train_ds.fit_scaler()
-    
-    # Save the scaler for inference
-    scaler_path = os.path.join(out_dir, "scaler.pt")
-    torch.save({"mean": mean, "std": std}, scaler_path)
-    print(f"Scaler saved to {scaler_path}")
-
-    # Apply the fitted scaler to both train and val datasets
     train_ds.apply_scaler(mean, std)
     val_ds.apply_scaler(mean, std)
     
-    # Get input feature count *after* creating the dataset
-    in_feat = train_ds.X.shape[1] 
+    # Save the scaler
+    scaler_path = ARTIFACT_DIR / "tst_scaler.npz"
+    np.savez(scaler_path, mean=mean, std=std)
+    print(f"Scaler saved to {scaler_path}")
 
-    # --- 4. CREATE DATALOADERS ---
-    # We can now safely shuffle the training loader
-    train_loader = DataLoader(train_ds, batch_size=batch_size, shuffle=True, num_workers=2, drop_last=True, pin_memory=True)
-    val_loader   = DataLoader(val_ds,   batch_size=batch_size, shuffle=False, num_workers=2, drop_last=False, pin_memory=True)
 
-    # --- 5. MODEL, OPTIMIZER, SCALER ---
-    model = build_model(arch, in_feat, cfg).to(device)
-    opt = AdamW(model.parameters(), lr=lr, weight_decay=cfg.get("weight_decay",1e-4))
-    scaler = torch.cuda.amp.GradScaler(enabled=(device=="cuda"))
+    # --- 4. Create DataLoaders ---
+    train_loader = DataLoader(train_ds, batch_size=BATCH_SIZE, shuffle=True, num_workers=4)
+    val_loader = DataLoader(val_ds, batch_size=BATCH_SIZE, shuffle=False, num_workers=4)
 
-    best_val = math.inf
-    patience = cfg.get("patience", 4)
-    no_improve = 0
-    ckpt_path = os.path.join(out_dir, f"{arch}_best.pt")
+    # --- 5. Initialize Model ---
+    # Get feature dimension from dataset
+    in_feat = train_ds.X.shape[1]
+    
+    print(f"Initializing TSTLite model with {in_feat} input features.")
+    
+    model = TSTLite(
+        in_feat=in_feat,
+        seq_len=SEQ_LEN, # <-- Pass seq_len for Positional Encoding
+        d_model=D_MODEL,
+        nhead=NHEAD,
+        num_layers=NUM_LAYERS,
+        dropout=DROPOUT
+    ).to(DEVICE)
 
-    print(f"Starting training for {epochs} epochs...")
-    # --- 6. TRAINING LOOP (Unchanged) ---
-    for epoch in range(1, epochs+1):
-        model.train()
-        tr_loss = 0.0
-        t_start = time.time()
+    optimizer = AdamW(model.parameters(), lr=LR)
+    
+    early_stopper = EarlyStopping(
+        patience=10, 
+        checkpoint_path=ARTIFACT_DIR / "tst_best_model.pth"
+    )
+
+    # --- 6. Training Loop ---
+    print("Starting training...")
+    for epoch in range(1, EPOCHS + 1):
+        train_loss, train_price_loss, train_vol_loss = train_one_epoch(
+            model, train_loader, optimizer, DEVICE, PRICE_LOSS_PARAMS, VOL_WEIGHT
+        )
         
-        for xb, yb in train_loader:
-            xb, yb = xb.to(device, non_blocking=True), yb.to(device, non_blocking=True)
-            opt.zero_grad(set_to_none=True)
-            with torch.cuda.amp.autocast(enabled=(device=="cuda")):
-                pred = model(xb)
-                loss = mse_direction_sharpe(pred, yb, alpha=cfg.get("alpha",0.5),
-                                            beta=cfg.get("beta",0.2), lam=cfg.get("lam",0.1))
-            scaler.scale(loss).backward()
-            torch.nn.utils.clip_grad_norm_(model.parameters(), cfg.get("grad_clip", 1.0))
-            scaler.step(opt); scaler.update()
-            tr_loss += loss.item() * xb.size(0)
+        val_loss, val_price_loss, val_vol_loss = validate(
+            model, val_loader, DEVICE, PRICE_LOSS_PARAMS, VOL_WEIGHT
+        )
 
-        # Validate
-        model.eval()
-        vl_loss, pnl = 0.0, []
-        with torch.no_grad():
-            for xb, yb in val_loader:
-                xb, yb = xb.to(device, non_blocking=True), yb.to(device, non_blocking=True)
-                with torch.cuda.amp.autocast(enabled=(device=="cuda")):
-                    pred = model(xb)
-                    loss = mse_direction_sharpe(pred, yb, alpha=cfg.get("alpha",0.5),
-                                                beta=cfg.get("beta",0.2), lam=cfg.get("lam",0.1))
-                vl_loss += loss.item() * xb.size(0)
-                pnl.append((pred*yb).detach().cpu().numpy())
-        
-        tr_loss /= len(train_ds); vl_loss /= len(val_ds)
-        pnl = np.concatenate(pnl) if len(pnl) > 0 else np.asarray([0.0])
-        val_sharpe = float(pnl.mean() / (pnl.std()+1e-6))
-        
-        epoch_time = time.time() - t_start
+        print(f"--- Epoch {epoch}/{EPOCHS} ---")
+        print(f"  Train Loss: {train_loss:.4f} | Val Loss: {val_loss:.4f}")
+        print(f"  Train Price Loss: {train_price_loss:.4f} | Val Price Loss: {val_price_loss:.4f}")
+        print(f"  Train Vol Loss:   {train_vol_loss:.4f} | Val Vol Loss:   {val_vol_loss:.4f}")
+        print("-" * (17 + len(str(epoch)) + len(str(EPOCHS))))
 
-        print(f"Epoch {epoch:02d}/{epochs} | Time: {epoch_time:.1f}s | TrainLoss: {tr_loss:.4f} | ValLoss: {vl_loss:.4f} | ValSharpe: {val_sharpe:.4f}")
-
-        # checkpoint on improvement (by loss)
-        if vl_loss + 1e-9 < best_val:
-            best_val = vl_loss; no_improve = 0
-            torch.save({"model": model.state_dict(),
-                        "cfg": {"arch":arch, "in_feat":in_feat, **cfg}}, ckpt_path)
-            print(f"  -> New best val_loss: {best_val:.4f}. Checkpoint saved.")
-        else:
-            no_improve += 1
-
-        # simple early stopping
-        if no_improve >= patience:
-            print(f"Early stopping at epoch {epoch} due to no improvement for {patience} epochs.")
+        early_stopper(val_loss, model)
+        if early_stopper.early_stop:
             break
 
-        # write epoch log
-        with open(os.path.join(out_dir, "train_log.jsonl"), "a") as f:
-            f.write(json.dumps({"epoch":epoch, "train_loss":tr_loss, "val_loss":vl_loss,
-                                "val_sharpe":val_sharpe, "best_val":best_val}) + "\n")
+    print("Training complete.")
+    print(f"Best model saved to {early_stopper.checkpoint_path}")
 
-    print(f"Training complete. Best model saved to {ckpt_path}")
-    return ckpt_path
+if __name__ == "__main__":
+    run_training()

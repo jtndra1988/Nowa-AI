@@ -6,14 +6,16 @@ from typing import Dict, List, Tuple
 
 class MultiModalTS(Dataset):
     """
-    Windowed time-series dataset with optional order-book, sentiment, on-chain features.
-    Expects a single aligned DataFrame (already joined on timestamp) with columns:
+    Windowed time-series dataset, updated for multi-task learning.
+    
+    Now expects a single aligned DataFrame with columns:
       - price features: open, high, low, close, volume, etc.
-      - ob_* for order-book derived features (e.g., ob_imbalance_1s, ob_spread, ob_depth_ask_1, ...)
+      - ob_* for order-book derived features
       - sent_* for sentiment/signal fusion features
       - onch_* for on-chain metrics
     Labels:
-      - next_return_{h}: forward return over horizon h (e.g., 5/15/30 mins)
+      - label_col (e.g., next_return_{h}): The main price-related target.
+      - [cite_start]vol_label_col (e.g., next_vol_{h}): The volatility target [cite: 285-287].
     
     NOTE: This dataset stores raw, un-normalized data.
     Use the `fit_scaler` and `apply_scaler` methods in your
@@ -24,12 +26,14 @@ class MultiModalTS(Dataset):
         df: pd.DataFrame,
         feature_blocks: Dict[str, List[str]],
         label_col: str,
+        vol_label_col: str, # <-- NEW: Column name for the volatility target
         seq_len: int = 60,
         target_scaler: float = 1.0,
         dropna: bool = True,
     ):
         self.seq_len = seq_len
         self.label_col = label_col
+        self.vol_label_col = vol_label_col # <-- NEW
         self.target_scaler = target_scaler
 
         if dropna:
@@ -47,10 +51,14 @@ class MultiModalTS(Dataset):
             start = end
 
         self.X = np.concatenate(X_blocks, axis=1)  # [T, F_total]
-        self.y = df[label_col].astype(np.float32).values * target_scaler
-
-        # --- Normalization is REMOVED from __init__ ---
         
+        # --- Multi-Task Labels ---
+        # 1. Price target
+        self.y_price = df[label_col].astype(np.float32).values * target_scaler
+        # 2. Volatility target
+        self.y_vol = df[vol_label_col].astype(np.float32).values
+        # -------------------------
+
         # Store scaler state
         self.mean = None
         self.std = None
@@ -59,13 +67,25 @@ class MultiModalTS(Dataset):
     def __len__(self):
         return max(0, self.X.shape[0] - self.seq_len)
 
-    def __getitem__(self, idx: int) -> Tuple[torch.Tensor, torch.Tensor]:
+    def __getitem__(self, idx: int) -> Tuple[torch.Tensor, Dict[str, torch.Tensor]]:
+        """
+        Returns a tuple of (features, target_dictionary).
+        This matches the multi-task model input and loss function.
+        """
         sl = slice(idx, idx + self.seq_len)
         x = torch.from_numpy(self.X[sl]).float()         # [L, F]
-        y = torch.tensor(self.y[idx + self.seq_len - 1]) # predict at seq end
-        return x, y
-
-    # --- NEW METHODS ---
+        
+        # Get the label index (at the end of the sequence)
+        label_idx = idx + self.seq_len - 1
+        
+        # --- Create target dictionary ---
+        y_dict = {
+            'price': torch.tensor(self.y_price[label_idx]),
+            'vol': torch.tensor(self.y_vol[label_idx])
+        }
+        # --------------------------------
+        
+        return x, y_dict
 
     def fit_scaler(self):
         """

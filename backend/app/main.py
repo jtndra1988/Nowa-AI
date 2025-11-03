@@ -2,11 +2,17 @@ from __future__ import annotations
 
 from fastapi import FastAPI
 from fastapi.middleware.cors import CORSMiddleware
+import logging
+
 from app.api.v1.health import router as health_router
 from app.api.v1.endpoints import router as core_router
 from app.api.v1.predict import router as v1_predict_router
 from app.core.config import settings
 from starlette_exporter import PrometheusMiddleware, handle_metrics  # type: ignore
+
+# --- ADDED: Import our new ML service and DB seeder ---
+from app.services.inference_service import inference_service
+from app.db.database import init_db  # <-- NEW IMPORT
 
 # --- Robust imports so it works with or without the "v1" package layout ---
 try:
@@ -22,13 +28,13 @@ except ImportError:
 
 def create_app() -> FastAPI:
     app = FastAPI(
-        title="ML Trading API",
-        version="1.0.0",
+        title="MARS Bot API",
+        version="2.0.0",
         contact={"name": "Your Team"},
         openapi_tags=[
             {"name": "health", "description": "Liveness & readiness probes"},
             {"name": "core", "description": "Core market/options endpoints"},
-            {"name": "predict", "description": "v1 ML predictions (ensemble + calibration)"},
+            {"name": "predict", "description": "v2 ML predictions (TFT + TCN + XGB Hybrid Ensemble)"},
             {"name": "metrics", "description": "Prometheus metrics"},
             {"name": "risk", "description": "Risk engine health/state/ledger"},
             {"name": "settings", "description": "Risk settings (global & per-symbol)"},
@@ -58,13 +64,25 @@ def create_app() -> FastAPI:
     app.include_router(risk_router, prefix="/api/risk", tags=["risk"])
 
     # Settings router: module already declares prefix="/api/settings" & tags=["settings"]
-    # Include as-is (no extra prefix) to avoid double-nesting.
-    app.include_router(settings_router)
-
-    @app.get("/", tags=["health"])
-    def root():
-        return {"status": "ok", "service": "ml-trading-api"}
+    # Include as-is (no prefix)
+    app.include_router(settings_router) 
 
     return app
 
 app = create_app()
+
+@app.on_event("startup")
+async def startup_event():
+    print("[*] FastAPI startup event: Application is starting...")
+    
+    # --- ADDED: Initialize and seed the database ---
+    print("[*] Initializing database and seeding models...")
+    init_db()
+    
+    # --- This loads all the ML models into memory ---
+    if inference_service is None:
+        logging.critical("CRITICAL: ML Inference Service FAILED to load on startup. Check logs.")
+    else:
+        logging.info("ML Inference Service loaded successfully and is ready.")
+        
+    print("[*] FastAPI startup complete.")

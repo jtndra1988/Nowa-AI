@@ -1,0 +1,92 @@
+groups:
+  - name: trading-core
+    rules:
+      - alert: TargetDown
+        expr: up == 0
+        for: 2m
+        labels: { severity: critical }
+        annotations:
+          summary: "Prometheus target down"
+          description: "Target {{ $labels.job }}/{{ $labels.instance }} is down."
+
+      - alert: ModelTooOld
+        expr: model_age_days{symbol="global"} > 7
+        for: 30m
+        labels: { severity: warning }
+        annotations:
+          summary: "Model is stale"
+          description: "Promoted model age is {{ $value | printf \"%.1f\" }} days (> 7)."
+
+      - alert: StaleTicker
+        expr: ticker_age_seconds > 90
+        for: 3m
+        labels: { severity: warning }
+        annotations:
+          summary: "Ticker feed stale"
+          description: "{{ $labels.symbol }} ticker age is {{ $value | humanizeDuration }} (> 90s)."
+
+      - alert: DataGaps
+        expr: missing_bars > 2
+        for: 10m
+        labels: { severity: warning }
+        annotations:
+          summary: "Missing OHLCV bars"
+          description: "{{ $labels.symbol }} has {{ $value }} missing bars on {{ $labels.timeframe }}."
+
+      - alert: VolSpike
+        expr: volatility_zscore > 3
+        for: 15m
+        labels: { severity: warning }
+        annotations:
+          summary: "Volatility spike"
+          description: "{{ $labels.symbol }} volatility Z-score is {{ $value | printf \"%.2f\" }} (> 3)."
+
+      - alert: FundingShock
+        expr: abs(funding_bps) > 20
+        for: 30m
+        labels: { severity: warning }
+        annotations:
+          summary: "Funding shock"
+          description: "{{ $labels.symbol }} funding is {{ $value | printf \"%.1f\" }} bps (>|20|)."
+
+      - alert: WideSpread
+        expr: spread_bps > 25
+        for: 10m
+        labels: { severity: warning }
+        annotations:
+          summary: "Liquidity / spread issue"
+          description: "{{ $labels.symbol }} spread is {{ $value | printf \"%.1f\" }} bps (> 25)."
+
+      - alert: TooManyFilteredSignals
+        expr: increase(signals_filtered_total[30m]) > 15
+        for: 5m
+        labels: { severity: info }
+        annotations:
+          summary: "Circuit breakers filtering many signals"
+          description: "{{ $labels.symbol }} filtered {{ $value | printf \"%.0f\" }} signals in 30m."
+
+      - alert: TradeErrorsHigh
+        expr: rate(trade_errors_total[10m]) > 0.1
+        for: 10m
+        labels: { severity: warning }
+        annotations:
+          summary: "Trade error rate high"
+          description: "{{ $labels.symbol }} {{ $labels.stage }} errors >0.1/s over 10m."
+
+      - alert: NoTrades
+        expr: increase(trades_placed_total[2h]) < 1
+        for: 2h
+        labels: { severity: info }
+        annotations:
+          summary: "No trades placed"
+          description: "Less than 1 trade in 2h for {{ $labels.symbol }}."
+  - name: celery-alerts
+    rules:
+      - alert: CeleryWorkerDown
+        expr: up{job="flower"} == 0
+        for: 1m
+        labels:
+          severity: critical
+        annotations:
+          summary: "Celery worker is DOWN"
+          description: "No Celery workers are responding for more than 1 minute"    

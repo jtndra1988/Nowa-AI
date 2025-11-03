@@ -1,0 +1,105 @@
+services:
+  db:
+    image: postgres:15-alpine
+    environment:
+      POSTGRES_DB: appdb
+      POSTGRES_USER: appuser
+      POSTGRES_PASSWORD: yoursecurepassword
+    ports: ["5432:5432"]
+    volumes:
+      - dbdata:/var/lib/postgresql/data
+    restart: unless-stopped
+
+  redis:
+    image: redis:7-alpine
+    command: ["redis-server","--appendonly","yes","--save","60","1000","--maxmemory-policy","allkeys-lru"]
+    ports: ["6379:6379"]
+    volumes: [ "redisdata:/data" ]
+    restart: unless-stopped
+
+  backend:
+    build: ./backend
+    command: uvicorn app.main:app --host 0.0.0.0 --port 8000 --reload
+    environment:
+      PYTHONPATH: /app
+      DATABASE_URL: postgresql+psycopg2://appuser:yoursecurepassword@db:5432/appdb
+      REDIS_URL: redis://redis:6379/0
+      CELERY__BROKER_URL: redis://redis:6379/0
+      CELERY__RESULT_BACKEND: redis://redis:6379/1
+    volumes:
+      - ./backend/app:/app/app
+    depends_on:
+      - db
+      - redis
+    ports:
+      - "8000:8000"
+    restart: unless-stopped
+
+  celery:
+    build: ./backend
+    command: ["celery", "-A", "app.celery_app.worker", "worker", "--loglevel=debug", "-E"]
+    environment:
+      PYTHONPATH: /app
+      DATABASE_URL: postgresql+psycopg2://appuser:yoursecurepassword@db:5432/appdb
+      CELERY_BROKER_URL: redis://redis:6379/0
+      CELERY_RESULT_BACKEND: redis://redis:6379/0
+      TZ: UTC
+    volumes:
+      - ./backend/app:/app/app
+    depends_on:
+      - backend
+      - db
+      - redis
+    restart: unless-stopped
+    healthcheck:
+      test: ["CMD-SHELL", "python - <<'PY'\nimport redis,psycopg2;redis.Redis(host='redis',port=6379,db=0).ping();psycopg2.connect('dbname=appdb user=appuser password=yoursecurepassword host=db port=5432');print('OK')\nPY"]
+      interval: 30s
+      timeout: 5s
+      retries: 3
+      start_period: 30s
+
+  beat:
+    build: ./backend
+    command: ["celery", "-A", "app.celery_app.worker", "beat", "--loglevel=info"]
+    environment:
+      PYTHONPATH: /app
+      DATABASE_URL: postgresql+psycopg2://appuser:yoursecurepassword@db:5432/appdb
+      CELERY_BROKER_URL: redis://redis:6379/0
+      CELERY_RESULT_BACKEND: redis://redis:6379/0
+      TZ: UTC
+    ports:
+      - "9100:9100"
+    volumes:
+      - ./backend/app:/app/app
+      - beatdata:/data
+    depends_on:
+      - db
+      - redis
+    restart: unless-stopped
+
+  flower:
+    image: mher/flower:2.0
+    command: ["celery", "--broker=redis://redis:6379/0", "flower", "--port=5555"]
+    depends_on:
+      - redis
+      - celery
+    ports:
+      - "5555:5555"
+    restart: unless-stopped
+
+  prometheus:
+    image: prom/prometheus:latest
+    command: ["--config.file=/etc/prometheus/prometheus.yml"]
+    # Put both files on host at: ./prometheus/prometheus.yml and ./prometheus/alerts.yml
+    volumes:
+      - ./prometheus:/etc/prometheus:ro
+    ports:
+      - "9090:9090"
+    depends_on:
+      - flower
+      - celery
+    restart: unless-stopped
+
+volumes:
+  dbdata:
+  beatdata:

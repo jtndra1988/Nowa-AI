@@ -1,3 +1,5 @@
+# app/api/predict.py
+
 from typing import Optional
 from fastapi import APIRouter, HTTPException, Query, Depends
 from pydantic import BaseModel
@@ -11,7 +13,7 @@ from app.db.models import Prediction, ModelVersion, HybridSignal
 from app.hybrid.schemas import MarketContext, HybridDecision
 
 router = APIRouter(tags=["Prediction"])
-logger = logging.getLogger(__name__)
+logger = logging.getLogger(_name_)
 
 
 class HybridPredictResponse(BaseModel):
@@ -40,10 +42,8 @@ def predict(
         )
 
     try:
-        # 1. Run inference via service
         result = inference_service.predict(symbol=symbol)
 
-        # 2. Get latest model version for bookkeeping (if exists)
         model_version = (
             db.query(ModelVersion)
             .filter(ModelVersion.model_name == "HybridEnsemble")
@@ -52,7 +52,6 @@ def predict(
         )
         model_version_id = model_version.id if model_version else None
 
-        # 3. Persist prediction (optional, but useful for monitoring)
         prediction_record = Prediction(
             model_version_id=model_version_id,
             symbol=symbol,
@@ -66,7 +65,6 @@ def predict(
 
         logger.info(f"Saved prediction {prediction_record.id} for {symbol}")
 
-        # 4. Return API response
         return HybridPredictResponse(
             symbol=symbol,
             timestamp=prediction_record.prediction_time,
@@ -82,10 +80,13 @@ def predict(
 
 
 @router.post("/hybrid-signal", response_model=HybridDecision)
-def hybrid_signal(
+async def hybrid_signal(
     ctx: MarketContext,
     db: Session = Depends(get_db),
 ):
+    """
+    Build and persist a full hybrid decision (Layer 1 + Layer 2 + Layer 3).
+    """
     if inference_service is None or not inference_service.is_ready:
         logger.error("Inference service not ready or failed to load.")
         raise HTTPException(
@@ -94,9 +95,9 @@ def hybrid_signal(
         )
 
     try:
-        decision = inference_service.build_decision(ctx)
+        decision = await inference_service.build_decision(ctx)
 
-        # Log decision for future training / audit
+        # Persist for audit / future training
         try:
             record = HybridSignal(
                 symbol=decision.symbol,

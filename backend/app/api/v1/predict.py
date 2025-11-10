@@ -1,3 +1,4 @@
+from typing import Optional
 from fastapi import APIRouter, HTTPException, Query, Depends
 from pydantic import BaseModel
 from sqlalchemy.orm import Session

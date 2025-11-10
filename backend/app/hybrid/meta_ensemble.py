@@ -21,8 +21,10 @@ def meta_predict(
 ) -> Dict[str, Any]:
     """
     Meta-ensemble:
-      - Uses expert outputs + context -> edge probability + raw direction.
-      - If no trained model, falls back to deterministic blend.
+      - Uses expert outputs + context to produce:
+        * p_edge: probability trade has positive edge
+        * dir_raw: raw direction suggestion
+        * confidence: same as p_edge for now
     """
     _lazy_load()
 
@@ -37,23 +39,26 @@ def meta_predict(
         "funding_1h": features.get("funding_1h", 0.0),
     }
 
+    # If you train a real meta model, it plugs in here
     if _meta_model is not None:
         proba = float(_meta_model.predict_proba([row])[0, 1])
     else:
+        # Fallback: use agreement & magnitude of price experts as proxy edge
         scores = [
-            s for s in (expert.tft_price, expert.tcn_price, expert.xgb_price)
+            s
+            for s in (expert.tft_price, expert.tcn_price, expert.xgb_price)
             if s is not None
         ]
         if scores:
             avg = sum(scores) / len(scores)
-            # squashed into [0,1] around 0.5
             proba = 0.5 + 0.4 * (avg / (abs(avg) + 1e-6))
             proba = max(0.0, min(1.0, proba))
         else:
             proba = 0.5
 
     scores_for_dir = [
-        s for s in (expert.tft_price, expert.tcn_price, expert.xgb_price)
+        s
+        for s in (expert.tft_price, expert.tcn_price, expert.xgb_price)
         if s is not None
     ]
     blended = sum(scores_for_dir) / len(scores_for_dir) if scores_for_dir else 0.0

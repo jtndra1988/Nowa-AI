@@ -21,9 +21,9 @@ def metalabel_decide(
     ctx: MarketContext,
 ) -> Dict[str, Any]:
     """
-    Meta-label:
-      - Should we execute?
-      - How big? (size_factor in [0,1])
+    Decide:
+      - execute: whether to send this to execution
+      - size_factor: recommended fraction of max size (0..1)
     """
     _lazy_load()
 
@@ -37,6 +37,7 @@ def metalabel_decide(
     if _metalabel_model is not None:
         p_ok = float(_metalabel_model.predict_proba([base])[0, 1])
     else:
+        # Heuristic fallback
         penalty = 0.0
         if abs(base["funding_1h"]) > 0.01:
             penalty += 0.1

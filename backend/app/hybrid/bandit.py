@@ -10,7 +10,12 @@ def bandit_weights(
     ctx: MarketContext,
 ) -> Tuple[Dict[str, float], str]:
     """
-    Simple regime-based weighting.
+    Simple regime-based weighting over TFT/TCN/XGB.
+    Replace with proper contextual bandit later.
+
+    Returns:
+      weights: dict of model_name -> weight
+      tag: strategy/regime tag
     """
     rv = float(features.get("rv_24h", 0.05))
     trend = float(features.get("trend_score", 0.0))

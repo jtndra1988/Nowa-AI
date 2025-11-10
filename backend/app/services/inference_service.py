@@ -285,14 +285,24 @@ class HybridInferenceService:
     # ---------- Public: hybrid decision for trading ----------
 
     def build_decision(self, ctx: MarketContext) -> HybridDecision:
+        """
+        Build a trade-ready hybrid decision from TFT + TCN + XGB.
+        This is what Nowa should consume.
+
+        Works for spot / perps / futures / options:
+        - We keep instrument_type metadata here.
+        - Position sizing / leverage logic can be applied downstream per type.
+        """
         if not self.is_ready:
-            raise RuntimeError("InferenceService not ready.")
+            raise RuntimeError("InferenceService not ready. Check model loading logs.")
 
         db = SessionLocal()
         try:
-            lookback = SEQ_LEN + max(ROLL_WINDOWS) + 5
-            df = self._fetch_inference_data(db, ctx.symbol, lookback)
-            if len(df) < lookback:
+            # Similar lookback as predict()
+            total_lookback = SEQ_LEN + max(ROLL_WINDOWS) + 5
+            raw_df = self._fetch_inference_data(db, ctx.symbol, total_lookback)
+
+            if len(raw_df) < total_lookback:
                 return HybridDecision(
                     symbol=ctx.symbol,
                     instrument_type=ctx.instrument_type,
@@ -302,46 +312,51 @@ class HybridInferenceService:
                     size_factor=0.0,
                     strategy_tag="no_data",
                     meta_execute=False,
-                    debug={"rows": len(df)},
+                    debug={"rows": len(raw_df)},
                 )
 
-            x_blocks, x_tabular = self._prepare_inputs(df)
+            # Reuse same input pipeline
+            x_blocks, x_tabular = self._prepare_inputs(raw_df)
 
             with torch.no_grad():
-                tft_out = self.models["tft"](x_blocks)
-                tcn_out = self.models["tcn"](x_blocks)
+                preds_tft = self.models["tft"](x_blocks)
+                preds_tcn = self.models["tcn"](x_blocks)
 
-                xgb_price = (
+                pred_xgb_price = (
                     _xgb_predict(self.models["xgb_price"], x_tabular)
-                    if self.models["xgb_price"] is not None
+                    if self.models.get("xgb_price") is not None
                     else None
                 )
-                xgb_vol = (
+                pred_xgb_vol = (
                     _xgb_predict(self.models["xgb_vol"], x_tabular)
-                    if self.models["xgb_vol"] is not None
+                    if self.models.get("xgb_vol") is not None
                     else None
                 )
 
             expert = ExpertSignals(
-                tft_price=float(tft_out["price"][0].item()),
-                tcn_price=float(tcn_out["price"][0].item()),
-                xgb_price=xgb_price,
-                tft_vol=float(tft_out["vol"][0].item()),
-                tcn_vol=float(tcn_out["vol"][0].item()),
-                xgb_vol=xgb_vol,
+                tft_price=float(preds_tft["price"].item()),
+                tcn_price=float(preds_tcn["price"].item()),
+                xgb_price=pred_xgb_price,
+                tft_vol=float(preds_tft["vol"].item()) if "vol" in preds_tft else None,
+                tcn_vol=float(preds_tcn["vol"].item()) if "vol" in preds_tcn else None,
+                xgb_vol=pred_xgb_vol,
             )
 
-            ret = df["close"].pct_change()
-            rv_24h = float(ret.rolling(96).std().iloc[-1] or 0.0)
+            # Build simple context features
+            ret = raw_df["close"].pct_change()
+            rv_24h = float(ret.rolling(96).std().iloc[-1] or 0.0)      # ~24h on 15m bars
             trend_score = float(ret.rolling(48).mean().iloc[-1] or 0.0)
 
             features = {
                 "rv_24h": rv_24h,
-                "funding_1h": 0.0,  # hook your funding here
+                "funding_1h": 0.0,          # plug real funding when available
                 "trend_score": trend_score,
             }
 
+            # 1) meta-ensemble: how strong is the edge, and which way?
             meta = meta_predict(features, expert, ctx)
+
+            # 2) meta-label: filter out garbage, size the trade
             ml = metalabel_decide(features, expert, meta, ctx)
 
             if not ml["execute"]:
@@ -354,11 +369,16 @@ class HybridInferenceService:
                     size_factor=0.0,
                     strategy_tag="filtered",
                     meta_execute=False,
-                    debug={"expert": expert.dict(), "meta": meta},
+                    debug={
+                        "expert": expert.dict(),
+                        "meta": meta,
+                    },
                 )
 
+            # 3) contextual bandit: regime tag + diagnostic weights
             weights, tag = bandit_weights(features, expert, meta, ctx)
 
+            # Final direction from meta-ensemble; sizing from meta-label
             return HybridDecision(
                 symbol=ctx.symbol,
                 instrument_type=ctx.instrument_type,
@@ -374,8 +394,12 @@ class HybridInferenceService:
                     "weights": weights,
                 },
             )
+
         except Exception as e:
-            logger.error(f"Hybrid decision failed for {ctx.symbol}: {e}", exc_info=True)
+            self.logger.error(
+                f"Hybrid decision failed for {ctx.symbol}: {e}",
+                exc_info=True,
+            )
             return HybridDecision(
                 symbol=ctx.symbol,
                 instrument_type=ctx.instrument_type,

@@ -3,11 +3,8 @@ import torch.nn as nn
 
 
 class StackingEnsemble(nn.Module):
-    """
-    Simple MLP ensemble:
-      input: [B, N_models]
-      output: [B, 1]
-    """
+    """Simple MLP ensemble: input [B, N_models] -> [B]."""
+
     def __init__(self, n_models: int, hidden: int = 16):
         super().__init__()
         self.net = nn.Sequential(
@@ -17,5 +14,4 @@ class StackingEnsemble(nn.Module):
         )
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
-        # x: [B, N_models]
         return self.net(x).squeeze(-1)

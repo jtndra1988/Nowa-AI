@@ -1,6 +1,6 @@
-import joblib
 from pathlib import Path
 from typing import Dict, Any
+import joblib
 
 from .schemas import ExpertSignals, MarketContext
 
@@ -14,17 +14,12 @@ def _lazy_load():
         _meta_model = joblib.load(_META_MODEL_PATH)
 
 
-def meta_predict(
-    features: Dict[str, Any],
-    expert: ExpertSignals,
-    ctx: MarketContext,
-) -> Dict[str, Any]:
+def meta_predict(features: Dict[str, Any], expert: ExpertSignals, ctx: MarketContext) -> Dict[str, Any]:
     """
-    Meta-ensemble:
-      - Uses expert outputs + context to produce:
-        * p_edge: probability trade has positive edge
-        * dir_raw: raw direction suggestion
-        * confidence: same as p_edge for now
+    Returns:
+        p_edge: probability trade has positive edge (0-1)
+        dir_raw: "long" / "short" / "flat"
+        confidence: same scale as p_edge
     """
     _lazy_load()
 
@@ -37,37 +32,24 @@ def meta_predict(
         "xgb_vol": expert.xgb_vol or 0.0,
         "rv_24h": features.get("rv_24h", 0.0),
         "funding_1h": features.get("funding_1h", 0.0),
-        "decision_net_score": expert.decision_net_score or 0.0,
-        "options_vol_edge": expert.options_vol_edge or 0.0,
-        "macro_onchain_bias": expert.macro_onchain_bias or 0.0,
     }
 
-    # If you train a real meta model, it plugs in here
     if _meta_model is not None:
-        proba += 0.1 * (expert.decision_net_score or 0.0)
-        proba += 0.05 * (expert.options_vol_edge or 0.0)
-        proba += 0.05 * (expert.macro_onchain_bias or 0.0)
-        proba = max(0.0, min(1.0, proba))
+        # Expect a sklearn-style model
+        import pandas as pd
+        proba = float(_meta_model.predict_proba(pd.DataFrame([row]))[0, 1])
     else:
-        # Fallback: use agreement & magnitude of price experts as proxy edge
-        scores = [
-            s
-            for s in (expert.tft_price, expert.tcn_price, expert.xgb_price)
-            if s is not None
-        ]
+        # Heuristic fallback based on blended expert view
+        scores = [s for s in [expert.tft_price, expert.tcn_price, expert.xgb_price] if s is not None]
         if scores:
             avg = sum(scores) / len(scores)
-            proba = 0.5 + 0.4 * (avg / (abs(avg) + 1e-6))
-            proba = max(0.0, min(1.0, proba))
+            proba = 0.5 + 0.25 * (avg / (abs(avg) + 1e-6))  # squashed into [0.25, 0.75]
         else:
             proba = 0.5
 
-    scores_for_dir = [
-        s
-        for s in (expert.tft_price, expert.tcn_price, expert.xgb_price)
-        if s is not None
-    ]
-    blended = sum(scores_for_dir) / len(scores_for_dir) if scores_for_dir else 0.0
+    # Direction from blended expert signal
+    scores = [s for s in [expert.tft_price, expert.tcn_price, expert.xgb_price] if s is not None]
+    blended = sum(scores) / len(scores) if scores else 0.0
 
     if proba < 0.52:
         dir_raw = "flat"
@@ -75,7 +57,7 @@ def meta_predict(
         dir_raw = "long" if blended >= 0 else "short"
 
     return {
-        "p_edge": proba,
+        "p_edge": max(0.0, min(1.0, proba)),
         "dir_raw": dir_raw,
-        "confidence": proba,
+        "confidence": max(0.0, min(1.0, proba)),
     }

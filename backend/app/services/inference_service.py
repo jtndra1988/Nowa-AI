@@ -20,9 +20,12 @@ from app.hybrid.schemas import MarketContext, ExpertSignals, HybridDecision
 from app.hybrid.meta_ensemble import meta_predict
 from app.hybrid.metalabel import metalabel_decide
 from app.hybrid.bandit import bandit_weights
+
 from app.ml.adv.decision_net import decision_net_score
 from app.ml.adv.options_vol_model import options_vol_edge
 from app.ml.adv.macro_onchain_model import macro_onchain_bias
+
+from app.db.models import FundingRate, OptionsDerivedMetrics, MacroData, OnchainMetrics
 
 warnings.filterwarnings("ignore", category=UserWarning)
 logger = logging.getLogger(__name__)
@@ -286,9 +289,10 @@ class HybridInferenceService:
             db.close()
 
     # ---------- Public: hybrid decision for trading ----------
-        def build_decision(self, ctx: MarketContext) -> HybridDecision:
-            if not self.is_ready:
-               raise RuntimeError("InferenceService not ready. Check model loading logs.")
+    def build_decision(self, ctx: MarketContext) -> HybridDecision:
+       
+        if not self.is_ready:
+            raise RuntimeError("InferenceService not ready. Check model loading logs.")
 
         db = SessionLocal()
         try:
@@ -298,7 +302,7 @@ class HybridInferenceService:
             total_lookback = SEQ_LEN + max(ROLL_WINDOWS) + 5
             raw_df = self._fetch_inference_data(db, ctx.symbol, total_lookback)
 
-            if len(raw_df) < total_lookback:
+            if raw_df is None or len(raw_df) < total_lookback:
                 return HybridDecision(
                     symbol=ctx.symbol,
                     instrument_type=ctx.instrument_type,
@@ -308,7 +312,7 @@ class HybridInferenceService:
                     size_factor=0.0,
                     strategy_tag="no_data",
                     meta_execute=False,
-                    debug={"rows": len(raw_df)},
+                    debug={"rows": 0 if raw_df is None else len(raw_df)},
                 )
 
             # -----------------------------
@@ -348,13 +352,11 @@ class HybridInferenceService:
             # --------------------------------------
             ret = raw_df["close"].pct_change()
 
-            rv_24h = float(ret.rolling(96).std().iloc[-1] or 0.0)        # ~24h on 15m bars
+            rv_24h = float(ret.rolling(96).std().iloc[-1] or 0.0)        # ~24h window
             trend_score = float(ret.rolling(48).mean().iloc[-1] or 0.0)  # short/mid bias
 
-            # Funding: last few records as simple 1h proxy (if available)
+            # Funding proxy from DB (if available)
             try:
-                from app.db.models import FundingRate
-
                 funding_rows = (
                     db.query(FundingRate)
                     .filter(FundingRate.symbol == ctx.symbol)
@@ -381,7 +383,6 @@ class HybridInferenceService:
             # 5) Specialists
             # -----------------------------
 
-            # Helper: underlying symbol (e.g. "BTC-PERP" -> "BTC")
             def _underlying_from_symbol(sym: str) -> str:
                 base = sym.split("-")[0]
                 if "/" in base:
@@ -407,8 +408,6 @@ class HybridInferenceService:
             # 5b) Options Vol/Skew specialist
             options_features: Dict[str, Any] = {}
             try:
-                from app.db.models import OptionsDerivedMetrics
-
                 odm = (
                     db.query(OptionsDerivedMetrics)
                     .filter(OptionsDerivedMetrics.symbol == underlying)
@@ -416,10 +415,8 @@ class HybridInferenceService:
                     .first()
                 )
                 if odm:
-                    # Very simple derived values; refine once you have real stats
                     iv_mid = odm.avg_iv_mid_term or odm.avg_iv_near_term or 0.0
-                    # crude normalization: assume IV up to ~200%; clamp into [0,1]
-                    iv_rank = max(0.0, min(1.0, iv_mid / 200.0))
+                    iv_rank = max(0.0, min(1.0, iv_mid / 200.0))  # crude normalization
                     rr_25d = odm.iv_skew_25d or 0.0
                     term_slope = (
                         getattr(odm, "iv_term_slope_near_mid", None)
@@ -433,7 +430,6 @@ class HybridInferenceService:
                         "term_structure_slope": float(term_slope),
                     }
             except Exception:
-                # stay neutral if anything goes wrong
                 options_features = {}
 
             opt_edge = options_vol_edge(options_features) if options_features else 0.0
@@ -441,8 +437,7 @@ class HybridInferenceService:
             # 5c) Macro + On-chain specialist
             macro_features: Dict[str, Any] = {}
             try:
-                from app.db.models import MacroData, OnchainMetrics
-
+                # MacroData: indicators like 'DXY', 'SPX'
                 def _macro_trend(indicator: str, limit: int = 10) -> float:
                     rows = (
                         db.query(MacroData)
@@ -473,8 +468,7 @@ class HybridInferenceService:
                     getattr(oc, "exchange_net_flow_usd", 0.0)
                 ) if oc else 0.0
 
-                # No direct reserves metric in schema; keep neutral for now
-                btc_exchange_reserves_change = 0.0
+                btc_exchange_reserves_change = 0.0  # not modeled yet, keep neutral
 
                 macro_features = {
                     "stablecoin_netflow": stablecoin_netflow,
@@ -503,7 +497,7 @@ class HybridInferenceService:
             ml = metalabel_decide(features, expert, meta, ctx)
 
             if not ml.get("execute", False):
-                # Meta-label veto → stay flat, but expose diagnostics
+                # Meta-label veto → stay flat, expose diagnostics
                 return HybridDecision(
                     symbol=ctx.symbol,
                     instrument_type=ctx.instrument_type,
@@ -572,7 +566,6 @@ class HybridInferenceService:
             )
         finally:
             db.close()
-
     
 try:
     inference_service = HybridInferenceService()

@@ -24,22 +24,25 @@ class HybridPredictResponse(BaseModel):
 
 @router.get("/predict", response_model=HybridPredictResponse)
 def predict(
-    symbol: str = Query(..., description="Asset symbol, e.g. BTC-PERP"),
+    symbol: str = Query(..., description="Asset symbol, e.g. BTC/USDT or BTC-PERP"),
     db: Session = Depends(get_db),
 ):
     """
-    Run Hybrid Ensemble (TFT+TCN+XGB) and store prediction.
+    Run the Hybrid Ensemble (TFT + TCN + XGBoost) inference
+    and return blended price & volatility predictions.
     """
     if inference_service is None or not inference_service.is_ready:
         logger.error("Inference service not ready or failed to load.")
         raise HTTPException(
             status_code=503,
-            detail="InferenceService is not available.",
+            detail="InferenceService is not available. Check server logs.",
         )
 
     try:
+        # 1. Run inference via service
         result = inference_service.predict(symbol=symbol)
 
+        # 2. Get latest model version for bookkeeping (if exists)
         model_version = (
             db.query(ModelVersion)
             .filter(ModelVersion.model_name == "HybridEnsemble")
@@ -48,6 +51,7 @@ def predict(
         )
         model_version_id = model_version.id if model_version else None
 
+        # 3. Persist prediction (optional, but useful for monitoring)
         prediction_record = Prediction(
             model_version_id=model_version_id,
             symbol=symbol,
@@ -58,8 +62,10 @@ def predict(
         )
         db.add(prediction_record)
         db.commit()
-        db.refresh(prediction_record)
 
+        logger.info(f"Saved prediction {prediction_record.id} for {symbol}")
+
+        # 4. Return API response
         return HybridPredictResponse(
             symbol=symbol,
             timestamp=prediction_record.prediction_time,
@@ -68,15 +74,30 @@ def predict(
             model_version_id=model_version_id,
             feature_importance=result["feature_importance"],
         )
+
     except Exception as e:
         logger.error(f"Failed to run prediction for {symbol}: {e}", exc_info=True)
         raise HTTPException(status_code=500, detail=str(e))
+
 
 @router.post("/hybrid-signal", response_model=HybridDecision)
 def hybrid_signal(
     ctx: MarketContext,
     db: Session = Depends(get_db),
 ):
+    """
+    Return a trade-ready hybrid decision for the given context.
+
+    This is the main endpoint your execution bot (Nowa) should call.
+
+    Example payload:
+    {
+      "symbol": "BTC-PERP",
+      "instrument_type": "perp",
+      "exchange": "deribit",
+      "timestamp": 1731240000
+    }
+    """
     if inference_service is None or not inference_service.is_ready:
         logger.error("Inference service not ready or failed to load.")
         raise HTTPException(
@@ -87,7 +108,7 @@ def hybrid_signal(
     try:
         decision = inference_service.build_decision(ctx)
 
-        # Log into HybridSignal for training / monitoring
+        # Log decision for future training / audit
         try:
             record = HybridSignal(
                 symbol=decision.symbol,
@@ -105,10 +126,16 @@ def hybrid_signal(
             db.commit()
         except Exception as e:
             db.rollback()
-            logger.error(f"Failed to persist HybridSignal: {e}", exc_info=True)
+            logger.error(
+                f"Failed to persist HybridSignal for {decision.symbol}: {e}",
+                exc_info=True,
+            )
 
         return decision
 
     except Exception as e:
-        logger.error(f"Failed to build hybrid signal for {ctx.symbol}: {e}", exc_info=True)
+        logger.error(
+            f"Failed to build hybrid signal for {ctx.symbol}: {e}",
+            exc_info=True,
+        )
         raise HTTPException(status_code=500, detail=str(e))

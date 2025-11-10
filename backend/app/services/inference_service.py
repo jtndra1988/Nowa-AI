@@ -1,164 +1,194 @@
 # app/services/inference_service.py
-
 import logging
 from typing import Any, Dict
+import random # For mock specialists
+from datetime import datetime
 
-from app.hybrid.schemas import MarketContext, HybridDecision
-from app.services.inference_service import (
-    HybridInferenceService,
-    HybridDecision as CoreHybridDecision,
-)
+# --- Imports for your NEW 3-Layer Architecture ---
+from app.hybrid.schemas import MarketContext, HybridDecision, Layer2Prediction, RLAction
+from app.ml.adv.llm_narrative_model import llm_engine # Import the REAL LLM engine
+from app.ml.adv.rl_execution_agent import rl_agent     # Import the REAL RL agent
 
-logger = logging.getLogger(_name_)
+# (Mock) Imports for your *EXISTING* models
+# In a real app, these would be your actual model inference functions
+# from app.ml.adv.models_tft import get_tft_signal
+# from app.ml.adv.models_tcn import get_tcn_signal
+# ...etc
+def get_tft_signal(asset: str) -> float: return random.uniform(-1, 1)
+def get_tcn_signal(asset: str) -> float: return random.uniform(-1, 1)
+def get_xgb_signal(asset: str) -> float: return random.uniform(-1, 1)
+def get_options_signal(asset: str) -> float: return random.uniform(-1, 1)
+def get_macro_signal(asset: str) -> float: return random.uniform(-1, 1)
+
+# (Mock) Import for DecisionNet (Layer 2)
+# from app.ml.adv.decision_net import run_decision_net
+def run_decision_net(votes: Dict[str, float]) -> Dict:
+    """
+    MOCK of your DecisionNet ("The Judge").
+    It takes all Layer 1 votes and fuses them into a single prediction.
+    """
+    if not votes:
+        return {"direction": "flat", "price_confidence": 0.0}
+        
+    final_score = sum(votes.values()) / len(votes)
+    direction = "flat"
+    if final_score > 0.3: direction = "up"
+    elif final_score < -0.3: direction = "down"
+    
+    confidence = min(1.0, abs(final_score) * 1.5) # Mock confidence
+    return {
+        "direction": direction,
+        "price_confidence": round(confidence, 2)
+    }
+
+logger = logging.getLogger(__name__)
 
 
 class InferenceService:
     """
     Public-facing inference layer for Nowa.
-
-    Wraps the advanced HybridInferenceService (Layer 1 + Layer 2 + Layer 3)
-    and exposes a clean API used by FastAPI routes:
-
-      - is_ready: quick health flag
-      - predict(symbol): simple ensemble preview for /predict
-      - build_decision(ctx): full hybrid decision for /hybrid-signal
+    This IS the core HybridInferenceService (Layer 1 + Layer 2 + Layer 3).
+    It exposes a clean API used by FastAPI routes.
     """
 
-    def _init_(self) -> None:
+    def __init__(self) -> None:
         try:
-            logger.info("[InferenceService] Initializing HybridInferenceService...")
-            # Core engine: TFT + TCN + XGB + Options + Macro + LLM + RL
-            self._core = HybridInferenceService(use_mock_models=True)
-            self.is_ready: bool = True
-            logger.info("[InferenceService] Initialization complete.")
-        except Exception as e:  # noqa: BLE001
+            logger.info("[InferenceService] Initializing...")
+            # Load the RL agent (which loads its model)
+            self.rl_agent = rl_agent
+            # Get the LLM engine
+            self.llm_engine = llm_engine
+            
+            # Simple readiness check; extend with real model-loading checks
+            self.is_ready: bool = self.rl_agent.is_model_loaded()
+            if not self.is_ready:
+                logger.warning("[InferenceService] RL model not found. Agent is in MOCK mode.")
+            else:
+                logger.info("[InferenceService] Initialization complete. RL model loaded.")
+        except Exception as e:
             logger.error(
-                "[InferenceService] Failed to initialize core engine: %s",
-                e,
+                f"[InferenceService] Failed to initialize core engine: {e}",
                 exc_info=True,
             )
-            self._core = None
-            self.is_ready = False
-
-    # ------------------------------------------------------------------ #
-    # /predict — simple, synchronous ensemble output
-    # ------------------------------------------------------------------ #
-
-    def predict(self, symbol: str) -> Dict[str, Any]:
-        """
-        Lightweight prediction for the /predict endpoint.
-
-        Currently:
-          - Uses core TFT/TCN/XGB from HybridInferenceService.
-          - Returns price_prediction, volatility_prediction, feature_importance
-            to match HybridPredictResponse.
-        """
-        if not self.is_ready or self._core is None:
-            raise RuntimeError("InferenceService not ready")
-
-        features = {
-            "symbol": symbol,
-            "mode": "futures",
-            "exchange": "binance",
-        }
-
-        # Use underlying model wrappers directly (mock-safe if needed)
-        try:
-            tft = float(self._core.tft.predict(features))
-        except Exception:  # noqa: BLE001
-            tft = 0.0
-
-        try:
-            tcn = float(self._core.tcn.predict(features))
-        except Exception:  # noqa: BLE001
-            tcn = 0.0
-
-        try:
-            xgb = float(self._core.xgb.predict(features))
-        except Exception:  # noqa: BLE001
-            xgb = 0.0
-
-        # Simple blended score
-        ensemble_score = (tft + tcn + xgb) / 3.0
-
-        # For demo:
-        # - treat ensemble_score as directional price_prediction proxy
-        # - volatility_prediction as absolute strength
-        return {
-            "price_prediction": ensemble_score,
-            "volatility_prediction": abs(ensemble_score),
-            "feature_importance": {
-                "tft": tft,
-                "tcn": tcn,
-                "xgb": xgb,
-            },
-        }
-
-    # ------------------------------------------------------------------ #
-    # /hybrid-signal — full 3-layer decision
-    # ------------------------------------------------------------------ #
+            self.is_ready: bool = False
 
     async def build_decision(self, ctx: MarketContext) -> HybridDecision:
         """
-        Build a full hybrid decision (Layer 1 → Layer 2 → Layer 3).
-
-        Steps:
-          1) Ask core HybridInferenceService for a CoreHybridDecision.
-          2) Wrap it into the public HybridDecision schema.
+        Runs the full 3-Layer Hybrid AI logic to make a trading decision.
         """
-        if not self.is_ready or self._core is None:
-            raise RuntimeError("InferenceService not ready")
-
-        # Call advanced engine (must be implemented in app/ml/adv/inference_service.py)
-        core: CoreHybridDecision = await self._core.get_hybrid_decision(
-            exchange=ctx.exchange,
-            symbol=ctx.symbol,
-            mode=ctx.mode,
+        # Get "BTC" from "BTC-PERP" or "BTC/USDT"
+        asset = ctx.symbol.split('/')[0].split('-')[0].upper()
+        
+        # --- LAYER 1: GATHER VOTES FROM ALL SPECIALISTS ---
+        logger.debug(f"Layer 1: Gathering specialist votes for {asset}")
+        
+        # Run async LLM task
+        llm_output_task = self.llm_engine.get_narrative_signal(asset)
+        
+        # Run sync model tasks (replace these with your real model calls)
+        tft_signal = get_tft_signal(asset)
+        tcn_signal = get_tcn_signal(asset)
+        xgb_signal = get_xgb_signal(asset)
+        options_signal = get_options_signal(asset)
+        macro_signal = get_macro_signal(asset)
+        
+        # Wait for LLM task to complete
+        llm_output = await llm_output_task
+        
+        model_votes = {
+            "tft_visionary": tft_signal,
+            "tcn_reflex": tcn_signal,
+            "xgb_analyst": xgb_signal,
+            "options_psychologist": options_signal,
+            "macro_economist": macro_signal,
+            "llm_narrative": llm_output["sentiment_score"],
+        }
+        
+        # --- LAYER 2: FUSE PREDICTIONS WITH DECISIONNET ---
+        logger.debug("Layer 2: Fusing votes with DecisionNet...")
+        # NOTE: This uses the MOCK `run_decision_net` function above.
+        # You must replace this with a call to your REAL DecisionNet model.
+        layer_2_output = run_decision_net(model_votes)
+        
+        prediction = Layer2Prediction(
+            asset=asset,
+            direction=layer_2_output["direction"],
+            price_confidence=layer_2_output["price_confidence"]
         )
 
-        payload = core.to_response()
+        # --- LAYER 3: GET OPTIMAL ACTION FROM RL AGENT ---
+        logger.debug("Layer 3: Getting optimal action from RL Agent...")
+        # We need to update the context with the latest volatility/regime if it's missing
+        # In a real system, this would come from your rt_adapt service
+        if ctx.current_regime is None:
+            ctx.current_regime = "mock_regime_neutral"
+        if ctx.current_volatility is None:
+            ctx.current_volatility = 0.5 # mock vol
 
-        direction = payload.get("direction", "flat")
-        confidence = float(payload.get("confidence", 0.0))
-        model_votes = payload.get("model_votes", {}) or {}
-        llm_headline = payload.get("llm_headline")
-        rl_action = payload.get("rl_action")
-        rl_mode = payload.get("rl_mode")
-        rl_target = float(payload.get("rl_target_position", 0.0))
+        rl_action: RLAction = self.rl_agent.get_optimal_action(
+            prediction=prediction, 
+            context=ctx, # Pass the real context from the API
+            model_votes=model_votes
+        )
 
-        # p_edge ~ confidence for now
-        p_edge = confidence
-
-        # If RL suggests a target, use that magnitude; otherwise use confidence
-        if rl_target != 0.0:
-            size_factor = min(1.0, max(0.0, abs(rl_target)))
+        # --- Build and return the final HybridDecision ---
+        # This maps the 3-layer output to your existing HybridDecision schema
+        
+        confidence = prediction.price_confidence
+        
+        # Use RL agent's sizing if available, otherwise fallback
+        if rl_action.optimal_size_pct > 0:
+            size_factor = rl_action.optimal_size_pct
         else:
-            size_factor = min(1.0, max(0.0, confidence))
+            # Fallback for "HOLD" or if RL agent fails
+            size_factor = 0.0
 
-        strategy_tag = "nowa_hybrid_v1"
-        meta_execute = True
+        # Map RL action to a direction
+        direction = "flat"
+        if rl_action.optimal_action == "LONG":
+            direction = "up"
+        elif rl_action.optimal_action == "SHORT":
+            direction = "down"
 
-        debug = {
-            "core": payload,
+        # The new debug payload is much richer
+        debug_payload = {
+            "l1_votes": model_votes,
+            "l2_prediction": prediction.dict(),
+            "l3_action": rl_action.dict(),
+            "context_in": ctx.dict()
         }
 
         return HybridDecision(
             symbol=ctx.symbol,
             instrument_type=ctx.instrument_type or "futures",
+            timestamp=datetime.utcnow(),
+            
+            # --- From Layer 2 & 3 ---
             direction=direction,
-            p_edge=p_edge,
+            p_edge=confidence, # Using confidence as p_edge
             confidence=confidence,
             size_factor=size_factor,
-            strategy_tag=strategy_tag,
-            meta_execute=meta_execute,
-            model_votes=model_votes,
-            llm_headline=llm_headline,
-            rl_action=rl_action,
-            rl_mode=rl_mode,
-            rl_target_position=rl_target,
-            debug=debug,
+            strategy_tag="nowa_hybrid_rl_v1",
+            meta_execute=True, # RL agent's decision is always executable
+            
+            # --- From Layer 1 (Votes) ---
+            model_votes={k: round(v, 2) for k, v in model_votes.items()},
+            llm_headline=llm_output["key_headline"],
+            
+            # --- From Layer 3 (RL Action) ---
+            rl_action=rl_action.optimal_action,
+            rl_mode=self.rl_agent.get_mode(),
+            rl_target_position=rl_action.optimal_size_pct if direction == "up" else -rl_action.optimal_size_pct,
+            rl_execution_style=rl_action.execution_style,
+            
+            # Full debug info
+            debug=debug_payload
         )
 
-
-# Singleton used by FastAPI routes
-inference_service = InferenceService()
+# --- SINGLETON INSTANCE ---
+# Create one instance to be imported by the FastAPI app
+try:
+    inference_service = InferenceService()
+except Exception as e:
+    logger.critical(f"Failed to create InferenceService singleton: {e}", exc_info=True)
+    inference_service = None # type: ignore

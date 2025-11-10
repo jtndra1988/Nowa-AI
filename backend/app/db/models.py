@@ -1,4 +1,4 @@
-from sqlalchemy import JSON, Column, Index, Integer, String, Float, DateTime, BigInteger, Boolean, UniqueConstraint
+from sqlalchemy import JSON, Column, Index, Integer, String, Float, DateTime, BigInteger, Boolean, UniqueConstraint, func
 from sqlalchemy.sql import func
 from .base import Base
 from datetime import datetime
@@ -325,4 +325,61 @@ class RiskLearnedState(Base):
     rolling_equity_min = Column(Float, nullable=False, default=100000.0)
     last_regime = Column(Integer, nullable=True)
     updated_at = Column(DateTime(timezone=True), server_default=func.now(), onupdate=func.now())    
+class HybridSignal(Base):
+    __tablename__ = "hybrid_signals"
+
+    id = Column(Integer, primary_key=True, index=True)
+
+    # When we generated this decision
+    created_at = Column(
+        DateTime(timezone=True),
+        server_default=func.now(),
+        index=True,
+        nullable=False,
+    )
+
+    # What instrument we’re talking about
+    symbol = Column(String, index=True, nullable=False)
+    instrument_type = Column(String, index=True, nullable=False)  # spot/perp/future/option
+    exchange = Column(String, index=True, nullable=True)
+
+    # Core decision fields
+    direction = Column(String, nullable=False)        # long/short/flat
+    p_edge = Column(Float, nullable=False)
+    confidence = Column(Float, nullable=False)
+    size_factor = Column(Float, nullable=False)
+    strategy_tag = Column(String, nullable=False)
+    meta_execute = Column(Boolean, nullable=False)
+
+    # Full debug payload (experts, specialists, meta outputs, weights)
+    debug_payload = Column(JSON, nullable=True)
+
+    __table_args__ = (
+        Index("ix_hybrid_signals_symbol_created_at", "symbol", "created_at"),
+    )
+
+class ModelVersion(Base):
+    __tablename__ = "model_versions"
+
+    id = Column(Integer, primary_key=True, index=True)
+    model_name = Column(String, index=True, nullable=False)   # e.g. 'HybridEnsemble'
+    version = Column(String, nullable=False)                  # e.g. '2025-11-10_001'
+    created_at = Column(DateTime(timezone=True), server_default=func.now())
+    metadata = Column(JSON, nullable=True)
+
+
+class Prediction(Base):
+    __tablename__ = "predictions"
+
+    id = Column(Integer, primary_key=True, index=True)
+    model_version_id = Column(Integer, index=True, nullable=True)
+    symbol = Column(String, index=True, nullable=False)
+    prediction_time = Column(DateTime(timezone=True), index=True, nullable=False)
+    prediction = Column(Float, nullable=False)        # e.g. price or log-return forecast
+    raw_score = Column(Float, nullable=True)          # e.g. vol forecast, or other
+    model_inputs = Column(JSON, nullable=True)        # feature_importance / context
+
+    __table_args__ = (
+        Index("ix_predictions_sym_time", "symbol", "prediction_time"),
+    )
 

@@ -20,6 +20,9 @@ from app.hybrid.schemas import MarketContext, ExpertSignals, HybridDecision
 from app.hybrid.meta_ensemble import meta_predict
 from app.hybrid.metalabel import metalabel_decide
 from app.hybrid.bandit import bandit_weights
+from app.ml.adv.decision_net import decision_net_score
+from app.ml.adv.options_vol_model import options_vol_edge
+from app.ml.adv.macro_onchain_model import macro_onchain_bias
 
 warnings.filterwarnings("ignore", category=UserWarning)
 logger = logging.getLogger(__name__)
@@ -283,22 +286,15 @@ class HybridInferenceService:
             db.close()
 
     # ---------- Public: hybrid decision for trading ----------
-
-    def build_decision(self, ctx: MarketContext) -> HybridDecision:
-        """
-        Build a trade-ready hybrid decision from TFT + TCN + XGB.
-        This is what Nowa should consume.
-
-        Works for spot / perps / futures / options:
-        - We keep instrument_type metadata here.
-        - Position sizing / leverage logic can be applied downstream per type.
-        """
-        if not self.is_ready:
-            raise RuntimeError("InferenceService not ready. Check model loading logs.")
+        def build_decision(self, ctx: MarketContext) -> HybridDecision:
+            if not self.is_ready:
+               raise RuntimeError("InferenceService not ready. Check model loading logs.")
 
         db = SessionLocal()
         try:
-            # Similar lookback as predict()
+            # -----------------------------
+            # 1) Load recent feature window
+            # -----------------------------
             total_lookback = SEQ_LEN + max(ROLL_WINDOWS) + 5
             raw_df = self._fetch_inference_data(db, ctx.symbol, total_lookback)
 
@@ -315,51 +311,199 @@ class HybridInferenceService:
                     debug={"rows": len(raw_df)},
                 )
 
-            # Reuse same input pipeline
+            # -----------------------------
+            # 2) Prepare inputs
+            # -----------------------------
             x_blocks, x_tabular = self._prepare_inputs(raw_df)
 
+            # -----------------------------
+            # 3) Core experts: TFT, TCN, XGB
+            # -----------------------------
             with torch.no_grad():
-                preds_tft = self.models["tft"](x_blocks)
-                preds_tcn = self.models["tcn"](x_blocks)
+                tft_out = self.models["tft"](x_blocks)
+                tcn_out = self.models["tcn"](x_blocks)
 
-                pred_xgb_price = (
+                xgb_price = (
                     _xgb_predict(self.models["xgb_price"], x_tabular)
                     if self.models.get("xgb_price") is not None
                     else None
                 )
-                pred_xgb_vol = (
+                xgb_vol = (
                     _xgb_predict(self.models["xgb_vol"], x_tabular)
                     if self.models.get("xgb_vol") is not None
                     else None
                 )
 
             expert = ExpertSignals(
-                tft_price=float(preds_tft["price"].item()),
-                tcn_price=float(preds_tcn["price"].item()),
-                xgb_price=pred_xgb_price,
-                tft_vol=float(preds_tft["vol"].item()) if "vol" in preds_tft else None,
-                tcn_vol=float(preds_tcn["vol"].item()) if "vol" in preds_tcn else None,
-                xgb_vol=pred_xgb_vol,
+                tft_price=float(tft_out["price"].item()),
+                tcn_price=float(tcn_out["price"].item()),
+                xgb_price=xgb_price,
+                tft_vol=float(tft_out["vol"].item()) if "vol" in tft_out else None,
+                tcn_vol=float(tcn_out["vol"].item()) if "vol" in tcn_out else None,
+                xgb_vol=xgb_vol,
             )
 
-            # Build simple context features
+            # --------------------------------------
+            # 4) Base context features (vol & trend)
+            # --------------------------------------
             ret = raw_df["close"].pct_change()
-            rv_24h = float(ret.rolling(96).std().iloc[-1] or 0.0)      # ~24h on 15m bars
-            trend_score = float(ret.rolling(48).mean().iloc[-1] or 0.0)
 
-            features = {
+            rv_24h = float(ret.rolling(96).std().iloc[-1] or 0.0)        # ~24h on 15m bars
+            trend_score = float(ret.rolling(48).mean().iloc[-1] or 0.0)  # short/mid bias
+
+            # Funding: last few records as simple 1h proxy (if available)
+            try:
+                from app.db.models import FundingRate
+
+                funding_rows = (
+                    db.query(FundingRate)
+                    .filter(FundingRate.symbol == ctx.symbol)
+                    .order_by(FundingRate.timestamp.desc())
+                    .limit(4)
+                    .all()
+                )
+                if funding_rows:
+                    funding_1h = float(
+                        sum(fr.funding_rate for fr in funding_rows) / len(funding_rows)
+                    )
+                else:
+                    funding_1h = 0.0
+            except Exception:
+                funding_1h = 0.0
+
+            features: Dict[str, Any] = {
                 "rv_24h": rv_24h,
-                "funding_1h": 0.0,          # plug real funding when available
+                "funding_1h": funding_1h,
                 "trend_score": trend_score,
             }
 
-            # 1) meta-ensemble: how strong is the edge, and which way?
+            # -----------------------------
+            # 5) Specialists
+            # -----------------------------
+
+            # Helper: underlying symbol (e.g. "BTC-PERP" -> "BTC")
+            def _underlying_from_symbol(sym: str) -> str:
+                base = sym.split("-")[0]
+                if "/" in base:
+                    base = base.split("/")[0]
+                return base
+
+            underlying = _underlying_from_symbol(ctx.symbol)
+
+            # 5a) DecisionNet specialist
+            decision_features = {
+                "tft_price": expert.tft_price or 0.0,
+                "tcn_price": expert.tcn_price or 0.0,
+                "xgb_price": expert.xgb_price or 0.0,
+                "tft_vol": expert.tft_vol or 0.0,
+                "tcn_vol": expert.tcn_vol or 0.0,
+                "xgb_vol": expert.xgb_vol or 0.0,
+                "rv_24h": features["rv_24h"],
+                "trend_score": features["trend_score"],
+                "funding_1h": features["funding_1h"],
+            }
+            dec_score = decision_net_score(decision_features)
+
+            # 5b) Options Vol/Skew specialist
+            options_features: Dict[str, Any] = {}
+            try:
+                from app.db.models import OptionsDerivedMetrics
+
+                odm = (
+                    db.query(OptionsDerivedMetrics)
+                    .filter(OptionsDerivedMetrics.symbol == underlying)
+                    .order_by(OptionsDerivedMetrics.timestamp.desc())
+                    .first()
+                )
+                if odm:
+                    # Very simple derived values; refine once you have real stats
+                    iv_mid = odm.avg_iv_mid_term or odm.avg_iv_near_term or 0.0
+                    # crude normalization: assume IV up to ~200%; clamp into [0,1]
+                    iv_rank = max(0.0, min(1.0, iv_mid / 200.0))
+                    rr_25d = odm.iv_skew_25d or 0.0
+                    term_slope = (
+                        getattr(odm, "iv_term_slope_near_mid", None)
+                        or getattr(odm, "iv_term_slope_reg_logT", None)
+                        or 0.0
+                    )
+
+                    options_features = {
+                        "iv_rank": float(iv_rank),
+                        "risk_reversal_25d": float(rr_25d),
+                        "term_structure_slope": float(term_slope),
+                    }
+            except Exception:
+                # stay neutral if anything goes wrong
+                options_features = {}
+
+            opt_edge = options_vol_edge(options_features) if options_features else 0.0
+
+            # 5c) Macro + On-chain specialist
+            macro_features: Dict[str, Any] = {}
+            try:
+                from app.db.models import MacroData, OnchainMetrics
+
+                def _macro_trend(indicator: str, limit: int = 10) -> float:
+                    rows = (
+                        db.query(MacroData)
+                        .filter(MacroData.indicator == indicator)
+                        .order_by(MacroData.timestamp.desc())
+                        .limit(limit)
+                        .all()
+                    )
+                    if len(rows) < 2:
+                        return 0.0
+                    latest = rows[0].value
+                    oldest = rows[-1].value
+                    if not oldest:
+                        return 0.0
+                    return float((latest - oldest) / abs(oldest))
+
+                dxy_trend = _macro_trend("DXY")
+                spx_trend = _macro_trend("SPX")
+
+                oc = (
+                    db.query(OnchainMetrics)
+                    .filter(OnchainMetrics.symbol == underlying)
+                    .order_by(OnchainMetrics.timestamp.desc())
+                    .first()
+                )
+
+                stablecoin_netflow = float(
+                    getattr(oc, "exchange_net_flow_usd", 0.0)
+                ) if oc else 0.0
+
+                # No direct reserves metric in schema; keep neutral for now
+                btc_exchange_reserves_change = 0.0
+
+                macro_features = {
+                    "stablecoin_netflow": stablecoin_netflow,
+                    "btc_exchange_reserves_change": btc_exchange_reserves_change,
+                    "dxy_trend": dxy_trend,
+                    "spx_trend": spx_trend,
+                }
+            except Exception:
+                macro_features = {}
+
+            macro_bias = macro_onchain_bias(macro_features) if macro_features else 0.0
+
+            # Attach specialist outputs
+            expert.decision_net_score = float(dec_score)
+            expert.options_vol_edge = float(opt_edge)
+            expert.macro_onchain_bias = float(macro_bias)
+
+            # -----------------------------
+            # 6) Meta-ensemble
+            # -----------------------------
             meta = meta_predict(features, expert, ctx)
 
-            # 2) meta-label: filter out garbage, size the trade
+            # -----------------------------
+            # 7) Meta-label (execute? size?)
+            # -----------------------------
             ml = metalabel_decide(features, expert, meta, ctx)
 
-            if not ml["execute"]:
+            if not ml.get("execute", False):
+                # Meta-label veto → stay flat, but expose diagnostics
                 return HybridDecision(
                     symbol=ctx.symbol,
                     instrument_type=ctx.instrument_type,
@@ -372,34 +516,49 @@ class HybridInferenceService:
                     debug={
                         "expert": expert.dict(),
                         "meta": meta,
+                        "specialists": {
+                            "decision_net_score": dec_score,
+                            "options_vol_edge": opt_edge,
+                            "macro_onchain_bias": macro_bias,
+                            "macro_features": macro_features,
+                            "options_features": options_features,
+                        },
                     },
                 )
 
-            # 3) contextual bandit: regime tag + diagnostic weights
+            # -----------------------------
+            # 8) Bandit / regime router
+            # -----------------------------
             weights, tag = bandit_weights(features, expert, meta, ctx)
 
-            # Final direction from meta-ensemble; sizing from meta-label
+            # -----------------------------
+            # 9) Final decision payload
+            # -----------------------------
             return HybridDecision(
                 symbol=ctx.symbol,
                 instrument_type=ctx.instrument_type,
                 direction=meta["dir_raw"],
                 p_edge=meta["p_edge"],
                 confidence=meta["confidence"],
-                size_factor=ml["size_factor"],
+                size_factor=float(ml.get("size_factor", 0.0)),
                 strategy_tag=tag,
                 meta_execute=True,
                 debug={
                     "expert": expert.dict(),
                     "meta": meta,
+                    "specialists": {
+                        "decision_net_score": dec_score,
+                        "options_vol_edge": opt_edge,
+                        "macro_onchain_bias": macro_bias,
+                        "macro_features": macro_features,
+                        "options_features": options_features,
+                    },
                     "weights": weights,
                 },
             )
 
         except Exception as e:
-            self.logger.error(
-                f"Hybrid decision failed for {ctx.symbol}: {e}",
-                exc_info=True,
-            )
+            logger.error(f"Hybrid decision failed for {ctx.symbol}: {e}", exc_info=True)
             return HybridDecision(
                 symbol=ctx.symbol,
                 instrument_type=ctx.instrument_type,
@@ -414,7 +573,7 @@ class HybridInferenceService:
         finally:
             db.close()
 
-
+    
 try:
     inference_service = HybridInferenceService()
 except Exception as e:

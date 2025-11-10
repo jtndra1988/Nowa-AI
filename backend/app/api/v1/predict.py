@@ -6,7 +6,7 @@ import logging
 
 from app.services.inference_service import inference_service
 from app.db.database import get_db
-from app.db.models import Prediction, ModelVersion
+from app.db.models import Prediction, ModelVersion, HybridSignal
 from app.hybrid.schemas import MarketContext, HybridDecision
 
 router = APIRouter(tags=["Prediction"])
@@ -71,20 +71,12 @@ def predict(
     except Exception as e:
         logger.error(f"Failed to run prediction for {symbol}: {e}", exc_info=True)
         raise HTTPException(status_code=500, detail=str(e))
+
 @router.post("/hybrid-signal", response_model=HybridDecision)
 def hybrid_signal(
     ctx: MarketContext,
     db: Session = Depends(get_db),
 ):
-    """
-    Returns a trade-ready hybrid decision for the given context.
-
-    This is what your Nowa execution bot should call:
-      - For spot:    instrument_type="spot"
-      - For perps:   instrument_type="perp"
-      - For futures: instrument_type="future"
-      - For options: instrument_type="option"
-    """
     if inference_service is None or not inference_service.is_ready:
         logger.error("Inference service not ready or failed to load.")
         raise HTTPException(
@@ -95,12 +87,28 @@ def hybrid_signal(
     try:
         decision = inference_service.build_decision(ctx)
 
-        # Optional: log decisions to DB for monitoring / future meta-training.
-        # Example (uncomment when you add a Decision model):
-        # db.add(HybridDecisionORM.from_decision(decision))
-        # db.commit()
+        # Log into HybridSignal for training / monitoring
+        try:
+            record = HybridSignal(
+                symbol=decision.symbol,
+                instrument_type=decision.instrument_type,
+                exchange=ctx.exchange,
+                direction=decision.direction,
+                p_edge=decision.p_edge,
+                confidence=decision.confidence,
+                size_factor=decision.size_factor,
+                strategy_tag=decision.strategy_tag,
+                meta_execute=decision.meta_execute,
+                debug_payload=decision.debug,
+            )
+            db.add(record)
+            db.commit()
+        except Exception as e:
+            db.rollback()
+            logger.error(f"Failed to persist HybridSignal: {e}", exc_info=True)
 
         return decision
+
     except Exception as e:
         logger.error(f"Failed to build hybrid signal for {ctx.symbol}: {e}", exc_info=True)
         raise HTTPException(status_code=500, detail=str(e))

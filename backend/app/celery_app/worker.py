@@ -63,7 +63,9 @@ from app.tasks.sentiment_fusion_collector import run_sentiment_fusion
 
 # --- CORRECTED IMPORT: Import our *new* full training pipeline task ---
 from app.tasks.training_tasks import run_full_retraining_pipeline
-
+from app.services.inference_service import inference_service
+from app.hybrid.schemas import MarketContext
+from app.db.models import HybridSignal
 # --- REMOVED old, broken task imports ---
 # from app.tasks.training_tasks import (
 #     retrain_models_task,
@@ -252,6 +254,13 @@ def setup_periodic_tasks(sender, **kwargs):
     sender.add_periodic_task(120.0, Q(portfolio_rebalance_suggest.s(), "signals"),name="portfolio_rebalance_suggest_2m")
     sender.add_periodic_task(90.0,  Q(portfolio_hedge_suggest.s(), "signals"),    name="portfolio_hedge_suggest_90s")
     sender.add_periodic_task(5.0,   Q(orders_monitor.s(), "signals"),            name="orders_monitor_5s")
+        # --- Hybrid Signal Generation (optional) → 'signals' queue
+    sender.add_periodic_task(
+        60.0,
+        Q(generate_hybrid_signals.s(), "signals"),
+        name="Hybrid Signal Generator (60s)"
+    )
+
     
     logger.info("[✅] Celerybeat periodic tasks configured.")
 # --------------------------------
@@ -353,8 +362,68 @@ def task_portfolio_hedge_suggest():
 @celery_app.task(name="tasks.orders_monitor", base=BaseTaskWithRetry)
 def task_orders_monitor():
     return orders_monitor()
+@celery_app.task(name="tasks.generate_hybrid_signals", base=BaseTaskWithRetry)
+def generate_hybrid_signals():
+    """
+    Periodically compute hybrid decisions for a set of symbols
+    and log them for later training & monitoring.
+    """
+    if inference_service is None or not inference_service.is_ready:
+        logger.error("Inference service not ready in generate_hybrid_signals.")
+        return {"status": "error", "reason": "inference_not_ready"}
 
-# --- Your existing Watchdog/Prometheus functions ---
+    symbols = [
+        "BTC-PERP",
+        "ETH-PERP",
+        # extend as needed
+    ]
+
+    from datetime import datetime, timezone
+
+    now_ts = int(datetime.now(timezone.utc).timestamp())
+    db = SessionLocal()
+
+    logged = 0
+
+    try:
+        for sym in symbols:
+            ctx = MarketContext(
+                symbol=sym,
+                instrument_type="perp",
+                exchange="deribit",
+                timestamp=now_ts,
+            )
+
+            try:
+                decision = inference_service.build_decision(ctx)
+            except Exception as e:
+                logger.error(f"[HybridSignal] Failed decision for {sym}: {e}", exc_info=True)
+                continue
+
+            try:
+                record = HybridSignal(
+                    symbol=decision.symbol,
+                    instrument_type=decision.instrument_type,
+                    exchange=ctx.exchange,
+                    direction=decision.direction,
+                    p_edge=decision.p_edge,
+                    confidence=decision.confidence,
+                    size_factor=decision.size_factor,
+                    strategy_tag=decision.strategy_tag,
+                    meta_execute=decision.meta_execute,
+                    debug_payload=decision.debug,
+                )
+                db.add(record)
+                db.commit()
+                logged += 1
+            except Exception as e:
+                db.rollback()
+                logger.error(f"[HybridSignal] Failed to persist for {sym}: {e}", exc_info=True)
+
+        return {"status": "ok", "logged": logged}
+
+    finally:
+        db.close()
 
 def _start_prometheus(port: int = 9100):
     """Start a Prometheus metrics server in a background thread."""

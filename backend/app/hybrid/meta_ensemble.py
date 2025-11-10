@@ -37,11 +37,17 @@ def meta_predict(
         "xgb_vol": expert.xgb_vol or 0.0,
         "rv_24h": features.get("rv_24h", 0.0),
         "funding_1h": features.get("funding_1h", 0.0),
+        "decision_net_score": expert.decision_net_score or 0.0,
+        "options_vol_edge": expert.options_vol_edge or 0.0,
+        "macro_onchain_bias": expert.macro_onchain_bias or 0.0,
     }
 
     # If you train a real meta model, it plugs in here
     if _meta_model is not None:
-        proba = float(_meta_model.predict_proba([row])[0, 1])
+        proba += 0.1 * (expert.decision_net_score or 0.0)
+        proba += 0.05 * (expert.options_vol_edge or 0.0)
+        proba += 0.05 * (expert.macro_onchain_bias or 0.0)
+        proba = max(0.0, min(1.0, proba))
     else:
         # Fallback: use agreement & magnitude of price experts as proxy edge
         scores = [

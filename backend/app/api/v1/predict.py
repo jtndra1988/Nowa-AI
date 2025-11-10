@@ -8,7 +8,7 @@ import logging
 from app.services.inference_service import inference_service
 from app.db.database import get_db
 from app.db.models import Prediction, ModelVersion
-
+from app.hybrid.schemas import MarketContext, HybridDecision
 router = APIRouter(tags=["Prediction"])
 logger = logging.getLogger(__name__)
 
@@ -81,3 +81,16 @@ def predict(
     except Exception as e:
         logger.error(f"Failed to run prediction for {symbol}: {e}", exc_info=True)
         raise HTTPException(status_code=500, detail=str(e))
+@router.post("/hybrid-signal", response_model=HybridDecision)
+def hybrid_signal(ctx: MarketContext, db: Session = Depends(get_db)):
+    """
+    Returns a trade-ready hybrid decision using the existing TFT + TCN + XGB stack
+    plus meta-ensemble, meta-label, and bandit logic.
+    """
+    if inference_service is None or not inference_service.is_ready:
+        logger.error("Inference service not ready.")
+        raise HTTPException(status_code=503, detail="InferenceService is not available")
+
+    decision = inference_service.build_decision(ctx)
+    # (optional) save decision to DB for training meta / bandit later
+    return decision    

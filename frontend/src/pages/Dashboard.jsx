@@ -1,286 +1,212 @@
-import React from 'react';
+import React, { useState } from 'react';
 
-// --- STYLES OBJECT ---
-// All styles are consolidated here, using the theme from your reference image.
-const styles = {
-  // Main grid for the dashboard layout
-  dashboardGrid: {
-    display: 'grid',
-    gridTemplateColumns: '1fr 320px', // Main content area and a right sidebar
-    gridTemplateRows: 'auto 1fr auto', // Header, main content, and bottom table
-    gap: '1.5rem',
-    height: 'calc(100vh - 3rem)', // Full viewport height minus layout padding
-  },
-  // Generic card style with the requested colored shadow
-  card: {
-    backgroundColor: '#2A2F34',
-    borderRadius: '12px',
-    padding: '1.5rem',
-    border: '1px solid rgba(55, 65, 81, 0.5)',
-    // The colored shadow effect you requested
-    boxShadow: '0 4px 30px rgba(0, 0, 0, 0.1), 0 0 20px rgba(34, 197, 94, 0.1)',
-  },
-  
-  // Header Section
-  header: {
-    gridColumn: '1 / -1', // Span across both columns
-    display: 'flex',
-    justifyContent: 'space-between',
-    alignItems: 'center',
-    marginBottom: '1rem',
-  },
-  headerText: { 
-    fontSize: '1.75rem', 
-    fontWeight: '600', 
-    color: '#E5E7EB' 
-  },
-  
-  // Main Content Area (Left side)
-  mainContent: {
-    gridColumn: '1 / 2',
-    gridRow: '2 / 3',
-    display: 'flex',
-    flexDirection: 'column',
-    gap: '1.5rem',
-  },
-  statsGrid: {
-    display: 'grid',
-    gridTemplateColumns: 'repeat(3, 1fr)',
-    gap: '1.5rem',
-  },
-  statTitle: { 
-    color: '#9CA3AF', 
-    fontSize: '0.875rem', 
-    marginBottom: '0.5rem' 
-  },
-  statValue: { 
-    fontSize: '1.5rem', 
-    color: '#E5E7EB', 
-    fontWeight: '600' 
-  },
-  pnlText: (pnl) => ({
-    fontSize: '1.5rem',
-    color: pnl >= 0 ? '#22C55E' : '#EF4444', // Green for profit, Red for loss
-    fontWeight: '600',
-  }),
-  chartContainer: {
-    flex: 1,
-    display: 'flex',
-    alignItems: 'center',
-    justifyContent: 'center',
-    color: '#6B7280'
-  },
-  
-  // Right Panel (AI Signal + Order Entry)
-  rightPanel: {
-    gridColumn: '2 / 3',
-    gridRow: '2 / 4', // Span two rows to fill the height
-    display: 'flex',
-    flexDirection: 'column',
-    gap: '2rem', // Increased gap for better separation
-  },
-  panelTitle: { 
-    color: '#E5E7EB', 
-    fontWeight: '600', 
-    fontSize: '1.1rem', 
-    marginBottom: '1rem' 
-  },
-  aiSignalCard: {
-    backgroundColor: 'rgba(34, 197, 94, 0.1)',
-    border: '1px solid #22C55E',
-    borderRadius: '8px',
-    padding: '1rem',
-    textAlign: 'center',
-  },
-  formGroup: { marginBottom: '1rem' },
-  label: { 
-    display: 'block', 
-    color: '#9CA3AF', 
-    fontSize: '0.875rem', 
-    marginBottom: '0.5rem' 
-  },
-  input: { 
-    width: '100%', 
-    boxSizing: 'border-box', 
-    backgroundColor: '#1A1E1F', 
-    border: '1px solid #374151', 
-    borderRadius: '8px', 
-    padding: '0.75rem', 
-    color: 'white', 
-    fontSize: '1rem' 
-  },
-  buttonGroup: { 
-    display: 'grid', 
-    gridTemplateColumns: '1fr 1fr', 
-    gap: '1rem' 
-  },
-  button: (variant) => ({
-    padding: '0.75rem', 
-    fontSize: '1rem', 
-    fontWeight: 'bold', 
-    borderRadius: '8px', 
-    border: 'none', 
-    cursor: 'pointer', 
-    color: 'white',
-    backgroundColor: variant === 'buy' ? '#22C55E' : '#EF4444',
-    transition: 'transform 0.2s ease',
-  }),
-  
-  // Bottom Table for Positions
-  positionsTableContainer: {
-    gridColumn: '1 / 2',
-    gridRow: '3 / 4',
-  },
-  table: { 
-    width: '100%', 
-    borderCollapse: 'collapse', 
-    fontSize: '0.875rem' 
-  },
-  th: { 
-    textAlign: 'left', 
-    padding: '0.75rem', 
-    color: '#9CA3AF', 
-    borderBottom: '1px solid #374151', 
-    fontWeight: '500' 
-  },
-  td: { 
-    padding: '0.75rem', 
-    borderBottom: '1px solid #374151', 
-    verticalAlign: 'middle' 
+// --- Mock Data ---
+// This is fake, static data we'll use to build the UI.
+// Later, we will replace this with live API calls.
+
+// Mock data for the main prediction widget
+const mockPrediction = {
+  price_prediction: 0.005, // A slightly bullish signal
+  volatility_prediction: 0.2, // Medium volatility
+  feature_importance: {
+    "Price Action": 0.6,
+    "Order Book": 0.3,
+    "Sentiment": 0.1,
   },
 };
 
-/**
- * Main component for the Trading Terminal Dashboard.
- * This component is composed of smaller, logical sub-components for clarity.
- */
-const Dashboard = () => {
-  return (
-    <div style={styles.dashboardGrid}>
-      <DashboardHeader />
-      <MainContent />
-      <RightPanel />
-      <PositionsTable />
-    </div>
-  );
+// Mock data for the user's risk settings
+const mockRiskSettings = {
+  max_position_usd: 10000,
+  confidence_cutoff: 0.65,
+  max_drawdown_pct: 10,
 };
 
-// --- SUB-COMPONENTS ---
+// Mock data for the user's live portfolio
+const mockPortfolio = [
+  { id: 1, symbol: 'BTC/USDT', size: 0.5, entry_price: 60000, pnl: 1500.25, type: 'long' },
+  { id: 2, symbol: 'ETH/USDT', size: 10, entry_price: 4000, pnl: -200.50, type: 'long' },
+];
+// --- End Mock Data ---
 
-const DashboardHeader = () => (
-  <header style={styles.header}>
-    <h1 style={styles.headerText}>Trading Terminal</h1>
-    {/* User Profile component can be added here */}
-  </header>
-);
 
-const MainContent = () => (
-  <main style={styles.mainContent}>
-    <PortfolioStats />
-    <div style={{...styles.card, ...styles.chartContainer}}>
-      <h2>[ TradingView Chart Placeholder: BTC-PERP ]</h2>
-    </div>
-  </main>
-);
-
-const PortfolioStats = () => {
-    // Static data representing portfolio metrics
-    const totalEquity = 10483.50;
-    const unrealizedPNL = 510.00;
-    const marginUsed = 10425;
-
-    return (
-        <div style={styles.statsGrid}>
-            <div style={styles.card}>
-                <div style={styles.statTitle}>Total Equity</div>
-                <div style={styles.statValue}>${(totalEquity + unrealizedPNL).toLocaleString()}</div>
-            </div>
-            <div style={styles.card}>
-                <div style={styles.statTitle}>Unrealized P&L</div>
-                <div style={styles.pnlText(unrealizedPNL)}>+${unrealizedPNL.toLocaleString()}</div>
-            </div>
-            <div style={styles.card}>
-                <div style={styles.statTitle}>Available Margin</div>
-                <div style={styles.statValue}>${(totalEquity - marginUsed).toLocaleString()}</div>
-            </div>
-        </div>
-    );
-};
-
-const RightPanel = () => (
-  <aside style={{...styles.card, ...styles.rightPanel}}>
-    <AISignal />
-    <OrderEntry />
-  </aside>
-);
-
-const AISignal = () => (
-    <div>
-        <h2 style={styles.panelTitle}>AI Trade Signal</h2>
-        <div style={styles.aiSignalCard}>
-            <p style={{ margin: 0, color: '#9CA3AF', fontSize: '0.8rem' }}>BTC-PERP | 5m</p>
-            <p style={{ margin: '0.5rem 0', fontSize: '1.5rem', fontWeight: 'bold', color: '#22C55E' }}>STRONG BUY</p>
-            <p style={{ margin: 0, color: '#E5E7EB' }}>Confidence: <span style={{ fontWeight: 'bold' }}>88%</span></p>
-        </div>
-    </div>
-);
-
-const OrderEntry = () => (
-  <div>
-    <h2 style={styles.panelTitle}>Order Entry</h2>
-    <div style={styles.formGroup}>
-      <label style={styles.label}>Order Type</label>
-      <input style={styles.input} type="text" defaultValue="Market" />
-    </div>
-    <div style={styles.formGroup}>
-      <label style={styles.label}>Size (BTC)</label>
-      <input style={styles.input} type="text" defaultValue="0.1" />
-    </div>
-    <div style={styles.buttonGroup}>
-      <button style={styles.button('buy')}>BUY / LONG</button>
-      <button style={styles.button('sell')}>SELL / SHORT</button>
-    </div>
+// --- Re-usable Card Component ---
+const Card = ({ title, children, className = "" }) => (
+  <div className={`bg-gray-800 shadow-lg rounded-xl p-6 ${className}`}>
+    <h2 className="text-xl font-semibold text-white mb-4">{title}</h2>
+    {children}
   </div>
 );
 
-const PositionsTable = () => {
-    // Static data mimicking the 'Position' model from your backend
-    const dummyPositions = [
-        { instrument: 'BTC-PERP', side: 'Long', size: 0.5, entry: 68500, mark: 69120, pnl: 310 },
-        { instrument: 'ETH-PERP', side: 'Short', size: 10, entry: 3500, mark: 3480, pnl: 200 },
-        { instrument: 'SOL-PERP', side: 'Long', size: 50, entry: 145.20, mark: 142.10, pnl: -155 },
-    ];
+// --- Dashboard Page ---
+export default function Dashboard() {
+  const [isBotActive, setIsBotActive] = useState(false);
 
-    return (
-        <section style={{...styles.card, ...styles.positionsTableContainer}}>
-            <h2 style={{...styles.panelTitle, marginTop: 0}}>Open Positions ({dummyPositions.length})</h2>
-            <table style={styles.table}>
+  // Helper to format the "Why?" chart data
+  const importanceData = Object.entries(mockPrediction.feature_importance)
+    .sort(([, a], [, b]) => b - a);
+
+  // Helper to determine signal strength
+  const signal = mockPrediction.price_prediction > 0 ? "BULLISH" : "BEARISH";
+  const signalColor = signal === "BULLISH" ? "text-green-400" : "text-red-400";
+  
+  // Helper to determine volatility
+  const volatility = mockPrediction.volatility_prediction > 0.3 ? "HIGH" : (mockPrediction.volatility_prediction > 0.15 ? "MEDIUM" : "LOW");
+  const volColor = volatility === "HIGH" ? "text-red-400" : (volatility === "MEDIUM" ? "text-yellow-400" : "text-green-400");
+
+
+  return (
+    <div className="p-6 bg-gray-900 text-gray-200 min-h-screen">
+      <h1 className="text-3xl font-bold text-white mb-6">MARS Bot Dashboard</h1>
+
+      {/* Main Grid Layout */}
+      <div className="grid grid-cols-1 lg:grid-cols-3 gap-6">
+
+        {/* === Left Column (Main Content) === */}
+        <div className="lg:col-span-2 space-y-6">
+          
+          {/* --- Bot Control Panel --- */}
+          <Card title="Bot Control">
+            <div className="flex items-center justify-between">
+              <span className={`text-lg font-medium ${isBotActive ? 'text-green-400' : 'text-red-400'}`}>
+                {isBotActive ? "BOT IS ACTIVE" : "BOT IS INACTIVE"}
+              </span>
+              <button
+                onClick={() => setIsBotActive(!isBotActive)}
+                className={`px-6 py-2 rounded-lg font-bold text-white transition-all ${isBotActive ? 'bg-red-600 hover:bg-red-700' : 'bg-green-600 hover:bg-green-700'}`}
+              >
+                {isBotActive ? "DEACTIVATE" : "ACTIVATE BOT"}
+              </button>
+            </div>
+            <p className="text-sm text-gray-400 mt-3">
+              When active, the bot will automatically execute trades based on the live signal and your risk settings.
+            </p>
+          </Card>
+
+          {/* --- Live Portfolio --- */}
+          <Card title="Live Portfolio">
+            <div className="overflow-x-auto">
+              <table className="w-full text-left">
                 <thead>
-                    <tr>
-                        <th style={styles.th}>Instrument</th>
-                        <th style={styles.th}>Side</th>
-                        <th style={styles.th}>Size</th>
-                        <th style={styles.th}>Entry Price</th>
-                        <th style={styles.th}>Mark Price</th>
-                        <th style={styles.th}>Unrealized P&L</th>
-                    </tr>
+                  <tr className="border-b border-gray-700 text-gray-400 text-sm">
+                    <th className="py-2">Symbol</th>
+                    <th className="py-2">Size</th>
+                    <th className="py-2">Entry Price</th>
+                    <th className="py-2">Type</th>
+                    <th className="py-2">Unrealized P&L</th>
+                  </tr>
                 </thead>
                 <tbody>
-                    {dummyPositions.map((pos, index) => (
-                        <tr key={index}>
-                            <td style={styles.td}>{pos.instrument}</td>
-                            <td style={{ ...styles.td, color: pos.side === 'Long' ? '#22C55E' : '#EF4444' }}>{pos.side}</td>
-                            <td style={styles.td}>{pos.size}</td>
-                            <td style={styles.td}>${pos.entry.toLocaleString()}</td>
-                            <td style={styles.td}>${pos.mark.toLocaleString()}</td>
-                            <td style={{ ...styles.td, color: pos.pnl >= 0 ? '#22C55E' : '#EF4444' }}>${pos.pnl.toFixed(2)}</td>
-                        </tr>
-                    ))}
+                  {mockPortfolio.map((pos) => (
+                    <tr key={pos.id} className="border-b border-gray-600">
+                      <td className="py-3 font-medium text-white">{pos.symbol}</td>
+                      <td className="py-3">{pos.size}</td>
+                      <td className="py-3">${pos.entry_price.toLocaleString()}</td>
+                      <td className={`py-3 font-medium ${pos.type === 'long' ? 'text-green-400' : 'text-red-400'}`}>
+                        {pos.type.toUpperCase()}
+                      </td>
+                      <td className={`py-3 font-medium ${pos.pnl > 0 ? 'text-green-400' : 'text-red-400'}`}>
+                        ${pos.pnl.toLocaleString()}
+                      </td>
+                    </tr>
+                  ))}
                 </tbody>
-            </table>
-        </section>
-    );
-};
+              </table>
+            </div>
+          </Card>
 
-export default Dashboard;
+        </div>
 
+        {/* === Right Column (Sidebar) === */}
+        <div className="lg:col-span-1 space-y-6">
+
+          {/* --- Live Signal --- */}
+          <Card title="Live Signal (BTC/USDT)">
+            <div className="text-center">
+              <div className={`text-5xl font-bold ${signalColor} mb-2`}>
+                {signal}
+              </div>
+              <div className="text-lg text-gray-300">
+                Confidence: {Math.abs(mockPrediction.price_prediction * 100).toFixed(1)}%
+              </div>
+            </div>
+            <div className="mt-4 pt-4 border-t border-gray-700 text-center">
+              <div className="text-sm text-gray-400 mb-1">VOLATILITY FORECAST</div>
+              <div className={`text-2xl font-bold ${volColor}`}>
+                {volatility}
+              </div>
+            </div>
+          </Card>
+
+          {/* --- Interpretability "Why?" Chart --- */}
+          <Card title="Signal Interpretability">
+            <p className="text-sm text-gray-400 mb-4">
+              The "Why?" chart shows which feature groups are driving the current signal.
+            </p>
+            {/* This is a MOCKUP of a donut chart. We can add a library like Recharts later. */}
+            <div className="space-y-3">
+              {importanceData.map(([name, value]) => (
+                <div key={name}>
+                  <div className="flex justify-between text-sm font-medium text-gray-300 mb-1">
+                    <span>{name}</span>
+                    <span>{(value * 100).toFixed(0)}%</span>
+                  </div>
+                  <div className="w-full bg-gray-700 rounded-full h-2.5">
+                    <div 
+                      className="bg-blue-500 h-2.5 rounded-full" 
+                      style={{ width: `${value * 100}%` }}
+                    ></div>
+                  </div>
+                </div>
+              ))}
+            </div>
+          </Card>
+
+          {/* --- Risk Settings --- */}
+          <Card title="Risk Settings">
+            <form className="space-y-4">
+              <div>
+                <label className="block text-sm font-medium text-gray-300 mb-1">
+                  Max Position (USD)
+                </label>
+                <input 
+                  type="number" 
+                  defaultValue={mockRiskSettings.max_position_usd}
+                  className="w-full bg-gray-700 border border-gray-600 rounded-md p-2 text-white"
+                />
+              </div>
+              <div>
+                <label className="block text-sm font-medium text-gray-300 mb-1">
+                  Confidence Cutoff (Trades only above this %)
+                </label>
+                <input 
+                  type="number"
+                  step="0.01"
+                  defaultValue={mockRiskSettings.confidence_cutoff}
+                  className="w-full bg-gray-700 border border-gray-600 rounded-md p-2 text-white"
+                />
+              </div>
+              <div>
+                <label className="block text-sm font-medium text-gray-300 mb-1">
+                  Max Drawdown (%)
+                </label>
+                <input 
+                  type="number" 
+                  defaultValue={mockRiskSettings.max_drawdown_pct}
+                  className="w-full bg-gray-700 border border-gray-600 rounded-md p-2 text-white"
+                />
+              </div>
+              <button 
+                type="button" 
+                className="w-full bg-blue-600 hover:bg-blue-700 text-white font-bold py-2 px-4 rounded-lg"
+              >
+                Save Settings
+              </button>
+            </form>
+          </Card>
+
+        </div>
+      </div>
+    </div>
+  );
+}

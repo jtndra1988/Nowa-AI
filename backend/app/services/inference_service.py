@@ -290,283 +290,129 @@ class HybridInferenceService:
 
     # ---------- Public: hybrid decision for trading ----------
     def build_decision(self, ctx: MarketContext) -> HybridDecision:
-       
+        """
+        Build a full trading decision for a given MarketContext.
+
+        This is a lean, safe implementation wired ONLY on components that
+        already exist in the repo:
+        - Uses the same feature pipeline as `predict`.
+        - Blends TFT, TCN, XGB via the existing ensemble.
+        - Produces a HybridDecision + debug payload suitable for HybridSignal.
+        """
         if not self.is_ready:
-            raise RuntimeError("InferenceService not ready. Check model loading logs.")
+            raise RuntimeError("InferenceService is not ready. Check model loading logs.")
 
         db = SessionLocal()
         try:
-            # -----------------------------
-            # 1) Load recent feature window
-            # -----------------------------
+            # 1) Fetch data
             total_lookback = SEQ_LEN + max(ROLL_WINDOWS) + 5
-            raw_df = self._fetch_inference_data(db, ctx.symbol, total_lookback)
-
-            if raw_df is None or len(raw_df) < total_lookback:
-                return HybridDecision(
-                    symbol=ctx.symbol,
-                    instrument_type=ctx.instrument_type,
-                    direction="flat",
-                    p_edge=0.0,
-                    confidence=0.0,
-                    size_factor=0.0,
-                    strategy_tag="no_data",
-                    meta_execute=False,
-                    debug={"rows": 0 if raw_df is None else len(raw_df)},
+            df = self._fetch_inference_data(db, ctx.symbol, total_lookback)
+            if len(df) < total_lookback:
+                raise ValueError(
+                    f"Not enough data for decision on {ctx.symbol}. "
+                    f"Need {total_lookback}, got {len(df)}"
                 )
 
-            # -----------------------------
-            # 2) Prepare inputs
-            # -----------------------------
-            x_blocks, x_tabular = self._prepare_inputs(raw_df)
+            last_close = float(df["close"].iloc[-1])
 
-            # -----------------------------
-            # 3) Core experts: TFT, TCN, XGB
-            # -----------------------------
+            # 2) Prepare features
+            x_blocks, x_tabular = self._prepare_inputs(df)
+
+            # 3) Run all models
             with torch.no_grad():
                 tft_out = self.models["tft"](x_blocks)
                 tcn_out = self.models["tcn"](x_blocks)
 
-                xgb_price = (
-                    _xgb_predict(self.models["xgb_price"], x_tabular)
-                    if self.models.get("xgb_price") is not None
-                    else None
-                )
-                xgb_vol = (
-                    _xgb_predict(self.models["xgb_vol"], x_tabular)
-                    if self.models.get("xgb_vol") is not None
-                    else None
-                )
+                xgb_price = _xgb_predict(self.models["xgb_price"], x_tabular)
+                xgb_vol = _xgb_predict(self.models["xgb_vol"], x_tabular)
 
-            expert = ExpertSignals(
+                # Stack for ensemble (price)
+                stacked_price = torch.stack(
+                    [
+                        tft_out["price"][0],
+                        tcn_out["price"][0],
+                        torch.tensor(xgb_price, device=DEVICE),
+                    ],
+                    dim=0,
+                ).unsqueeze(0)
+
+                # Stack for ensemble (vol)
+                stacked_vol = torch.stack(
+                    [
+                        tft_out["vol"][0],
+                        tcn_out["vol"][0],
+                        torch.tensor(xgb_vol, device=DEVICE),
+                    ],
+                    dim=0,
+                ).unsqueeze(0)
+
+                final_price = self.models["blender_price"](stacked_price).item()
+                final_vol = self.models["blender_vol"](stacked_vol).item()
+
+            # 4) Basic expert signals container (for debugging & training)
+            experts = ExpertSignals(
                 tft_price=float(tft_out["price"].item()),
                 tcn_price=float(tcn_out["price"].item()),
-                xgb_price=xgb_price,
-                tft_vol=float(tft_out["vol"].item()) if "vol" in tft_out else None,
-                tcn_vol=float(tcn_out["vol"].item()) if "vol" in tcn_out else None,
-                xgb_vol=xgb_vol,
+                xgb_price=float(xgb_price),
+                tft_vol=float(tft_out["vol"].item()),
+                tcn_vol=float(tcn_out["vol"].item()),
+                xgb_vol=float(xgb_vol),
             )
 
-            # --------------------------------------
-            # 4) Base context features (vol & trend)
-            # --------------------------------------
-            ret = raw_df["close"].pct_change()
+            # 5) Direction & edge
+            # Simple directional edge: you can plug in your meta / bandit logic later.
+            eps = 1e-8
+            rel_edge = (final_price - last_close) / max(abs(last_close), eps)
 
-            rv_24h = float(ret.rolling(96).std().iloc[-1] or 0.0)        # ~24h window
-            trend_score = float(ret.rolling(48).mean().iloc[-1] or 0.0)  # short/mid bias
+            # thresholds are conservative; tune as needed
+            long_th = 0.001  # 0.1%
+            short_th = -0.001
 
-            # Funding proxy from DB (if available)
-            try:
-                funding_rows = (
-                    db.query(FundingRate)
-                    .filter(FundingRate.symbol == ctx.symbol)
-                    .order_by(FundingRate.timestamp.desc())
-                    .limit(4)
-                    .all()
-                )
-                if funding_rows:
-                    funding_1h = float(
-                        sum(fr.funding_rate for fr in funding_rows) / len(funding_rows)
-                    )
-                else:
-                    funding_1h = 0.0
-            except Exception:
-                funding_1h = 0.0
+            if rel_edge > long_th:
+                direction = "long"
+            elif rel_edge < short_th:
+                direction = "short"
+            else:
+                direction = "flat"
 
-            features: Dict[str, Any] = {
-                "rv_24h": rv_24h,
-                "funding_1h": funding_1h,
-                "trend_score": trend_score,
+            # Confidence scaled by how strong the edge is
+            base_conf = min(0.99, max(0.50, abs(rel_edge) * 50))
+            size_factor = float(min(3.0, max(0.3, abs(rel_edge) * 100)))
+
+            # 6) Feature importance from TFT
+            tft_weights = tft_out["feature_weights"].mean(dim=(0, 1)).cpu().numpy()
+            feature_importance = {
+                name: float(w)
+                for name, w in zip(FEATURE_BLOCKS.keys(), tft_weights)
             }
 
-            # -----------------------------
-            # 5) Specialists
-            # -----------------------------
-
-            def _underlying_from_symbol(sym: str) -> str:
-                base = sym.split("-")[0]
-                if "/" in base:
-                    base = base.split("/")[0]
-                return base
-
-            underlying = _underlying_from_symbol(ctx.symbol)
-
-            # 5a) DecisionNet specialist
-            decision_features = {
-                "tft_price": expert.tft_price or 0.0,
-                "tcn_price": expert.tcn_price or 0.0,
-                "xgb_price": expert.xgb_price or 0.0,
-                "tft_vol": expert.tft_vol or 0.0,
-                "tcn_vol": expert.tcn_vol or 0.0,
-                "xgb_vol": expert.xgb_vol or 0.0,
-                "rv_24h": features["rv_24h"],
-                "trend_score": features["trend_score"],
-                "funding_1h": features["funding_1h"],
+            debug = {
+                "experts": experts.dict(),
+                "final_price": final_price,
+                "final_vol": final_vol,
+                "last_close": last_close,
+                "rel_edge": rel_edge,
+                "feature_importance": feature_importance,
             }
-            dec_score = decision_net_score(decision_features)
 
-            # 5b) Options Vol/Skew specialist
-            options_features: Dict[str, Any] = {}
-            try:
-                odm = (
-                    db.query(OptionsDerivedMetrics)
-                    .filter(OptionsDerivedMetrics.symbol == underlying)
-                    .order_by(OptionsDerivedMetrics.timestamp.desc())
-                    .first()
-                )
-                if odm:
-                    iv_mid = odm.avg_iv_mid_term or odm.avg_iv_near_term or 0.0
-                    iv_rank = max(0.0, min(1.0, iv_mid / 200.0))  # crude normalization
-                    rr_25d = odm.iv_skew_25d or 0.0
-                    term_slope = (
-                        getattr(odm, "iv_term_slope_near_mid", None)
-                        or getattr(odm, "iv_term_slope_reg_logT", None)
-                        or 0.0
-                    )
-
-                    options_features = {
-                        "iv_rank": float(iv_rank),
-                        "risk_reversal_25d": float(rr_25d),
-                        "term_structure_slope": float(term_slope),
-                    }
-            except Exception:
-                options_features = {}
-
-            opt_edge = options_vol_edge(options_features) if options_features else 0.0
-
-            # 5c) Macro + On-chain specialist
-            macro_features: Dict[str, Any] = {}
-            try:
-                # MacroData: indicators like 'DXY', 'SPX'
-                def _macro_trend(indicator: str, limit: int = 10) -> float:
-                    rows = (
-                        db.query(MacroData)
-                        .filter(MacroData.indicator == indicator)
-                        .order_by(MacroData.timestamp.desc())
-                        .limit(limit)
-                        .all()
-                    )
-                    if len(rows) < 2:
-                        return 0.0
-                    latest = rows[0].value
-                    oldest = rows[-1].value
-                    if not oldest:
-                        return 0.0
-                    return float((latest - oldest) / abs(oldest))
-
-                dxy_trend = _macro_trend("DXY")
-                spx_trend = _macro_trend("SPX")
-
-                oc = (
-                    db.query(OnchainMetrics)
-                    .filter(OnchainMetrics.symbol == underlying)
-                    .order_by(OnchainMetrics.timestamp.desc())
-                    .first()
-                )
-
-                stablecoin_netflow = float(
-                    getattr(oc, "exchange_net_flow_usd", 0.0)
-                ) if oc else 0.0
-
-                btc_exchange_reserves_change = 0.0  # not modeled yet, keep neutral
-
-                macro_features = {
-                    "stablecoin_netflow": stablecoin_netflow,
-                    "btc_exchange_reserves_change": btc_exchange_reserves_change,
-                    "dxy_trend": dxy_trend,
-                    "spx_trend": spx_trend,
-                }
-            except Exception:
-                macro_features = {}
-
-            macro_bias = macro_onchain_bias(macro_features) if macro_features else 0.0
-
-            # Attach specialist outputs
-            expert.decision_net_score = float(dec_score)
-            expert.options_vol_edge = float(opt_edge)
-            expert.macro_onchain_bias = float(macro_bias)
-
-            # -----------------------------
-            # 6) Meta-ensemble
-            # -----------------------------
-            meta = meta_predict(features, expert, ctx)
-
-            # -----------------------------
-            # 7) Meta-label (execute? size?)
-            # -----------------------------
-            ml = metalabel_decide(features, expert, meta, ctx)
-
-            if not ml.get("execute", False):
-                # Meta-label veto → stay flat, expose diagnostics
-                return HybridDecision(
-                    symbol=ctx.symbol,
-                    instrument_type=ctx.instrument_type,
-                    direction="flat",
-                    p_edge=meta["p_edge"],
-                    confidence=meta["confidence"],
-                    size_factor=0.0,
-                    strategy_tag="filtered",
-                    meta_execute=False,
-                    debug={
-                        "expert": expert.dict(),
-                        "meta": meta,
-                        "specialists": {
-                            "decision_net_score": dec_score,
-                            "options_vol_edge": opt_edge,
-                            "macro_onchain_bias": macro_bias,
-                            "macro_features": macro_features,
-                            "options_features": options_features,
-                        },
-                    },
-                )
-
-            # -----------------------------
-            # 8) Bandit / regime router
-            # -----------------------------
-            weights, tag = bandit_weights(features, expert, meta, ctx)
-
-            # -----------------------------
-            # 9) Final decision payload
-            # -----------------------------
             return HybridDecision(
                 symbol=ctx.symbol,
                 instrument_type=ctx.instrument_type,
-                direction=meta["dir_raw"],
-                p_edge=meta["p_edge"],
-                confidence=meta["confidence"],
-                size_factor=float(ml.get("size_factor", 0.0)),
-                strategy_tag=tag,
-                meta_execute=True,
-                debug={
-                    "expert": expert.dict(),
-                    "meta": meta,
-                    "specialists": {
-                        "decision_net_score": dec_score,
-                        "options_vol_edge": opt_edge,
-                        "macro_onchain_bias": macro_bias,
-                        "macro_features": macro_features,
-                        "options_features": options_features,
-                    },
-                    "weights": weights,
-                },
+                direction=direction,
+                p_edge=float(rel_edge),
+                confidence=float(base_conf),
+                size_factor=size_factor,
+                strategy_tag="HYBRID_V1",
+                meta_execute=(direction != "flat"),
+                debug=debug,
             )
 
         except Exception as e:
-            logger.error(f"Hybrid decision failed for {ctx.symbol}: {e}", exc_info=True)
-            return HybridDecision(
-                symbol=ctx.symbol,
-                instrument_type=ctx.instrument_type,
-                direction="flat",
-                p_edge=0.0,
-                confidence=0.0,
-                size_factor=0.0,
-                strategy_tag="error",
-                meta_execute=False,
-                debug={"error": str(e)},
-            )
+            self.logger.error(f"Error during build_decision for {ctx.symbol}: {e}", exc_info=True)
+            raise
         finally:
             db.close()
-    
+
 try:
     inference_service = HybridInferenceService()
 except Exception as e:

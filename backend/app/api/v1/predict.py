@@ -18,7 +18,7 @@ class HybridPredictResponse(BaseModel):
     timestamp: datetime
     price_prediction: float
     volatility_prediction: float
-    model_version_id: int | None = None
+    model_version_id: Optional[int] = None
     feature_importance: dict
 
 
@@ -85,19 +85,6 @@ def hybrid_signal(
     ctx: MarketContext,
     db: Session = Depends(get_db),
 ):
-    """
-    Return a trade-ready hybrid decision for the given context.
-
-    This is the main endpoint your execution bot (Nowa) should call.
-
-    Example payload:
-    {
-      "symbol": "BTC-PERP",
-      "instrument_type": "perp",
-      "exchange": "deribit",
-      "timestamp": 1731240000
-    }
-    """
     if inference_service is None or not inference_service.is_ready:
         logger.error("Inference service not ready or failed to load.")
         raise HTTPException(

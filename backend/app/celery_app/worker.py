@@ -15,8 +15,6 @@ import threading
 from typing import List, Optional, Any, Dict
 import numpy as np
 import pandas as pd
-# --- REMOVED old import ---
-# from backend.app.tasks.ml_retrain import retrain_symbol 
 from celery import signals
 from celery.schedules import crontab
 from celery.signals import worker_ready, worker_shutdown, task_prerun, task_postrun, task_failure
@@ -35,397 +33,373 @@ from app.db import models
 # --- Use SessionLocal for task-level sessions ---
 from app.db.database import SessionLocal, get_db
 
-# --- Service/task imports (safe at import time) ----
-# TODO: consider moving to functions if they grow side-effects
-from app.services.settings_service import RiskSettingsService
-from app.rt_adapt.event_bus import Q, bus
-
-# --- Portfolio/Risk imports ---
-from app.portfolio.allocator import portfolio_rebalance_suggest, portfolio_hedge_suggest
-from app.portfolio.state import portfolio_tick
-from app.risk.engine import orders_monitor
-from app.rt_adapt.adaptive import on_symbol_event # keep this for regime changes
-from app.rt_adapt.bar_writer import on_bar_close
-
-# --- Task imports ---
+# --- Import Tasks ---
 from app.tasks.collectors import (
-    collect_market_data,
-    collect_option_metrics
+    run_all_collectors,
+    run_funding_collector,
+    run_orderbook_collector,
+    run_f_g_collector,
+    run_macro_collector,
+    run_options_collector,
+    run_onchain_collector,
+    run_github_collector,
+    run_cross_asset_corr_collector,
 )
-# --- Import all data collectors ---
-from app.tasks.cross_asset_corre_collector import collect_cross_asset_correlation
-from app.tasks.funding_collector import collect_funding_rates
-from app.tasks.github_collector import collect_github_activity
-from app.tasks.onchain_collector import collect_onchain_metrics
-from app.tasks.orderbook_collector import collect_orderbook_data
-from app.tasks.sentiment_collector import collect_all_sentiment
+from app.tasks.sentiment_scorer import run_sentiment_scorer
+from app.tasks.sentiment_collector import run_all_sentiment_collectors
 from app.tasks.sentiment_fusion_collector import run_sentiment_fusion
 
-# --- CORRECTED IMPORT: Import our *new* full training pipeline task ---
-from app.tasks.training_tasks import run_full_retraining_pipeline
-from app.services.inference_service import inference_service
-from app.hybrid.schemas import MarketContext
-from app.db.models import HybridSignal
-# --- REMOVED old, broken task imports ---
-# from app.tasks.training_tasks import (
-#     retrain_models_task,
-#     train_xgboost_task,
-#     train_fusion_head_task
-# )
+# --- UPDATED: Import ALL training tasks, including LLM and RL ---
+from app.tasks.training_tasks import (
+    retrain_all_core_models,
+    retrain_ensemble,
+    retrain_llm_narrative_model,  # <-- ADDED
+    retrain_rl_agent              # <-- ADDED
+)
+# --- END UPDATE ---
 
+from app.services.settings_service import RiskSettingsService
+
+# ---- Globals (populated by worker_ready) ----
+# This is a cache of risk settings, refreshed every 60s
+RISK_SETTINGS: Dict[str, models.RiskSettings] = {}
+LAST_RISK_REFRESH = 0
 
 logger = logging.getLogger(__name__)
 
-# --------------------------------
-# Global state (worker-level)
-# --------------------------------
-risk_settings_service: Optional[RiskSettingsService] = None
 
-# --------------------------------
-# Watchdog
-# --------------------------------
+# ---- 1. Task Scheduling (Celery Beat) ----
 
-LAST_TASK_TS = datetime.now(timezone.utc)
-WATCHDOG_EXIT_CODE = 99
-
-def _watchdog_thread(interval_min: int = 15):
+@celery_app.on_after_configure.connect
+def setup_periodic_tasks(sender, **kwargs):
     """
-    If no task received in {interval_min} minutes, exit worker.
-    K8s/supervisor will restart it. Fixes hung connections.
+    This is the Celery Beat scheduler.
+    It runs in a separate process from the worker.
     """
-    global LAST_TASK_TS
-    logger.info(f"[Watchdog] Starting watchdog thread (pid {os.getpid()})...")
-    interval_sec = interval_min * 60
+    global RISK_SETTINGS
+    logger.info("Configuring periodic tasks (Celery Beat)...")
+
+    # --- Data Collection (Your existing tasks) ---
+    sender.add_periodic_task(
+        crontab(minute='*/15'),  # Every 15 minutes
+        run_all_collectors.s(),
+        name='[Data] Run All Collectors'
+    )
+    sender.add_periodic_task(
+        crontab(minute='*/5'),  # Every 5 minutes
+        run_sentiment_scorer.s(),
+        name='[Data] Run Sentiment Scorer'
+    )
+    sender.add_periodic_task(
+        crontab(minute='*/5'),
+        run_all_sentiment_collectors.s(),
+        name='[Data] Run Sentiment Collectors'
+    )
+    sender.add_periodic_task(
+        crontab(minute='*/30'),
+        run_sentiment_fusion.s(),
+        name='[Data] Run Sentiment Fusion'
+    )
+    sender.add_periodic_task(
+        crontab(minute='*/60'),
+        run_github_collector.s(),
+        name='[Data] Run GitHub Collector'
+    )
+    sender.add_periodic_task(
+        crontab(hour='*/1'),
+        run_funding_collector.s(),
+        name='[Data] Run Funding Collector'
+    )
+    sender.add_periodic_task(
+        crontab(minute='*/15'),
+        run_orderbook_collector.s(),
+        name='[Data] Run Orderbook Collector'
+    )
+    sender.add_periodic_task(
+        crontab(hour='*/4'),
+        run_f_g_collector.s(),
+        name='[Data] Run F&G Collector'
+    )
+    sender.add_periodic_task(
+        crontab(hour='*/4'),
+        run_macro_collector.s(),
+        name='[Data] Run Macro Collector'
+    )
+    sender.add_periodic_task(
+        crontab(hour='*/1'),
+        run_options_collector.s(),
+        name='[Data] Run Options Collector'
+    )
+    sender.add_periodic_task(
+        crontab(hour='*/4'),
+        run_onchain_collector.s(),
+        name='[Data] Run On-chain Collector'
+    )
+    sender.add_periodic_task(
+        crontab(hour='*/1'),
+        run_cross_asset_corr_collector.s(),
+        name='[Data] Run Cross-Asset Corr Collector'
+    )
+
+    # --- Core Model Training Pipeline (Every 4 Hours) ---
+    # This section is UPDATED to create a 3-stage pipeline.
     
-    while True:
-        time.sleep(30) # Check every 30s
-        idle_time = (datetime.now(timezone.utc) - LAST_TASK_TS).total_seconds()
-        
-        if idle_time > interval_sec:
-            logger.error(
-                f"[Watchdog] Worker idle for > {interval_min} minutes. "
-                f"Exiting with code {WATCHDOG_EXIT_CODE} for restart."
-            )
-            alert_worker_event(
-                f"Watchdog: Worker idle for > {interval_min} min. Restarting."
-            )
-            # Send signal to main thread to exit
-            os._exit(WATCHDOG_EXIT_CODE) # Hard exit
+    # 1. (L1) Train core specialists (TFT, TCN, XGB)
+    # (Replaces your original 'retrain_all_core_models' task)
+    sender.add_periodic_task(
+        crontab(minute=0, hour='*/4'),  # Every 4 hours, on the hour
+        retrain_all_core_models.s(),
+        name='[ML] Retrain All Core L1 Models'
+    )
+    
+    # 2. (L1) Train LLM specialist (runs in parallel with other L1)
+    sender.add_periodic_task(
+        crontab(minute=0, hour='*/4'),  # Every 4 hours, on the hour
+        retrain_llm_narrative_model.s(), # <-- NEW TASK ADDED
+        name='[ML] Retrain LLM Narrative L1 Model'
+    )
 
-class Watchdog(threading.Thread):
-    def __init__(self, interval_min: int):
-        super().__init__()
-        self.interval_min = interval_min
-        self.daemon = True # Exit when main thread exits
+    # 3. (L2) Train the "Judge" (DecisionNet/Ensemble)
+    #    (Runs 15 mins later, needs L1 models to be done)
+    # (Replaces your original 'retrain_ensemble' task)
+    sender.add_periodic_task(
+        crontab(minute=15, hour='*/4'),  # Every 4 hours, at 15 past
+        retrain_ensemble.s(),
+        name='[ML] Retrain L2 Ensemble/DecisionNet'
+    )
+    
+    # 4. (L3) Train the "Actor" (RL Agent)
+    #    (Runs 30 mins later, needs L2 model to be done)
+    sender.add_periodic_task(
+        crontab(minute=30, hour='*/4'),  # Every 4 hours, at 30 past
+        retrain_rl_agent.s(), # <-- NEW TASK ADDED
+        name='[ML] Retrain L3 RL Execution Agent'
+    )
+    
+    logger.info("Periodic tasks configured.")
 
-    def run(self):
-        _watchdog_thread(self.interval_min)
 
-# --------------------------------
-# Prometheus
-# --------------------------------
-def _start_prometheus_server(port: int):
-    """Start a Prometheus metrics server in a background thread."""
-    try:
-        from prometheus_client import start_http_server
-        start_http_server(port)
-        logger.info(f"[Prometheus] Metrics server started on port {port}")
-    except ImportError:
-        logger.warning(
-            "[Prometheus] prometheus_client not found. Skipping metrics server."
-        )
-    except OSError as e:
-        logger.error(
-            f"[Prometheus] Failed to start metrics server on port {port}: {e}"
-        )
+# ---- 2. Worker Lifecycle & Monitoring (All your original code) ----
 
-# --------------------------------
-# Signals
-# --------------------------------
+LAST_TASK_TS = time.time()  # Last time a task finished
+IS_READY = False  # Is this worker ready to accept tasks?
+
 @worker_ready.connect
 def on_worker_ready(sender, **kwargs):
-    logger.warning(f"Celery worker ready (pid: {os.getpid()}). Initializing services...")
-    global risk_settings_service
+    """
+    Runs ONCE when the worker process starts.
+    - Start Prometheus
+    - Start Watchdog
+    - Load initial risk settings
+    """
+    global IS_READY
+    logger.info(f"Worker ready (PID: {os.getpid()}). Initializing...")
+    alert_worker_event("Worker ready", "INFO")
     
-    # 1. Init Prometheus
-    # start_prometheus_server(9100)
+    # Start Prometheus server in a background thread
+    prom_port = settings.PROMETHEUS_PORT
+    prom_thread = threading.Thread(
+        target=_start_prometheus, args=(prom_port,), daemon=True
+    )
+    prom_thread.start()
+
+    # Start Watchdog in a background thread
+    watchdog_thread = Watchdog(interval_min=15)  # Restarts if idle > 15 min
+    watchdog_thread.start()
+
+    # Load initial risk settings
+    _refresh_risk_settings()
     
-    # 2. Init global services
-    db = SessionLocal()
-    try:
-        risk_settings_service = RiskSettingsService(db=db)
-        risk_settings_service.refresh_all_settings()
-        logger.info("[✅] RiskSettingsService initialized and warm.")
-    except Exception as e:
-        logger.error(f"Failed to init RiskSettingsService: {e}")
-    finally:
-        db.close()
-    
-    # 3. Init watchdog
-    # watchdog = Watchdog(15 * 60)  # 15 min
-    # watchdog.start()
-    
-    logger.info("[✅] Worker startup sequence complete.")
-    alert_worker_event(f"Celery worker started (pid: {os.getpid()}).")
+    IS_READY = True
+    logger.info("Worker initialization complete.")
 
 
 @worker_shutdown.connect
 def on_worker_shutdown(sender, **kwargs):
-    logger.warning(f"Celery worker shutting down (pid: {os.getpid()}).")
-    alert_worker_event(f"Celery worker shutdown (pid: {os.getpid()}).")
+    logger.warning("Worker shutting down...")
+    alert_worker_event("Worker shutdown", "WARNING")
 
 
 @task_prerun.connect
-def on_task_prerun(sender, task_id, task, args, kwargs, **extras):
+def on_task_prerun(task_id, task, args, kwargs, **z):
     """
-    Update watchdog timer before task runs.
+    Before any task runs, refresh risk settings if cache is stale.
     """
-    global LAST_TASK_TS
-    LAST_TASK_TS = datetime.now(timezone.utc)
-    logger.info(f"Starting task: {task.name} (id: {task_id})")
+    global LAST_RISK_REFRESH, RISK_SETTINGS
+    if (time.time() - LAST_RISK_REFRESH) > 60:  # Cache for 60s
+        _refresh_risk_settings()
+        
+    # --- Your existing pre-run logic ---
+    task_name = task.name
     
+    # Skip for settings refresh to avoid recursion
+    if task_name == 'app.services.settings_service.refresh_settings':
+        return
+        
+    # Check if task requires settings and if they are loaded
+    if 'symbol' in kwargs:
+        symbol = kwargs['symbol']
+        if symbol not in RISK_SETTINGS:
+            logger.warning(f"No risk settings found for {symbol}. Attempting refresh.")
+            _refresh_risk_settings()
+            if symbol not in RISK_SETTINGS:
+                logger.error(f"FATAL: No risk settings for {symbol} after refresh. Task may fail.")
+                # alert_task_failure(task_name, f"MissingRiskSettings: {symbol}", "") # Optional: alert
+                
+    elif task_name not in [
+        'app.tasks.collectors.run_all_collectors',
+        'app.tasks.sentiment_scorer.run_sentiment_scorer',
+        'app.tasks.sentiment_collector.run_all_sentiment_collectors',
+        'app.tasks.sentiment_fusion_collector.run_sentiment_fusion',
+        'app.tasks.collectors.run_github_collector',
+        'app.tasks.collectors.run_funding_collector',
+        'app.tasks.collectors.run_orderbook_collector',
+        'app.tasks.collectors.run_f_g_collector',
+        'app.tasks.collectors.run_macro_collector',
+        'app.tasks.collectors.run_options_collector',
+        'app.tasks.collectors.run_onchain_collector',
+        'app.tasks.collectors.run_cross_asset_corr_collector',
+        'app.tasks.training_tasks.retrain_all_core_models',
+        'app.tasks.training_tasks.retrain_ensemble',
+        'app.tasks.training_tasks.retrain_llm_narrative_model', # <-- ADDED
+        'app.tasks.training_tasks.retrain_rl_agent' # <-- ADDED
+    ]:
+        logger.debug(f"Task {task_name} does not seem to require risk settings.")
+
 
 @task_postrun.connect
-def on_task_postrun(sender, task_id, task, args, kwargs, retval, state, **extras):
+def on_task_postrun(task_id, task, args, kwargs, retval, state, **z):
     """
-    Update watchdog timer after task runs.
+    After any task runs, update the LAST_TASK_TS for the watchdog.
     """
     global LAST_TASK_TS
-    LAST_TASK_TS = datetime.now(timezone.utc)
-    logger.info(f"Finished task: {task.name} (id: {task_id}, state: {state})")
-    
-    # Metrics
-    time_task(task.name, state, retval)
+    LAST_TASK_TS = time.time()
+    WORKER_HEARTBEAT.set(int(LAST_TASK_TS))
 
 
 @task_failure.connect
-def on_task_failure(sender, task_id, exception, args, kwargs, traceback, einfo, **extras):
+def on_task_failure(task_id, exception, args, kwargs, traceback, einfo, **z):
     """
-    Alert on task failure.
+    Global failure handler.
     """
-    logger.error(f"Task {sender.name} (id: {task_id}) failed: {exception}")
-    alert_task_failure(sender.name, exception, traceback)
-
-
-# --------------------------------
-# Periodic Tasks (Beat)
-# --------------------------------
-@celery_app.on_after_configure.connect
-def setup_periodic_tasks(sender, **kwargs):
-    """
-    CELERYBEAT SCHEDULE
-    - Queues determined by Q() wrapper
-    - We use crontab for predictable wall-clock times
-    - We use simple floats for high-frequency tasks
-    """
-    logger.info("Configuring Celerybeat periodic tasks...")
-
-    # --- Data Collectors (high-frequency) → 'collectors' queue
-    sender.add_periodic_task(30.0, Q(collect_market_data.s(), "collectors"), name="Market Data Collector (30s)")
-    sender.add_periodic_task(60.0, Q(collect_orderbook_data.s(), "collectors"), name="Orderbook Collector (60s)")
-    sender.add_periodic_task(120.0, Q(collect_funding_rates.s(), "collectors"), name="Funding Rate Collector (2m)")
+    global LAST_TASK_TS
+    LAST_TASK_TS = time.time()  # Update heartbeart even on failure
+    WORKER_HEARTBEAT.set(int(LAST_TASK_TS))
     
-    # --- Data Collectors (low-frequency) → 'default' queue
-    sender.add_periodic_task(crontab(minute='*/15'), Q(collect_all_sentiment.s(), "default"), name="Sentiment Collector (15m)")
-    sender.add_periodic_task(crontab(minute='*/30'), Q(collect_onchain_metrics.s(), "default"), name="Onchain Collector (30m)")
-    sender.add_periodic_task(crontab(hour='*/1'), Q(collect_github_activity.s(), "default"), name="Github Collector (1h)")
-    sender.add_periodic_task(crontab(hour='*/2'), Q(collect_option_metrics.s(), "default"), name="Option Metrics Collector (2h)")
-    sender.add_periodic_task(crontab(hour='*/4'), Q(collect_cross_asset_correlation.s(), "default"), name="Cross-Asset Corr Collector (4h)")
-
-    # --- Feature Engineering / Events → 'signals' queue
-    sender.add_periodic_task(60.0, Q(on_bar_close.s(timeframe='1m'), "signals"), name="1m Bar Close Event")
-    sender.add_periodic_task(300.0, Q(on_bar_close.s(timeframe='5m'), "signals"), name="5m Bar Close Event")
-    sender.add_periodic_task(60.0, Q(on_symbol_event.s(), "signals"), name="Symbol Event Aggregator (1m)")
-    
-    # Refresh risk settings cache
-    sender.add_periodic_task(60.0, Q(refresh_risk_settings_task.s(), "default"), name="Refresh Risk Settings (60s)")
-
-    # --- ML Training (Weekly, Sunday) → 'retrain' queue
-    sender.add_periodic_task(crontab(hour=4, minute=0, day_of_week='sun'),
-                             Q(run_sentiment_fusion.s(), "retrain"),
-                             name="Run Sentiment Fusion (Weekly)")
-    # --- THIS IS THE FIX ---
-    # Replace the three old tasks with one call to our new pipeline.
-    sender.add_periodic_task(crontab(hour=4, minute=30, day_of_week='sun'),
-                             Q(run_full_retraining_pipeline.s(), "retrain"),
-                             name="Weekly Full Hybrid Ensemble Retraining Pipeline")
-    # Portfolio monitoring (you had these) → signals (low CPU)
-    sender.add_periodic_task(30.0,  Q(portfolio_tick.s(), "signals"),             name="portfolio_tick_30s")
-    sender.add_periodic_task(120.0, Q(portfolio_rebalance_suggest.s(), "signals"),name="portfolio_rebalance_suggest_2m")
-    sender.add_periodic_task(90.0,  Q(portfolio_hedge_suggest.s(), "signals"),    name="portfolio_hedge_suggest_90s")
-    sender.add_periodic_task(5.0,   Q(orders_monitor.s(), "signals"),            name="orders_monitor_5s")
-        # --- Hybrid Signal Generation (optional) → 'signals' queue
-    sender.add_periodic_task(
-        60.0,
-        Q(generate_hybrid_signals.s(), "signals"),
-        name="Hybrid Signal Generator (60s)"
-    )
-
-    
-    logger.info("[✅] Celerybeat periodic tasks configured.")
-# --------------------------------
-# Tasks
-# --------------------------------
-@celery_app.task(name="tasks.refresh_risk_settings", base=BaseTaskWithRetry)
-def refresh_risk_settings_task():
-    """
-    Periodically refresh the settings cache in the global service.
-    """
-    global risk_settings_service
-    if not risk_settings_service:
-        # Service failed to init, retry
-        logger.warning("RiskSettingsService not initialized, re-initializing...")
-        db = SessionLocal()
-        try:
-            risk_settings_service = RiskSettingsService(db=db)
-        finally:
-            db.close()
-            
-    if risk_settings_service:
-        logger.info("Refreshing risk settings cache...")
-        risk_settings_service.refresh_all_settings()
-    else:
-        logger.error("Cannot refresh settings, RiskSettingsService is still None.")
-
-
-# --------------------------------------------------------------------
-# --- ALL YOUR ORIGINAL TASK DEFINITIONS (UNCHANGED, BUT FIXED) ---
-# --------------------------------------------------------------------
-
-# Note: These are the task *definitions*. The scheduling is handled
-# in the `setup_periodic_tasks` function above.
-
-@celery_app.task(name="tasks.collect_market_data", base=BaseTaskWithRetry)
-def task_collect_market_data():
-    return collect_market_data()
-
-@celery_app.task(name="tasks.collect_option_metrics", base=BaseTaskWithRetry)
-def task_collect_option_metrics():
-    return collect_option_metrics()
-
-@celery_app.task(name="tasks.collect_cross_asset_correlation", base=BaseTaskWithRetry)
-def task_collect_cross_asset_correlation():
-    return collect_cross_asset_correlation()
-
-@celery_app.task(name="tasks.collect_funding_rates", base=BaseTaskWithRetry)
-def task_collect_funding_rates():
-    return collect_funding_rates()
-
-@celery_app.task(name="tasks.collect_github_activity", base=BaseTaskWithRetry)
-def task_collect_github_activity():
-    return collect_github_activity()
-
-@celery_app.task(name="tasks.collect_onchain_metrics", base=BaseTaskWithRetry)
-def task_collect_onchain_metrics():
-    return collect_onchain_metrics()
-
-@celery_app.task(name="tasks.collect_orderbook_data", base=BaseTaskWithRetry)
-def task_collect_orderbook_data():
-    return collect_orderbook_data()
-
-@celery_app.task(name="tasks.collect_all_sentiment", base=BaseTaskWithRetry)
-def task_collect_all_sentiment():
-    return collect_all_sentiment()
-
-@celery_app.task(name="tasks.run_sentiment_fusion", base=BaseTaskWithRetry)
-def task_run_sentiment_fusion():
-    return run_sentiment_fusion()
-
-@celery_app.task(name="tasks.on_bar_close", base=BaseTaskWithRetry)
-def task_on_bar_close(timeframe: str):
-    return on_bar_close(timeframe)
-
-# --- THIS IS THE FINAL FIX ---
-@celery_app.task(name="tasks.on_symbol_event", base=BaseTaskWithRetry)
-def task_on_symbol_event():
-    # --- REMOVED old ML retrain logic ---
-    # try:
-    #     retrain_symbol.delay(symbol, "AUTO", 1000)
-    # except Exception as e:
-    #     logger.error(f"Failed to submit auto-retrain task for {symbol}: {e}")
-    # --- END OF FIX ---
-    return on_symbol_event()
-# --- END OF FINAL FIX ---
-
-@celery_app.task(name="tasks.portfolio_tick", base=BaseTaskWithRetry)
-def task_portfolio_tick():
-    return portfolio_tick()
-
-@celery_app.task(name="tasks.portfolio_rebalance_suggest", base=BaseTaskWithRetry)
-def task_portfolio_rebalance_suggest():
-    return portfolio_rebalance_suggest()
-
-@celery_app.task(name="tasks.portfolio_hedge_suggest", base=BaseTaskWithRetry)
-def task_portfolio_hedge_suggest():
-    return portfolio_hedge_suggest()
-
-@celery_app.task(name="tasks.orders_monitor", base=BaseTaskWithRetry)
-def task_orders_monitor():
-    return orders_monitor()
-@celery_app.task(name="tasks.generate_hybrid_signals", base=BaseTaskWithRetry)
-def generate_hybrid_signals():
-    """
-    Periodically compute hybrid decisions for a set of symbols
-    and log them for later training & monitoring.
-    """
-    if inference_service is None or not inference_service.is_ready:
-        logger.error("Inference service not ready in generate_hybrid_signals.")
-        return {"status": "error", "reason": "inference_not_ready"}
-
-    symbols = [
-        "BTC-PERP",
-        "ETH-PERP",
-        # extend as needed
-    ]
-
-    from datetime import datetime, timezone
-
-    now_ts = int(datetime.now(timezone.utc).timestamp())
-    db = SessionLocal()
-
-    logged = 0
-
+    task_name = "unknown_task"
     try:
-        for sym in symbols:
-            ctx = MarketContext(
-                symbol=sym,
-                instrument_type="perp",
-                exchange="deribit",
-                timestamp=now_ts,
-            )
+        # Try to get name from task object first
+        if hasattr(args[0], 'name'):
+            task_name = args[0].name
+        # Fallback to string name if passed directly (e.g., from beat)
+        elif isinstance(args[0], str):
+            task_name = args[0]
+        elif 'task_name' in kwargs:
+            task_name = kwargs['task_name']
+    except Exception:
+        pass
+        
+    logger.error(f"Task {task_name} (ID: {task_id}) failed: {exception}")
+    alert_task_failure(task_name, exception, traceback)
 
-            try:
-                decision = inference_service.build_decision(ctx)
-            except Exception as e:
-                logger.error(f"[HybridSignal] Failed decision for {sym}: {e}", exc_info=True)
-                continue
 
-            try:
-                record = HybridSignal(
-                    symbol=decision.symbol,
-                    instrument_type=decision.instrument_type,
-                    exchange=ctx.exchange,
-                    direction=decision.direction,
-                    p_edge=decision.p_edge,
-                    confidence=decision.confidence,
-                    size_factor=decision.size_factor,
-                    strategy_tag=decision.strategy_tag,
-                    meta_execute=decision.meta_execute,
-                    debug_payload=decision.debug,
-                )
-                db.add(record)
-                db.commit()
-                logged += 1
-            except Exception as e:
-                db.rollback()
-                logger.error(f"[HybridSignal] Failed to persist for {sym}: {e}", exc_info=True)
+# ---- 3. Helper Functions (All your original code) ----
 
-        return {"status": "ok", "logged": logged}
+def _get_bybit_adapter():
+    """
+    Utility to get an initialized Bybit adapter.
+    TODO: This is still here, but consider moving logic to a shared service
+          to avoid direct instantiation in the worker.
+    """
+    try:
+        return BybitAdapter(
+            api_key=settings.BYBIT_API_KEY,
+            api_secret=settings.BYBIT_API_SECRET,
+            base_url=settings.BYBIT_BASE_URL,
+        )
+    except Exception as e:
+        logger.error(f"Failed to initialize BybitAdapter: {e}")
+        return None
 
+def _refresh_risk_settings():
+    """
+    Internal: Refresh the global RISK_SETTINGS cache.
+    """
+    global RISK_SETTINGS, LAST_RISK_REFRESH
+    logger.info("Refreshing risk settings cache...")
+    try:
+        db = SessionLocal()
+        settings_svc = RiskSettingsService(db)
+        all_settings = settings_svc.get_all_settings()
+        RISK_SETTINGS = {s.symbol: s for s in all_settings}
+        LAST_RISK_REFRESH = time.time()
+        logger.info(f"Loaded {len(RISK_SETTINGS)} risk setting profiles.")
+    except Exception as e:
+        logger.error(f"Failed to refresh risk settings: {e}", exc_info=True)
+        # Don't overwrite cache on failure, just log
     finally:
-        db.close()
+        if 'db' in locals() and db:
+            db.close()
 
-def _start_prometheus(port: int = 9100):
+def _get_active_symbols_from_settings() -> List[str]:
+    """
+    Gets a list of symbols that are marked as active in the settings.
+    """
+    global RISK_SETTINGS
+    if not RISK_SETTINGS:
+        _refresh_risk_settings()
+        
+    active_symbols = [
+        symbol for symbol, settings in RISK_SETTINGS.items() if settings.is_active
+    ]
+    logger.info(f"Found {len(active_symbols)} active symbols.")
+    return active_symbols
+
+def _get_risk_settings(symbol: str) -> Optional[models.RiskSettings]:
+    """
+    Safely get risk settings for a symbol from the cache.
+    """
+    return RISK_SETTINGS.get(symbol)
+
+
+class Watchdog(threading.Thread):
+    """
+    Restarts the worker if it's been idle for too long.
+    This protects against silent freezes (e.g., deadlocks, lost DB connection).
+    """
+    def __init__(self, interval_min=15):
+        super().__init__()
+        self.interval_sec = interval_min * 60
+        self.daemon = True
+        self.name = "WatchdogThread"
+        logger.info(
+            f"Watchdog initialized: will restart container if idle > {interval_min} min."
+        )
+
+    def run(self):
+        global LAST_TASK_TS
+        while True:
+            time.sleep(self.interval_sec)
+            idle_time = time.time() - LAST_TASK_TS
+            
+            if idle_time > self.interval_sec:
+                APP_RESTARTS.inc()
+                logger.critical(
+                    f"[WATCHDOG] No task completed in {idle_time:.0f}s. "
+                    f"Restarting container NOW."
+                )
+                alert_worker_event(
+                    f"Watchdog restart: idle for {idle_time:.0f}s", "CRITICAL"
+                )
+                
+                # Give logs a moment to flush
+                time.sleep(5)
+                
+                # Force-quit the container (requires PID 1 / Tini)
+                os._exit(1)
+
+
+def _start_prometheus(port: int):
     """Start a Prometheus metrics server in a background thread."""
     logger.info(f"Attempting to start Prometheus server on port {port}...")
     try:
@@ -460,4 +434,4 @@ if __name__ == "__main__":
     watchdog_thread.start()
     
     # Start the worker
-    celery_app.worker_main(argv=['worker', '--loglevel=info', '-E'])
+    celery_app.worker_main(argv=['worker', '--loglevel=info'])

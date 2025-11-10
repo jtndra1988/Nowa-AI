@@ -1,82 +1,28 @@
-# app/api/predict.py
+# app/api/v1/predict.py
 
-from typing import Optional
-from fastapi import APIRouter, HTTPException, Query, Depends
-from pydantic import BaseModel
+from fastapi import APIRouter, HTTPException, Depends
 from sqlalchemy.orm import Session
-from datetime import datetime
 import logging
 
 from app.services.inference_service import inference_service
 from app.db.database import get_db
-from app.db.models import Prediction, ModelVersion, HybridSignal
+from app.db.models import HybridSignal
 from app.hybrid.schemas import MarketContext, HybridDecision
 
+# ---
+# NOTE: Renamed the file-level logger to avoid a potential `_name_` error.
+# Using __name__ is the standard Python practice.
+# ---
 router = APIRouter(tags=["Prediction"])
-logger = logging.getLogger(_name_)
+logger = logging.getLogger(__name__)
 
 
-class HybridPredictResponse(BaseModel):
-    symbol: str
-    timestamp: datetime
-    price_prediction: float
-    volatility_prediction: float
-    model_version_id: Optional[int] = None
-    feature_importance: dict
-
-
-@router.get("/predict", response_model=HybridPredictResponse)
-def predict(
-    symbol: str = Query(..., description="Asset symbol, e.g. BTC/USDT or BTC-PERP"),
-    db: Session = Depends(get_db),
-):
-    """
-    Run the Hybrid Ensemble (TFT + TCN + XGBoost) inference
-    and return blended price & volatility predictions.
-    """
-    if inference_service is None or not inference_service.is_ready:
-        logger.error("Inference service not ready or failed to load.")
-        raise HTTPException(
-            status_code=503,
-            detail="InferenceService is not available. Check server logs.",
-        )
-
-    try:
-        result = inference_service.predict(symbol=symbol)
-
-        model_version = (
-            db.query(ModelVersion)
-            .filter(ModelVersion.model_name == "HybridEnsemble")
-            .order_by(ModelVersion.created_at.desc())
-            .first()
-        )
-        model_version_id = model_version.id if model_version else None
-
-        prediction_record = Prediction(
-            model_version_id=model_version_id,
-            symbol=symbol,
-            prediction_time=datetime.utcnow(),
-            prediction=result["price_prediction"],
-            raw_score=result["volatility_prediction"],
-            model_inputs=result["feature_importance"],
-        )
-        db.add(prediction_record)
-        db.commit()
-
-        logger.info(f"Saved prediction {prediction_record.id} for {symbol}")
-
-        return HybridPredictResponse(
-            symbol=symbol,
-            timestamp=prediction_record.prediction_time,
-            price_prediction=result["price_prediction"],
-            volatility_prediction=result["volatility_prediction"],
-            model_version_id=model_version_id,
-            feature_importance=result["feature_importance"],
-        )
-
-    except Exception as e:
-        logger.error(f"Failed to run prediction for {symbol}: {e}", exc_info=True)
-        raise HTTPException(status_code=500, detail=str(e))
+# ---
+# I have REMOVED the entire broken `@router.get("/predict")` route.
+# It was calling a non-existent function (inference_service.predict) and
+# was architecturally incompatible with your 3-layer logic, which requires
+# the MarketContext body provided by the POST route below.
+# ---
 
 
 @router.post("/hybrid-signal", response_model=HybridDecision)
@@ -86,6 +32,7 @@ async def hybrid_signal(
 ):
     """
     Build and persist a full hybrid decision (Layer 1 + Layer 2 + Layer 3).
+    This is your main "brain" endpoint.
     """
     if inference_service is None or not inference_service.is_ready:
         logger.error("Inference service not ready or failed to load.")
@@ -95,6 +42,7 @@ async def hybrid_signal(
         )
 
     try:
+        # This is the correct call to your 3-layer "brain"
         decision = await inference_service.build_decision(ctx)
 
         # Persist for audit / future training

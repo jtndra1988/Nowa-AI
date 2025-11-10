@@ -382,4 +382,41 @@ class Prediction(Base):
     __table_args__ = (
         Index("ix_predictions_sym_time", "symbol", "prediction_time"),
     )
+class AIExecutionLog(Base):
+    _tablename_ = "ai_execution_logs"
+
+    id = Column(Integer, primary_key=True, index=True)
+    timestamp = Column(DateTime, default=datetime.utcnow, nullable=False)
+
+    # --- Linkage to Hybrid Signal / Prediction ---
+    hybrid_signal_id = Column(Integer, ForeignKey("hybrid_signals.id"), nullable=False)
+    model_version_id = Column(Integer, ForeignKey("model_versions.id"), nullable=True)
+
+    # --- Decision Metadata ---
+    decided_action = Column(String(50), nullable=False)   # LONG / SHORT / HOLD / FLAT
+    execution_style = Column(String(50), nullable=True)   # RL, conservative, aggressive, rule_fallback, etc.
+    target_position = Column(Float, nullable=True)        # Suggested net exposure (-1 to 1)
+    executed_position = Column(Float, nullable=True)      # What was actually taken
+    executed_price = Column(Float, nullable=True)
+    exchange = Column(String(50), nullable=True)
+    symbol = Column(String(50), nullable=True)
+
+    # --- Performance Metrics ---
+    realized_pnl = Column(Float, nullable=True)
+    unrealized_pnl = Column(Float, nullable=True)
+    slippage = Column(Float, nullable=True)
+    latency_ms = Column(Integer, nullable=True)           # time from signal → execution
+    confidence = Column(Float, nullable=True)
+    p_edge = Column(Float, nullable=True)
+
+    # --- Diagnostic Payloads ---
+    rl_diagnostics = Column(JSON, nullable=True)          # RL debug (policy weights, reward components)
+    exec_meta = Column(JSON, nullable=True)               # Exchange/trade details (order ids, etc.)
+
+    # --- Relations ---
+    hybrid_signal = relationship("HybridSignal", backref="execution_logs")
+    model_version = relationship("ModelVersion")
+
+    def _repr_(self):
+        return f"<AIExecutionLog(id={self.id}, symbol={self.symbol}, action={self.decided_action})>"
 

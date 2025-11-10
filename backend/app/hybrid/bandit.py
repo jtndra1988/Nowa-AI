@@ -10,11 +10,7 @@ def bandit_weights(
     ctx: MarketContext,
 ) -> Tuple[Dict[str, float], str]:
     """
-    Simple heuristic "bandit":
-      - trend & sane vol -> trend-follow
-      - high vol -> momentum
-      - else -> mean-revert
-    Replace with proper contextual bandit later.
+    Simple regime-based weighting.
     """
     rv = float(features.get("rv_24h", 0.05))
     trend = float(features.get("trend_score", 0.0))

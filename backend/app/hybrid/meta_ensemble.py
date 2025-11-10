@@ -20,10 +20,9 @@ def meta_predict(
     ctx: MarketContext,
 ) -> Dict[str, Any]:
     """
-    Returns:
-      p_edge: P(trade has positive edge)
-      dir_raw: "long" / "short" / "flat"
-      confidence: same scale as p_edge
+    Meta-ensemble:
+      - Uses expert outputs + context -> edge probability + raw direction.
+      - If no trained model, falls back to deterministic blend.
     """
     _lazy_load()
 
@@ -42,22 +41,20 @@ def meta_predict(
         proba = float(_meta_model.predict_proba([row])[0, 1])
     else:
         scores = [
-            s
-            for s in [expert.tft_price, expert.tcn_price, expert.xgb_price]
+            s for s in (expert.tft_price, expert.tcn_price, expert.xgb_price)
             if s is not None
         ]
         if scores:
             avg = sum(scores) / len(scores)
-            # squashed into [0,1]
-            proba = max(
-                0.0,
-                min(0.5 + 0.5 * (avg / (abs(avg) + 1e-6)), 1.0),
-            )
+            # squashed into [0,1] around 0.5
+            proba = 0.5 + 0.4 * (avg / (abs(avg) + 1e-6))
+            proba = max(0.0, min(1.0, proba))
         else:
             proba = 0.5
 
     scores_for_dir = [
-        s for s in [expert.tft_price, expert.tcn_price, expert.xgb_price] if s is not None
+        s for s in (expert.tft_price, expert.tcn_price, expert.xgb_price)
+        if s is not None
     ]
     blended = sum(scores_for_dir) / len(scores_for_dir) if scores_for_dir else 0.0
 

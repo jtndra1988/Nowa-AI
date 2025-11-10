@@ -21,9 +21,9 @@ def metalabel_decide(
     ctx: MarketContext,
 ) -> Dict[str, Any]:
     """
-    Returns:
-      execute: bool
-      size_factor: float in [0, 1]
+    Meta-label:
+      - Should we execute?
+      - How big? (size_factor in [0,1])
     """
     _lazy_load()
 

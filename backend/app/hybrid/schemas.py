@@ -8,7 +8,7 @@ class MarketContext(BaseModel):
     symbol: str
     instrument_type: InstrumentType = "perp"
     exchange: str = "deribit"
-    timestamp: int  # epoch ms or s; mainly for logging/routing
+    timestamp: int  # epoch ms or s
 
 
 class ExpertSignals(BaseModel):

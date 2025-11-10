@@ -1,451 +1,719 @@
 # app/services/inference_service.py
-import logging
-from typing import Any, Dict, List, Tuple
-from datetime import datetime
-from pathlib import Path
-import random # We still use it for the *new* mock data function
 
-# --- Model Loading Imports ---
-import torch
-import joblib
+from __future__ import annotations
+
+import logging
+import os
+from datetime import datetime, timedelta
+from typing import Any, Dict, Tuple
+
 import numpy as np
 import pandas as pd
+from sqlalchemy import select, desc
+from sqlalchemy.orm import Session
 
-# --- Imports for your REAL Models ---
-from app.hybrid.schemas import MarketContext, HybridDecision, Layer2Prediction, RLAction
-from app.ml.adv.llm_narrative_model import llm_engine # Import the REAL LLM engine
-from app.ml.adv.rl_execution_agent import rl_agent     # Import the REAL RL agent
-
-# --- Import Model Class Definitions ---
-# We must import the model *classes* to load their .pth weights
-from app.ml.adv.models_tft import TemporalFusionTransformer
-from app.ml.adv.models_tcn import TemporalConvNet
-# from app.ml.adv.decision_net import DecisionNet # Assuming you have a class
-# from app.ml.adv.macro_onchain_model import MacroOnchainModel # Assuming you have a class
-# from app.ml.adv.options_vol_model import OptionsVolatilityModel # Assuming you have a class
-
+from app.db.database import SessionLocal
+from app.db import models
+from app.ml.adv.llm_narrative_model import llm_engine
+from app.ml.adv.rl_execution_agent import rl_agent
+from app.hybrid.schemas import (
+    MarketContext,
+    Layer2Prediction,
+    RLAction,
+    HybridDecision,
+)
+from app.risk.engine import RiskEngine
 
 logger = logging.getLogger(__name__)
 
-# --- 1. Define Model Artifact Paths ---
-ARTIFACT_DIR = Path("./model_artifacts")
-TFT_WEIGHTS_PATH = ARTIFACT_DIR / "tft_best_model.pth"
-TCN_WEIGHTS_PATH = ARTIFACT_DIR / "tcn_best_model.pth"
-XGB_PRICE_PATH = ARTIFACT_DIR / "xgb_price_model.joblib"
-XGB_VOL_PATH = ARTIFACT_DIR / "xgb_vol_model.joblib"
-DECISION_NET_PATH = ARTIFACT_DIR / "decision_net_model.joblib"
-MACRO_MODEL_PATH = ARTIFACT_DIR / "macro_model.joblib"
-OPTIONS_MODEL_PATH = ARTIFACT_DIR / "options_model.joblib"
-SCALER_PATH = ARTIFACT_DIR / "tft_scaler.npz" # CRITICAL: The scaler used at training
+SEQ_LEN_DEFAULT = 64
+ALLOW_FEATURE_MOCK = os.getenv("MARS_ALLOW_FEATURE_MOCK", "false").lower() == "true"
+DEFAULT_ACCOUNT_EQUITY = float(os.getenv("MARS_ACCOUNT_EQUITY_USD", 100000.0))
 
-# --- 2. Define Model Configurations (MUST match training) ---
-# These are needed to create the model "skeletons" before loading weights
-SEQ_LEN = 60 # Example: Must match your training sequence length
 
-# Feature blocks (must match train_ensemble.py)
-FEATURE_BLOCKS = {
-    "price": ['open', 'high', 'low', 'close', 'volume'],
-    "ob": ['ob_imbalance_1s', 'ob_spread', 'ob_depth_ask_1', 'ob_depth_bid_1'],
-    "sent": ['sent_score_1m', 'sent_score_15m'],
-}
-# All sequential features
-SEQ_FEATURE_COLS = [col for cols in FEATURE_BLOCKS.values() for col in cols]
+# =============================================================================
+# ModelEngine (L1 + L2 ensemble over REAL data)
+# =============================================================================
 
-# Tabular features (must match train_ensemble.py)
-TABULAR_FEATURE_COLS = ['close', 'volume', 'open', 'high', 'low'] # Example
-ROLL_WINDOWS = [5, 10, 20] # Example
 
-# TFT Config (must match train_adv.py or train_ensemble.py)
-TFT_CONFIG = {
-    "feature_dims": { # Example dims, you must get this from your dataset
-        'price': 5,
-        'ob': 4,
-        'sent': 2
-    },
-    "seq_len": SEQ_LEN,
-    "d_model": 128,
-    "nhead": 4,
-    "num_layers": 3,
-    "dropout": 0.1
-}
-
-# TCN Config (must match train_tcn.py)
-TCN_CONFIG = {
-    "in_feat": len(SEQ_FEATURE_COLS), # Total num of sequential features
-    "channels": (64, 128, 128),
-    "kernel": 3,
-    "dropout": 0.1
-}
-
-# --- 3. Internal Engine: Loads and runs all models ---
-
-class _ModelInferenceEngine:
+class ModelEngine:
     """
-    This private class is instantiated ONCE by InferenceService.
-    It loads all models and scalers into memory and runs inference.
-    """
-    def __init__(self):
-        logger.info("Initializing _ModelInferenceEngine...")
-        self.device = 'cuda' if torch.cuda.is_available() else 'cpu'
-        self.is_ready = True
+    Encapsulates your L2 ensemble logic.
 
-        try:
-            # --- Load Scaler ---
-            logger.info(f"Loading scaler from {SCALER_PATH}")
-            scaler = np.load(SCALER_PATH)
-            self.scaler_mean = scaler['mean']
-            self.scaler_std = scaler['std']
-            
-            # --- Load PyTorch Models ---
-            logger.info("Loading PyTorch models...")
-            self.tft_model = self._load_tft()
-            self.tcn_model = self._load_tcn()
-            
-            # --- Load Joblib Models ---
-            logger.info("Loading joblib models...")
-            self.xgb_price_model = self._load_joblib("XGB Price", XGB_PRICE_PATH)
-            self.xgb_vol_model = self._load_joblib("XGB Vol", XGB_VOL_PATH)
-            self.decision_net = self._load_joblib("DecisionNet", DECISION_NET_PATH)
-            self.macro_model = self._load_joblib("Macro", MACRO_MODEL_PATH)
-            self.options_model = self._load_joblib("Options", OPTIONS_MODEL_PATH)
-            
-        except Exception as e:
-            logger.error(f"Failed to load one or more models: {e}", exc_info=True)
-            self.is_ready = False
-        
-        if self.is_ready:
-            logger.info("_ModelInferenceEngine initialized successfully.")
-        else:
-            logger.warning("_ModelInferenceEngine initialized with MISSING models.")
+    Currently:
+      - deterministic rule-based fusion over real features
+      - no random mock; no external artifacts
+      - `is_ready` is True as long as code paths exist
 
-    def _load_joblib(self, name: str, path: Path):
-        if not path.exists():
-            logger.warning(f"{name} model not found at {path}. Voting will be disabled.")
-            return None
-        logger.info(f"Loading {name} from {path}...")
-        return joblib.load(path)
-
-    def _load_tft(self):
-        if not TFT_WEIGHTS_PATH.exists():
-            logger.warning(f"TFT model not found at {TFT_WEIGHTS_PATH}.")
-            return None
-        model = TemporalFusionTransformer(**TFT_CONFIG).to(self.device)
-        model.load_state_dict(torch.load(TFT_WEIGHTS_PATH, map_location=self.device))
-        model.eval()
-        return model
-
-    def _load_tcn(self):
-        if not TCN_WEIGHTS_PATH.exists():
-            logger.warning(f"TCN model not found at {TCN_WEIGHTS_PATH}.")
-            return None
-        model = TemporalConvNet(**TCN_CONFIG).to(self.device)
-        model.load_state_dict(torch.load(TCN_WEIGHTS_PATH, map_location=self.device))
-        model.eval()
-        return model
-
-    def _preprocess_seq(self, features_df: pd.DataFrame) -> Tuple[Dict[str, torch.Tensor], torch.Tensor]:
-        """Prepares data for TCN and TFT models."""
-        # 1. Get last SEQ_LEN rows
-        df_seq = features_df[SEQ_FEATURE_COLS].iloc[-SEQ_LEN:]
-        
-        # 2. Apply scaler
-        df_scaled = (df_seq - self.scaler_mean) / (self.scaler_std + 1e-8)
-        
-        # 3. Create TCN input (B, C, L) -> (1, num_features, seq_len)
-        tcn_tensor = torch.from_numpy(df_scaled.values.T).float().unsqueeze(0).to(self.device)
-        
-        # 4. Create TFT input (dict of tensors)
-        tft_blocks = {}
-        idx = 0
-        for block_name, block_cols in FEATURE_BLOCKS.items():
-            num_cols = len(block_cols)
-            block_data = df_scaled.iloc[:, idx : idx + num_cols]
-            tft_blocks[block_name] = torch.from_numpy(block_data.values).float().unsqueeze(0).to(self.device)
-            idx += num_cols
-            
-        return tft_blocks, tcn_tensor
-
-    def _preprocess_tab(self, features_df: pd.DataFrame) -> np.ndarray:
-        """Prepares data for XGBoost models."""
-        # TODO: This MUST match the feature engineering used for XGB training
-        # This is a simplified example. You must add your rolling windows, etc.
-        logger.warning("XGBoost preprocessing is simplified. Ensure it matches training!")
-        
-        # Simple example: just get the last row of tabular features
-        # In reality, you need to compute rolling features here.
-        last_row = features_df[TABULAR_FEATURE_COLS].iloc[-1].values
-        
-        # ... add your rolling features from ROLL_WINDOWS ...
-        
-        return last_row.reshape(1, -1) # (1, num_features)
-
-    @torch.no_grad()
-    def get_deep_signals(self, features_df: pd.DataFrame) -> Dict[str, float]:
-        """Runs TFT and TCN models."""
-        if not self.tft_model or not self.tcn_model:
-            return {"tft_price": 0.0, "tcn_price": 0.0}
-            
-        tft_blocks, tcn_tensor = self._preprocess_seq(features_df)
-        
-        # Run models
-        preds_tft = self.tft_model(tft_blocks)
-        preds_tcn = self.tcn_model(tcn_tensor)
-        
-        # Return the 'price' prediction (assuming this is the output structure)
-        return {
-            "tft_price": preds_tft.get('price', torch.tensor(0.0)).item(),
-            "tcn_price": preds_tcn.get('price', torch.tensor(0.0)).item()
-        }
-
-    def get_xgb_signals(self, features_df: pd.DataFrame) -> Dict[str, float]:
-        """Runs XGBoost models."""
-        if not self.xgb_price_model or not self.xgb_vol_model:
-            return {"xgb_price": 0.0, "xgb_vol": 0.0}
-            
-        x_tabular = self._preprocess_tab(features_df)
-        
-        price_pred = self.xgb_price_model.predict(x_tabular)[0]
-        vol_pred = self.xgb_vol_model.predict(x_tabular)[0]
-        
-        return {"xgb_price": float(price_pred), "xgb_vol": float(vol_pred)}
-
-    def get_specialist_signals(self, features_df: pd.DataFrame) -> Dict[str, float]:
-        """Runs other specialist models (Macro, Options)."""
-        signals = {"options_price": 0.0, "macro_price": 0.0}
-        
-        # Prepare features (this is just an example)
-        x_data = features_df.iloc[-1].values.reshape(1, -1) # adjust as needed
-        
-        if self.options_model:
-            # You need to define what features this model expects
-            # signals["options_price"] = self.options_model.predict(x_data)[0]
-            pass # Placeholder
-            
-        if self.macro_model:
-            # You need to define what features this model expects
-            # signals["macro_price"] = self.macro_model.predict(x_data)[0]
-            pass # Placeholder
-            
-        return signals
-
-    def run_decision_net(self, votes: Dict[str, float]) -> Dict[str, Any]:
-        """
-        REAL replacement for the mock DecisionNet.
-        Fuses Layer 1 votes into a single prediction.
-        """
-        if self.decision_net is None:
-            logger.warning("DecisionNet not loaded. Using heuristic fallback.")
-            # Fallback logic from your mock
-            final_score = sum(votes.values()) / (len(votes) or 1)
-            direction = "flat"
-            if final_score > 0.3: direction = "up"
-            elif final_score < -0.3: direction = "down"
-            confidence = min(1.0, abs(final_score) * 1.5)
-            return {"direction": direction, "price_confidence": round(confidence, 2)}
-            
-        # --- REAL INFERENCE ---
-        # 1. Convert votes dict to DataFrame row (must match training)
-        # Ensure the column order is IDENTICAL to the one used for training
-        try:
-            votes_df = pd.DataFrame([votes])
-            
-            # Example:
-            # 'decision_net.predict_proba' returns [[P(class_0), P(class_1), P(class_2)]]
-            # where class 0=down, 1=flat, 2=up
-            # probas = self.decision_net.predict_proba(votes_df)[0]
-            
-            # This is a GUESS. You must adapt this to your DecisionNet's output.
-            # Let's assume it's a simple regression model for this example:
-            final_score = self.decision_net.predict(votes_df)[0]
-            
-            # Map score to direction/confidence
-            direction = "flat"
-            if final_score > 0.3: direction = "up"  # Adjust thresholds
-            elif final_score < -0.3: direction = "down"
-            confidence = min(1.0, abs(final_score) * 1.5)
-            
-            return {
-                "direction": direction,
-                "price_confidence": round(confidence, 2)
-            }
-
-        except Exception as e:
-            logger.error(f"Error running DecisionNet: {e}", exc_info=True)
-            return {"direction": "flat", "price_confidence": 0.0}
-
-
-# --- 4. Main Public-Facing Service ---
-
-class InferenceService:
-    """
-    Public-facing inference layer for Nowa.
-    This IS the core HybridInferenceService (Layer 1 + Layer 2 + Layer 3).
-    It exposes a clean API used by FastAPI routes.
+    When you plug TFT/TCN/XGB, only replace this class.
     """
 
     def __init__(self) -> None:
-        try:
-            logger.info("[InferenceService] Initializing...")
-            # Load the RL agent (which loads its model)
-            self.rl_agent = rl_agent
-            # Get the LLM engine
-            self.llm_engine = llm_engine
-            
-            # --- THIS IS THE KEY ---
-            # Instantiate the engine to load all models
-            self.model_engine = _ModelInferenceEngine()
-            
-            self.is_ready: bool = (
-                self.rl_agent.is_model_loaded() and self.model_engine.is_ready
-            )
-            
-            if not self.is_ready:
-                logger.warning("[InferenceService] Initialization incomplete. Check warnings.")
-            else:
-                logger.info("[InferenceService] Initialization complete. All models loaded.")
-                
-        except Exception as e:
-            logger.error(
-                f"[InferenceService] Failed to initialize core engine: {e}",
-                exc_info=True,
-            )
-            self.is_ready: bool = False
+        self.is_ready: bool = True
+        logger.info("[ModelEngine] Initialized (rule-based ensemble over live features).")
 
-    def _fetch_and_prepare_features(self, asset: str, seq_len: int) -> pd.DataFrame:
+    def build_layer2_prediction(
+        self,
+        symbol: str,
+        seq_features: np.ndarray,
+        tab_features: Dict[str, float],
+    ) -> Layer2Prediction:
         """
-        --- THIS IS THE NEW MOCK ---
-        This function is responsible for getting the latest feature data
-        for a given asset. You MUST replace this with a real implementation
-        that queries your database or market data service.
-        
-        It must return a DataFrame with AT LEAST `seq_len` rows
-        and all columns needed for:
-        1. TCN/TFT (all columns in SEQ_FEATURE_COLS)
-        2. XGB (all columns in TABULAR_FEATURE_COLS + data for rolling features)
+        Build a fused L2 prediction from sequential + tabular features.
+
+        Uses:
+          - Price trend (closes)
+          - Vol-normalized trend strength
+          - Sentiment, options, on-chain nudges
+
+        Returns Layer2Prediction:
+          - asset: symbol
+          - direction: 'up' | 'down' | 'flat'
+          - price_confidence: [0,1]
         """
-        logger.warning(f"--- USING MOCK FEATURE DATA for {asset} ---")
-        # TODO: REPLACE THIS
-        
-        # 1. Get all feature columns
-        all_cols = list(set(SEQ_FEATURE_COLS + TABULAR_FEATURE_COLS))
-        
-        # 2. Generate mock data
-        # We need more than seq_len rows to calculate rolling features for XGB
-        num_rows = seq_len + max(ROLL_WINDOWS) + 5 
-        data = {col: np.random.randn(num_rows) for col in all_cols}
-        
-        # Add some realistic price data
-        data['close'] = np.cumsum(np.random.randn(num_rows) * 0.1) + 100
-        data['open'] = data['close'] - np.random.rand(num_rows) * 0.1
-        data['high'] = data['close'] + np.random.rand(num_rows) * 0.1
-        data['low'] = data['close'] - np.random.rand(num_rows) * 0.1
-        data['volume'] = np.random.rand(num_rows) * 100
-        
-        return pd.DataFrame(data)
+        if not self.is_ready:
+            raise RuntimeError("[ModelEngine] Called while not ready.")
+
+        if seq_features.size == 0 or seq_features.shape[0] < 10:
+            raise RuntimeError(
+                "[ModelEngine] Not enough sequential data for prediction."
+            )
+
+        closes = seq_features[:, 0]
+
+        last_close = float(closes[-1])
+        ma_short = float(closes[-5:].mean())
+        ma_long = float(closes[-20:].mean()) if len(closes) >= 20 else ma_short
+
+        # Base trend direction
+        if last_close > ma_short * 1.002 and ma_short >= ma_long:
+            base_dir = "up"
+        elif last_close < ma_short * 0.998 and ma_short <= ma_long:
+            base_dir = "down"
+        else:
+            base_dir = "flat"
+
+        # Vol-normalized trend strength
+        if len(closes) >= 20:
+            price_std = float(closes[-20:].std())
+        else:
+            price_std = float(closes.std())
+        price_std = max(price_std, 1e-8)
+
+        trend_strength = abs(last_close - ma_long) / price_std
+        conf_trend = max(0.0, min(1.0, trend_strength / 4.0))
+
+        # Tabular nudges
+        sent = float(tab_features.get("final_sentiment", 0.0))
+        put_call = float(tab_features.get("put_call_oi_ratio", 1.0))
+        whale_vol = float(tab_features.get("whale_volume_usd", 0.0))
+        ex_flow = float(tab_features.get("exchange_net_flow_usd", 0.0))
+
+        conf_sent = min(0.2, abs(sent) * 0.2)
+        conf_pc = 0.1 if 0.7 <= put_call <= 1.3 else 0.0
+        conf_flow = 0.1 if whale_vol > 0 and ex_flow != 0 else 0.0
+
+        price_confidence = max(
+            0.0, min(1.0, conf_trend + conf_sent + conf_pc + conf_flow)
+        )
+
+        # Direction bias from sentiment & flows
+        dir_bias = 0.0
+        dir_bias += np.sign(sent) * min(0.5, abs(sent))
+        if ex_flow < 0:
+            dir_bias -= 0.15
+        elif ex_flow > 0:
+            dir_bias += 0.15
+
+        final_score = {"up": 0.0, "down": 0.0, "flat": 0.0}
+
+        if base_dir == "up":
+            final_score["up"] += 1.0
+        elif base_dir == "down":
+            final_score["down"] += 1.0
+        else:
+            final_score["flat"] += 0.5
+
+        if dir_bias > 0.1:
+            final_score["up"] += 0.5
+        elif dir_bias < -0.1:
+            final_score["down"] += 0.5
+        else:
+            final_score["flat"] += 0.2
+
+        direction = max(final_score.items(), key=lambda x: x[1])[0]
+
+        return Layer2Prediction(
+            asset=symbol,
+            direction=direction,
+            price_confidence=float(round(price_confidence, 3)),
+        )
+
+
+# =============================================================================
+# HybridInferenceService (One Brain Orchestrator)
+# =============================================================================
+
+
+class HybridInferenceService:
+    """
+    Orchestrates:
+      - Feature extraction from real DB tables
+      - ModelEngine (L2)
+      - LLM narrative specialist (L1.5)
+      - RL execution agent (L3)
+      - RiskEngine constraints
+      - Persistence & HybridDecision assembly
+    """
+
+    def __init__(self) -> None:
+        self.model_engine = ModelEngine()
+        self.llm_engine = llm_engine
+        self.rl_agent = rl_agent
+        self.allow_mock = ALLOW_FEATURE_MOCK
+
+        self.is_ready: bool = (
+            self.model_engine.is_ready
+            and self.llm_engine.is_model_loaded()
+            and self.rl_agent.is_model_loaded()
+        )
+
+        if self.is_ready:
+            logger.info("[HybridInferenceService] READY: all engines loaded.")
+        else:
+            logger.error(
+                "[HybridInferenceService] NOT READY: "
+                f"model={self.model_engine.is_ready}, "
+                f"llm={self.llm_engine.is_model_loaded()}, "
+                f"rl={self.rl_agent.is_model_loaded()}"
+            )
+
+    def ready(self) -> bool:
+        return self.is_ready
+
+    # -------------------------------------------------------------------------
+    # Main entrypoint for /hybrid-signal
+    # -------------------------------------------------------------------------
 
     async def build_decision(self, ctx: MarketContext) -> HybridDecision:
-        """
-        Runs the full 3-Layer Hybrid AI logic to make a trading decision.
-        """
-        # Get "BTC" from "BTC-PERP" or "BTC/USDT"
-        asset = ctx.symbol.split('/')[0].split('-')[0].upper()
-        
-        # --- 1. Get Features ---
-        # This is the ONE function you must replace with real data
-        features_df = self._fetch_and_prepare_features(asset, SEQ_LEN)
-        
-        # --- LAYER 1: GATHER VOTES FROM ALL SPECIALISTS ---
-        logger.debug(f"Layer 1: Gathering specialist votes for {asset}")
-        
-        # Run async LLM task
-        llm_output_task = self.llm_engine.get_narrative_signal(asset)
-        
-        # --- Run REAL model tasks ---
-        deep_signals = self.model_engine.get_deep_signals(features_df)
-        xgb_signals = self.model_engine.get_xgb_signals(features_df)
-        specialist_signals = self.model_engine.get_specialist_signals(features_df)
-        
-        # Wait for LLM task to complete
-        llm_output = await llm_output_task
-        
-        model_votes = {
-            "tft_visionary": deep_signals.get("tft_price", 0.0),
-            "tcn_reflex": deep_signals.get("tcn_price", 0.0),
-            "xgb_analyst": xgb_signals.get("xgb_price", 0.0),
-            "xgb_vol_analyst": xgb_signals.get("xgb_vol", 0.0), # Added vol
-            "options_psychologist": specialist_signals.get("options_price", 0.0),
-            "macro_economist": specialist_signals.get("macro_price", 0.0),
-            "llm_narrative": llm_output["sentiment_score"],
-        }
-        
-        # --- LAYER 2: FUSE PREDICTIONS WITH DECISIONNET ---
-        logger.debug("Layer 2: Fusing votes with DecisionNet...")
-        # --- THIS IS THE REAL CALL ---
-        layer_2_output = self.model_engine.run_decision_net(model_votes)
-        
-        prediction = Layer2Prediction(
-            asset=asset,
-            direction=layer_2_output["direction"],
-            price_confidence=layer_2_output["price_confidence"]
+        if not self.is_ready:
+            raise RuntimeError(
+                "[HybridInferenceService] Called while not ready. "
+                "Verify LLM, RL, and ModelEngine initialization."
+            )
+
+        symbol = (ctx.symbol or "BTCUSDT").upper()
+        instrument_type = (ctx.instrument_type or "futures").lower()
+
+        # 1) Features (seq, tabular, OHLC for risk)
+        seq, tab, ohlc_df = self._fetch_features(symbol, SEQ_LEN_DEFAULT)
+
+        # 2) L2 prediction
+        l2_pred = self.model_engine.build_layer2_prediction(
+            symbol=symbol,
+            seq_features=seq,
+            tab_features=tab,
         )
 
-        # --- LAYER 3: GET OPTIMAL ACTION FROM RL AGENT ---
-        logger.debug("Layer 3: Getting optimal action from RL Agent...")
-        if ctx.current_regime is None:
-            ctx.current_regime = "mock_regime_neutral"
-        if ctx.current_volatility is None:
-            ctx.current_volatility = xgb_signals.get("xgb_vol", 0.5) # Use predicted vol
+        # 3) LLM narrative (live only)
+        llm_out = await self.llm_engine.get_narrative_signal(symbol)
+        llm_score = float(llm_out["sentiment_score"])
+        llm_headline = llm_out.get("key_headline")
 
+        # 4) Model votes for RL + debug
+        model_votes: Dict[str, float] = {
+            "trend_model": (
+                1.0 if l2_pred.direction == "up"
+                else -1.0 if l2_pred.direction == "down"
+                else 0.0
+            ),
+            "price_confidence": float(l2_pred.price_confidence),
+            "llm_narrative": llm_score,
+            "final_sentiment": float(tab.get("final_sentiment", 0.0)),
+            "put_call_oi_ratio": float(tab.get("put_call_oi_ratio", 1.0)),
+        }
+
+        # 5) RL agent
         rl_action: RLAction = self.rl_agent.get_optimal_action(
-            prediction=prediction, 
-            context=ctx, # Pass the real context from the API
-            model_votes=model_votes
+            prediction=l2_pred,
+            context=ctx,
+            model_votes=model_votes,
         )
 
-        # --- Build and return the final HybridDecision ---
-        confidence = prediction.price_confidence
-        
-        if rl_action.optimal_size_pct > 0:
-            size_factor = rl_action.optimal_size_pct
+        # 6) Risk + persistence + final HybridDecision
+        decision = self._risk_aware_persist_and_build_decision(
+            symbol=symbol,
+            instrument_type=instrument_type,
+            ctx=ctx,
+            l2_pred=l2_pred,
+            llm_headline=llm_headline,
+            llm_score=llm_score,
+            rl_action=rl_action,
+            model_votes=model_votes,
+            tab_features=tab,
+            ohlc_df=ohlc_df,
+        )
+        return decision
+
+    # -------------------------------------------------------------------------
+    # Feature extraction from REAL tables
+    # -------------------------------------------------------------------------
+
+    def _fetch_features(
+        self,
+        symbol: str,
+        seq_len: int,
+    ) -> Tuple[np.ndarray, Dict[str, float], pd.DataFrame]:
+        """
+        Pull:
+          - Sequential OHLCV from FuturesMarketData or MarketData
+          - Latest:
+              SentimentFusion
+              OptionsDerivedMetrics
+              OnchainMetrics
+              DeveloperActivity
+              FundingRate
+              FearAndGreedIndex
+              CrossAssetCorr
+
+        Returns:
+          seq_features: [T,2] -> [close, volume]
+          tab_features: dict
+          ohlc_df: DataFrame ['high','low','close'] for RiskEngine
+        """
+        with SessionLocal() as db:
+            end_time = datetime.utcnow()
+            start_time = end_time - timedelta(hours=24)
+
+            seq, ohlc_df = self._load_price_and_ohlc(
+                db=db,
+                symbol=symbol,
+                seq_len=seq_len,
+                start_time=start_time,
+                end_time=end_time,
+            )
+
+            if seq.size == 0:
+                if self.allow_mock:
+                    logger.warning(
+                        "[HybridInferenceService] No price data; using DEV-ONLY mock features."
+                    )
+                    return self._generate_mock_features(symbol, seq_len)
+                raise RuntimeError("[HybridInferenceService] No price data available.")
+
+            tab: Dict[str, float] = {}
+            base = (
+                symbol.replace("USDT", "")
+                .replace("/USDT", "")
+                .replace("/", "")
+                .upper()
+            )
+
+            # SentimentFusion
+            sf = (
+                db.execute(
+                    select(models.SentimentFusion)
+                    .where(models.SentimentFusion.symbol.in_([symbol, base]))
+                    .order_by(desc(models.SentimentFusion.timestamp))
+                    .limit(1)
+                )
+                .scalars()
+                .first()
+            )
+            if sf:
+                tab["final_sentiment"] = float(sf.final_sentiment or 0.0)
+                tab["avg_news_sentiment"] = float(sf.avg_news_sentiment or 0.0)
+                tab["fear_greed_local"] = float(sf.fear_greed_index or 0.0)
+
+            # OptionsDerivedMetrics
+            od = (
+                db.execute(
+                    select(models.OptionsDerivedMetrics)
+                    .where(models.OptionsDerivedMetrics.symbol.in_([symbol, base]))
+                    .order_by(desc(models.OptionsDerivedMetrics.timestamp))
+                    .limit(1)
+                )
+                .scalars()
+                .first()
+            )
+            if od:
+                tab["put_call_oi_ratio"] = float(od.put_call_oi_ratio or 1.0)
+                tab["avg_iv_near_term"] = float(od.avg_iv_near_term or 0.0)
+                tab["iv_skew_25d"] = float(od.iv_skew_25d or 0.0)
+
+            # OnchainMetrics
+            oc = (
+                db.execute(
+                    select(models.OnchainMetrics)
+                    .where(models.OnchainMetrics.symbol.in_([symbol, base, base.lower()]))
+                    .order_by(desc(models.OnchainMetrics.timestamp))
+                    .limit(1)
+                )
+                .scalars()
+                .first()
+            )
+            if oc:
+                tab["whale_volume_usd"] = float(oc.whale_volume_usd or 0.0)
+                tab["exchange_net_flow_usd"] = float(oc.exchange_net_flow_usd or 0.0)
+                tab["active_addresses"] = float(oc.active_addresses or 0.0)
+
+            # DeveloperActivity
+            da = (
+                db.execute(
+                    select(models.DeveloperActivity)
+                    .where(models.DeveloperActivity.symbol.in_([symbol, base]))
+                    .order_by(desc(models.DeveloperActivity.timestamp))
+                    .limit(1)
+                )
+                .scalars()
+                .first()
+            )
+            if da:
+                tab["dev_stars"] = float(da.stars or 0.0)
+                tab["dev_forks"] = float(da.forks or 0.0)
+
+            # FundingRate
+            fr = (
+                db.execute(
+                    select(models.FundingRate)
+                    .where(models.FundingRate.symbol.in_([symbol, base]))
+                    .order_by(desc(models.FundingRate.timestamp))
+                    .limit(1)
+                )
+                .scalars()
+                .first()
+            )
+            if fr:
+                tab["funding_rate"] = float(fr.funding_rate or 0.0)
+
+            # Global Fear & Greed
+            fgi = (
+                db.execute(
+                    select(models.FearAndGreedIndex)
+                    .order_by(desc(models.FearAndGreedIndex.timestamp))
+                    .limit(1)
+                )
+                .scalars()
+                .first()
+            )
+            if fgi:
+                tab["fear_greed_global"] = float(fgi.value or 0.0)
+
+            # CrossAssetCorr
+            cac = (
+                db.execute(
+                    select(models.CrossAssetCorr)
+                    .where(models.CrossAssetCorr.base_symbol.in_([symbol, base]))
+                    .order_by(desc(models.CrossAssetCorr.timestamp))
+                    .limit(1)
+                )
+                .scalars()
+                .first()
+            )
+            if cac:
+                tab["corr_btc_eth"] = float(cac.corr_btc_eth or 0.0)
+                tab["corr_btc_dxy"] = float(cac.corr_btc_dxy or 0.0)
+                tab["corr_btc_ndx"] = float(cac.corr_btc_ndx or 0.0)
+                tab["corr_btc_gold"] = float(cac.corr_btc_gold or 0.0)
+
+            return seq, tab, ohlc_df
+
+    def _load_price_and_ohlc(
+        self,
+        db: Session,
+        symbol: str,
+        seq_len: int,
+        start_time: datetime,
+        end_time: datetime,
+    ) -> Tuple[np.ndarray, pd.DataFrame]:
+        """
+        Load OHLCV from FuturesMarketData or MarketData.
+
+        Returns:
+          seq_features: [T,2] -> [close, volume]
+          ohlc_df: DataFrame with ['high','low','close']
+        """
+        # Prefer futures data
+        fut_rows = (
+            db.execute(
+                select(models.FuturesMarketData)
+                .where(models.FuturesMarketData.symbol == symbol)
+                .where(models.FuturesMarketData.timestamp.between(start_time, end_time))
+                .order_by(desc(models.FuturesMarketData.timestamp))
+                .limit(seq_len)
+            )
+            .scalars()
+            .all()
+        )
+
+        rows = fut_rows
+        if not rows:
+            spot_rows = (
+                db.execute(
+                    select(models.MarketData)
+                    .where(models.MarketData.symbol == symbol)
+                    .where(models.MarketData.timestamp.between(start_time, end_time))
+                    .order_by(desc(models.MarketData.timestamp))
+                    .limit(seq_len)
+                )
+                .scalars()
+                .all()
+            )
+            rows = spot_rows
+
+        if not rows:
+            return np.zeros((0, 2), dtype=np.float32), pd.DataFrame(
+                columns=["high", "low", "close"]
+            )
+
+        rows = list(reversed(rows))
+
+        closes = [
+            float(
+                getattr(r, "close", None)
+                if getattr(r, "close", None) is not None
+                else getattr(r, "last_price", 0.0)
+            )
+            for r in rows
+        ]
+        vols = [float(getattr(r, "volume", 0.0)) for r in rows]
+        highs = [
+            float(getattr(r, "high", c)) for r, c in zip(rows, closes)
+        ]
+        lows = [
+            float(getattr(r, "low", c)) for r, c in zip(rows, closes)
+        ]
+
+        seq = np.column_stack([closes, vols]).astype(np.float32)
+        ohlc_df = pd.DataFrame({"high": highs, "low": lows, "close": closes})
+
+        return seq, ohlc_df
+
+    def _generate_mock_features(
+        self,
+        symbol: str,
+        seq_len: int,
+    ) -> Tuple[np.ndarray, Dict[str, float], pd.DataFrame]:
+        """
+        DEV-ONLY deterministic pseudo-features.
+        Enabled only when MARS_ALLOW_FEATURE_MOCK=true.
+        """
+        seed = sum(ord(c) for c in symbol)
+        rng = np.random.default_rng(seed)
+
+        closes = np.cumsum(rng.normal(0, 1, size=seq_len)) + 100.0
+        vols = rng.uniform(10, 50, size=seq_len)
+
+        seq = np.column_stack([closes, vols]).astype(np.float32)
+        tab = {
+            "final_sentiment": 0.0,
+            "put_call_oi_ratio": 1.0,
+            "whale_volume_usd": 0.0,
+            "exchange_net_flow_usd": 0.0,
+        }
+        ohlc_df = pd.DataFrame(
+            {"high": closes + 1.0, "low": closes - 1.0, "close": closes}
+        )
+        return seq, tab, ohlc_df
+
+    # -------------------------------------------------------------------------
+    # Risk integration + persistence + HybridDecision
+    # -------------------------------------------------------------------------
+
+    def _risk_aware_persist_and_build_decision(
+        self,
+        symbol: str,
+        instrument_type: str,
+        ctx: MarketContext,
+        l2_pred: Layer2Prediction,
+        llm_headline: str,
+        llm_score: float,
+        rl_action: RLAction,
+        model_votes: Dict[str, float],
+        tab_features: Dict[str, float],
+        ohlc_df: pd.DataFrame,
+    ) -> HybridDecision:
+        now = datetime.utcnow()
+
+        # RL raw action
+        act = (rl_action.optimal_action or "HOLD").upper()
+        rl_mode = rl_action.mode or self.rl_agent.get_mode()
+
+        # Base direction (for HybridDecision)
+        if act == "LONG":
+            base_direction = "up"
+        elif act == "SHORT":
+            base_direction = "down"
         else:
-            size_factor = 0.0
+            base_direction = l2_pred.direction
 
-        direction = "flat"
-        if rl_action.optimal_action == "LONG":
-            direction = "up"
-        elif rl_action.optimal_action == "SHORT":
-            direction = "down"
+        # RL suggested size [0,1]
+        raw_size = float(rl_action.optimal_size_pct or 0.0)
+        raw_size = max(0.0, min(1.0, raw_size))
 
-        debug_payload = {
-            "l1_votes": model_votes,
-            "l2_prediction": prediction.dict(),
-            "l3_action": rl_action.dict(),
-            "context_in": ctx.dict()
+        # Candidate execution?
+        meta_execute = act in ("LONG", "SHORT") and raw_size > 0.0
+
+        # ---- RiskEngine integration ----
+        risk_debug: Dict[str, Any] = {}
+        final_size = 0.0
+        rl_target_position = 0.0
+
+        if meta_execute and not ohlc_df.empty:
+            risk_engine = RiskEngine(symbol)
+
+            # 1) Global guard (rolling DD, etc.)
+            current_equity = DEFAULT_ACCOUNT_EQUITY
+            guard = risk_engine.check_global_guards(current_equity=current_equity)
+            risk_debug["global_guard"] = guard
+
+            if guard.get("halt"):
+                # Hard stop: no new risk
+                meta_execute = False
+                final_size = 0.0
+                rl_target_position = 0.0
+            else:
+                # 2) Side for RiskEngine
+                side = "BUY" if base_direction == "up" else "SELL"
+
+                # 3) Regime from context (int)
+                regime = 0
+                if ctx.current_regime is not None:
+                    try:
+                        regime = int(ctx.current_regime)
+                    except Exception:
+                        regime = 0
+
+                # 4) Mark price from last close
+                mark_price = float(ohlc_df["close"].iloc[-1])
+
+                # 5) RiskEngine position proposal
+                proposal = risk_engine.propose_position(
+                    dfe=ohlc_df,
+                    side=side,
+                    confidence=float(l2_pred.price_confidence),
+                    regime=regime,
+                    mark_price=mark_price,
+                    open_positions_usd=0.0,
+                    portfolio_gross_exposure=0.0,
+                )
+                risk_debug["proposal"] = proposal
+
+                if proposal.get("reason") == "ok":
+                    max_risk_size = float(proposal["qty_usd"]) / max(
+                        current_equity, 1e-9
+                    )
+                    max_risk_size = max(0.0, min(1.0, max_risk_size))
+                    final_size = min(raw_size, max_risk_size)
+                    rl_target_position = (
+                        final_size if side == "BUY" else -final_size
+                    )
+                else:
+                    meta_execute = False
+                    final_size = 0.0
+                    rl_target_position = 0.0
+
+                risk_engine.save_state()
+        else:
+            # no exec / no data → flat
+            final_size = 0.0
+            rl_target_position = 0.0
+
+        confidence = float(l2_pred.price_confidence)
+        p_edge = confidence
+        direction = base_direction
+        rl_exec_style = rl_action.execution_style
+
+        debug_payload: Dict[str, Any] = {
+            "layer2_prediction": l2_pred.dict(),
+            "llm": {"sentiment_score": llm_score, "headline": llm_headline},
+            "rl_action": rl_action.dict(),
+            "model_votes": model_votes,
+            "tab_features": tab_features,
+            "risk": risk_debug,
         }
 
+        # ---- Persist DB artifacts ----
+        with SessionLocal() as db:
+            # Prediction
+            pred_row = models.Prediction(
+                model_version_id=None,
+                symbol=symbol,
+                prediction_time=now,
+                prediction=p_edge,
+                raw_score=p_edge,
+                model_inputs={"tab": tab_features, "votes": model_votes},
+            )
+            db.add(pred_row)
+            db.flush()
+
+            # HybridSignal
+            hs = models.HybridSignal(
+                symbol=symbol,
+                instrument_type=instrument_type,
+                exchange=ctx.exchange,
+                direction=direction,
+                p_edge=p_edge,
+                confidence=confidence,
+                size_factor=final_size,
+                strategy_tag="nowa_hybrid_v1",
+                meta_execute=bool(meta_execute),
+                debug_payload=debug_payload,
+            )
+            db.add(hs)
+            db.flush()
+
+            # AIExecutionLog
+            try:
+                log = models.AIExecutionLog(
+                    hybrid_signal_id=hs.id,
+                    model_version_id=None,
+                    decided_action=act,
+                    execution_style=rl_exec_style,
+                    target_position=rl_target_position,
+                    executed_position=None,
+                    executed_price=None,
+                    exchange=ctx.exchange,
+                    symbol=symbol,
+                    realized_pnl=None,
+                    unrealized_pnl=None,
+                    slippage=None,
+                    latency_ms=None,
+                    confidence=confidence,
+                    p_edge=p_edge,
+                    rl_diagnostics=risk_debug,
+                    exec_meta={"source": "HybridInferenceService", "rl_mode": rl_mode},
+                )
+                db.add(log)
+            except Exception as e:
+                logger.error(
+                    "[HybridInferenceService] Failed to persist AIExecutionLog: %s",
+                    e,
+                    exc_info=True,
+                )
+
+            db.commit()
+
+        # ---- Final HybridDecision (matches schemas.py) ----
         return HybridDecision(
-            symbol=ctx.symbol,
-            instrument_type=ctx.instrument_type or "futures",
-            timestamp=datetime.utcnow(),
+            symbol=symbol,
+            instrument_type=instrument_type,
+            timestamp=now,
             direction=direction,
-            p_edge=confidence, 
+            p_edge=p_edge,
             confidence=confidence,
-            size_factor=size_factor,
-            strategy_tag="nowa_hybrid_rl_v1",
-            meta_execute=True,
-            model_votes={k: round(v, 2) for k, v in model_votes.items()},
-            llm_headline=llm_output["key_headline"],
-            rl_action=rl_action.optimal_action,
-            rl_mode=self.rl_agent.get_mode(),
-            rl_target_position=rl_action.optimal_size_pct if direction == "up" else -rl_action.optimal_size_pct,
-            rl_execution_style=rl_action.execution_style,
-            debug=debug_payload
+            size_factor=final_size,
+            strategy_tag="nowa_hybrid_v1",
+            meta_execute=bool(meta_execute),
+            model_votes=model_votes,
+            llm_headline=llm_headline,
+            rl_action=act,
+            rl_mode=rl_mode,
+            rl_target_position=rl_target_position,
+            rl_execution_style=rl_exec_style,
+            debug=debug_payload,
         )
 
-# --- SINGLETON INSTANCE ---
-# Create one instance to be imported by the FastAPI app
-try:
-    inference_service = InferenceService()
-except Exception as e:
-    logger.critical(f"Failed to create InferenceService singleton: {e}", exc_info=True)
-    inference_service = None # type: ignore
+
+# Singleton used by routes
+inference_service = HybridInferenceService()

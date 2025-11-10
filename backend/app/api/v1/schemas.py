@@ -1,7 +1,7 @@
 # app/api/schemas.py
 from __future__ import annotations
 
-from typing import Optional
+from typing import Optional, List
 from datetime import datetime
 from pydantic import BaseModel, Field
 
@@ -34,7 +34,37 @@ class OptionInstrument(BaseModel):
         orm_mode = True
         allow_population_by_field_name = True
 
-# --- Optional: for a legacy forwarded predict route ---
-class LegacyPrediction(BaseModel):
+
+# ---
+# --- NEW SCHEMAS ADDED FOR READ APIS ---
+# ---
+
+class SentimentResponse(BaseModel):
     symbol: str
-    signal: str  # e.g., 'BUY_CALL', 'SELL_PUT', 'HOLD'
+    timestamp: datetime
+    sentiment_score: Optional[float] = Field(None, alias="sent_score_1m")
+    sentiment_score_15m: Optional[float] = Field(None, alias="sent_score_15m")
+    
+    class Config:
+        orm_mode = True
+        allow_population_by_field_name = True
+        
+class OnchainResponse(BaseModel):
+    symbol: str
+    timestamp: datetime
+    nvt_ratio: Optional[float]
+    sopr: Optional[float]
+    # Add other on-chain fields here as needed
+    
+    class Config:
+        orm_mode = True
+
+class DeveloperResponse(BaseModel):
+    symbol: str
+    timestamp: datetime
+    commit_count: Optional[int]
+    stars: Optional[int]
+    # Add other dev fields here as needed
+
+    class Config:
+        orm_mode = True

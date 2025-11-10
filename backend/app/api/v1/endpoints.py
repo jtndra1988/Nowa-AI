@@ -1,68 +1,97 @@
-# app/api/endpoints.py
-from __future__ import annotations
-
-from datetime import datetime, timedelta, timezone
-from typing import List
+# app/api/v1/endpoints.py
+import logging
+from typing import List, Optional
 
 from fastapi import APIRouter, Depends, HTTPException, Query
 from sqlalchemy.orm import Session
-from sqlalchemy import and_
+from sqlalchemy import select, desc
 
-from app.db.database import get_db
 from app.db import models
-from . import schemas
+from app.db.database import get_db
+from app.api.v1.schemas import OptionInstrument
+# --- NEW IMPORTS ---
+from app.api.v1.schemas import SentimentResponse, OnchainResponse, DeveloperResponse
+from app.services.market_data import MarketDataService
 
-router = APIRouter()
+logger = logging.getLogger(__name__)
+router = APIRouter(tags=["Market Data"])
+md_service = MarketDataService()
 
-@router.get("/options-chain/{currency}", response_model=List[schemas.OptionInstrument])
+
+@router.get("/options-chain", response_model=List[OptionInstrument])
 def get_options_chain(
-    currency: str,
-    hours: int = Query(24, ge=1, le=168, description="Lookback window in hours"),
+    symbol: str = Query(..., description="Underlying symbol, e.g., 'BTC'"),
     db: Session = Depends(get_db),
 ):
     """
-    Return recent normalized option instruments for `currency` (e.g., BTC, ETH)
-    using the canonical shape expected by collectors/ETL/inference.
+    Get the latest options chain data for a given underlying.
     """
-    since = datetime.now(timezone.utc) - timedelta(hours=hours)
-
-    # OptionsChain.symbol stores the underlying symbol you used in collectors (typically 'BTC', not 'BTC/USDT')
-    q = (
-        db.query(models.OptionsChain)
-        .filter(
-            and_(
-                models.OptionsChain.symbol == currency.upper(),
-                models.OptionsChain.timestamp >= since,
-            )
+    try:
+        data = md_service.get_latest_options_chain(db, symbol)
+        if not data:
+            return []
+        return data
+    except Exception as e:
+        logger.error(
+            f"Failed to fetch options chain for {symbol}: {e}", exc_info=True
         )
-        .order_by(models.OptionsChain.timestamp.desc())
-        .limit(5000)
+        raise HTTPException(status_code=500, detail="Internal server error")
+
+
+# ---
+# --- NEW "READ" ENDPOINTS ADDED ---
+# ---
+
+@router.get("/data/sentiment/{symbol}", response_model=List[SentimentResponse])
+def get_sentiment_data(
+    symbol: str,
+    limit: int = Query(100, ge=1, le=1000),
+    db: Session = Depends(get_db)
+):
+    """
+    Get the latest sentiment data for a symbol.
+    """
+    stmt = (
+        select(models.SentimentFusion)
+        .where(models.SentimentFusion.symbol == symbol)
+        .order_by(desc(models.SentimentFusion.timestamp))
+        .limit(limit)
     )
-    rows = q.all()
-    if not rows:
-        return []
+    results = db.scalars(stmt).all()
+    return results
 
-    out: List[schemas.OptionInstrument] = []
-    for r in rows:
-        out.append(
-            schemas.OptionInstrument(
-                symbol=r.symbol,
-                expiry=r.expiry,
-                strike=r.strike,
-                option_type=("CALL" if str(r.option_type).upper().startswith("C") else "PUT"),
-                timestamp=r.timestamp,
-                bid=r.bid,
-                ask=r.ask,
-                last_price=r.last_price,
-                mark_price=r.mark_price,
-                volume=r.volume,
-                open_interest=r.open_interest,
-                iv=r.iv,
-                delta=r.delta,
-                gamma=r.gamma,
-                theta=r.theta,
-                vega=r.vega,
-            )
-        )
-    return out
+@router.get("/data/onchain/{symbol}", response_model=List[OnchainResponse])
+def get_onchain_data(
+    symbol: str,
+    limit: int = Query(100, ge=1, le=1000),
+    db: Session = Depends(get_db)
+):
+    """
+    Get the latest on-chain data for a symbol.
+    """
+    stmt = (
+        select(models.OnchainMetrics)
+        .where(models.OnchainMetrics.symbol == symbol)
+        .order_by(desc(models.OnchainMetrics.timestamp))
+        .limit(limit)
+    )
+    results = db.scalars(stmt).all()
+    return results
 
+@router.get("/data/developer/{symbol}", response_model=List[DeveloperResponse])
+def get_developer_data(
+    symbol: str,
+    limit: int = Query(100, ge=1, le=1000),
+    db: Session = Depends(get_db)
+):
+    """
+    Get the latest developer activity data for a symbol.
+    """
+    stmt = (
+        select(models.DeveloperActivity)
+        .where(models.DeveloperActivity.symbol == symbol)
+        .order_by(desc(models.DeveloperActivity.timestamp))
+        .limit(limit)
+    )
+    results = db.scalars(stmt).all()
+    return results

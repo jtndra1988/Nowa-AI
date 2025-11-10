@@ -1,27 +1,27 @@
 # app/api/v1/predict.py
 
-from fastapi import APIRouter, HTTPException, Depends
+from typing import Optional
+from fastapi import APIRouter, HTTPException, Query, Depends
+from pydantic import BaseModel
 from sqlalchemy.orm import Session
+from datetime import datetime
 import logging
 
 from app.services.inference_service import inference_service
 from app.db.database import get_db
-from app.db.models import HybridSignal
+from app.db.models import Prediction, ModelVersion, HybridSignal
 from app.hybrid.schemas import MarketContext, HybridDecision
 
-# ---
-# NOTE: Renamed the file-level logger to avoid a potential `_name_` error.
-# Using __name__ is the standard Python practice.
-# ---
 router = APIRouter(tags=["Prediction"])
+# --- FIX: Changed _name_ to __name__ ---
 logger = logging.getLogger(__name__)
 
 
 # ---
-# I have REMOVED the entire broken `@router.get("/predict")` route.
+# NOTE: I have removed the broken `@router.get("/predict")` route.
 # It was calling a non-existent function (inference_service.predict) and
 # was architecturally incompatible with your 3-layer logic, which requires
-# the MarketContext body provided by the POST route below.
+# the MarketContext body provided by this POST route.
 # ---
 
 
@@ -32,7 +32,7 @@ async def hybrid_signal(
 ):
     """
     Build and persist a full hybrid decision (Layer 1 + Layer 2 + Layer 3).
-    This is your main "brain" endpoint.
+    This is the main "brain" endpoint.
     """
     if inference_service is None or not inference_service.is_ready:
         logger.error("Inference service not ready or failed to load.")
@@ -42,11 +42,13 @@ async def hybrid_signal(
         )
 
     try:
-        # This is the correct call to your 3-layer "brain"
+        # 1. This call is correct and returns the full HybridDecision
         decision = await inference_service.build_decision(ctx)
 
-        # Persist for audit / future training
+        # 2. Persist the *full* decision for audit / future training
         try:
+            # --- FIX: Added ALL fields from the 'decision' object ---
+            # This now correctly maps the Pydantic schema to the DB model.
             record = HybridSignal(
                 symbol=decision.symbol,
                 instrument_type=decision.instrument_type,
@@ -58,6 +60,12 @@ async def hybrid_signal(
                 strategy_tag=decision.strategy_tag,
                 meta_execute=decision.meta_execute,
                 debug_payload=decision.debug,
+                
+                # --- NEWLY ADDED FIELDS FOR DB WRITE ---
+                rl_action=decision.rl_action,
+                rl_mode=decision.rl_mode,
+                rl_target_position=decision.rl_target_position,
+                llm_headline=decision.llm_headline
             )
             db.add(record)
             db.commit()
@@ -67,7 +75,8 @@ async def hybrid_signal(
                 f"Failed to persist HybridSignal for {decision.symbol}: {e}",
                 exc_info=True,
             )
-
+        
+        # 3. Return the full decision to the client
         return decision
 
     except Exception as e:

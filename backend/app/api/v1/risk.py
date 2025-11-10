@@ -1,51 +1,33 @@
-# app/api/risk.py
-from __future__ import annotations
+# app/api/v1/risk.py
 
-import json
-from pathlib import Path
-from typing import Dict, Any, Optional
+from fastapi import APIRouter, Depends
+from sqlalchemy.orm import Session
+from sqlalchemy import select
+from app.db.database import get_db
+from app.db import models
 
-from fastapi import APIRouter, HTTPException
+router = APIRouter(prefix="/api/v1/risk", tags=["risk"])
 
-router = APIRouter()
 
-STATE_PATH = Path("/app/state/risk/state.json")
-LEDGER_PATH = Path("/app/state/risk/ledger.json")
+@router.get("/state/{symbol}")
+def get_risk_state(symbol: str, db: Session = Depends(get_db)):
+    symbol = symbol.upper()
 
-def _load_json(path: Path) -> Dict[str, Any]:
-    if not path.exists():
-        return {}
-    try:
-        with open(path) as f:
-            return json.load(f)
-    except Exception as e:
-        raise HTTPException(status_code=500, detail=f"Failed to read {path.name}: {e}")
+    global_cfg = db.query(models.RiskSettingsGlobal).first()
+    sym_cfg = (
+        db.query(models.RiskSettingsSymbol)
+        .filter(models.RiskSettingsSymbol.symbol == symbol)
+        .one_or_none()
+    )
+    learned = (
+        db.query(models.RiskLearnedState)
+        .filter(models.RiskLearnedState.symbol == symbol)
+        .one_or_none()
+    )
 
-@router.get("/health")
-def risk_health() -> Dict[str, Any]:
     return {
-        "ok": True,
-        "state_exists": STATE_PATH.exists(),
-        "ledger_exists": LEDGER_PATH.exists(),
+        "symbol": symbol,
+        "global": global_cfg.__dict__ if global_cfg else None,
+        "symbol_settings": sym_cfg.__dict__ if sym_cfg else None,
+        "learned": learned.__dict__ if learned else None,
     }
-
-@router.get("/state")
-def risk_state() -> Dict[str, Any]:
-    """
-    Current risk parameters, engine mode, equity, and per-symbol performance
-    (as last dumped by the RiskEngine inside the Celery process).
-    """
-    state = _load_json(STATE_PATH)
-    if not state:
-        raise HTTPException(status_code=404, detail="risk state not found yet")
-    return state
-
-@router.get("/ledger")
-def risk_ledger() -> Dict[str, Any]:
-    """
-    Open simulated trades tracked by the ExecutionService ledger
-    (or you can extend to show live trades by querying the venue).
-    """
-    data = _load_json(LEDGER_PATH)
-    # keep shape stable
-    return {"open": data}

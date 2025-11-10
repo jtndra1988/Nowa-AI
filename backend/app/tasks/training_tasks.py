@@ -3,7 +3,7 @@ import subprocess
 import sys
 from celery import chain
 from app.celery_app.app import celery_app
-
+from app.ml.train_adv import run_advanced_training
 logger = logging.getLogger(__name__)
 
 def _run_training_script(script_module: str):
@@ -34,7 +34,28 @@ def _run_training_script(script_module: str):
         raise e
 
 # --- Individual Model Training Tasks ---
+@celery_app.task(name="app.tasks.training_tasks.retrain_llm_narrative_model", base=BaseTaskWithRetry)
+def retrain_llm_narrative_model():
+    """
+    Celery task to retrain the L1 LLM Narrative model.
+    """
+    logger.info("Starting LLM Narrative Model retraining task...")
+    # TODO: Add your LLM fine-tuning/retraining logic here
+    # Example: from app.ml.adv.llm_narrative_model import run_llm_retraining
+    # run_llm_retraining()
+    logger.info("LLM Narrative Model retraining task complete (STUB).")
 
+@celery_app.task(name="app.tasks.training_tasks.retrain_rl_agent", base=BaseTaskWithRetry)
+def retrain_rl_agent():
+    """
+    Celery task to retrain the L3 RL Execution Agent.
+    """
+    logger.info("Starting RL Agent retraining task...")
+    # TODO: Add your RL agent retraining logic here
+    # Example: from app.ml.adv.rl_execution_agent import run_rl_retraining
+    # run_rl_retraining()
+    logger.info("RL Agent retraining task complete (STUB).")
+    
 @celery_app.task(name="tasks.train_tft")
 def train_tft_model_task():
     """

@@ -1,8 +1,9 @@
 # app/hybrid/schemas.py
-from _future_ import annotations
+from __future__ import annotations
 
 from typing import Optional, Dict, Any, Literal
 from pydantic import BaseModel, Field
+from datetime import datetime
 
 
 class MarketContext(BaseModel):
@@ -14,19 +15,20 @@ class MarketContext(BaseModel):
     """
     exchange: str = Field(..., description="Exchange, e.g. 'binance'")
     symbol: str = Field(..., description="Symbol, e.g. 'BTCUSDT'")
-    mode: Literal["spot", "futures", "options"] = Field(
-        ..., description="Market mode"
+    
+    # --- FIX: Changed 'mode' to 'instrument_type' to align with InferenceService
+    # This was a minor conflict. 'instrument_type' is used by the service.
+    instrument_type: Optional[str] = Field(
+        "futures", description="Market mode: 'spot', 'futures', 'options'"
     )
 
-    # Optional but useful knobs:
-    instrument_type: Optional[str] = Field(
-        None, description="Internal instrument type if needed"
-    )
     timeframe: Optional[str] = Field(
         "15m", description="Candle timeframe used for features"
     )
-    position: Optional[float] = Field(
-        0.0, description="Current net position (for future extensions)"
+    # --- FIX: Renamed 'position' to 'current_position_size' ---
+    # This aligns with the 'MarketContext' expected by the RLAgent
+    current_position_size: Optional[float] = Field(
+        0.0, description="Current net position (from -1.0 to 1.0)"
     )
     current_regime: Optional[str] = Field(
         None, description="Detected regime label if available"
@@ -36,38 +38,48 @@ class MarketContext(BaseModel):
     )
 
 
+# --- NEW: Added Layer2Prediction Schema ---
+# This is the internal object passed from Layer 2 to Layer 3
+class Layer2Prediction(BaseModel):
+    asset: str
+    direction: Literal["up", "down", "flat"]
+    price_confidence: float = Field(..., ge=0.0, le=1.0)
+
+
+# --- NEW: Added RLAction Schema ---
+# This is the internal object returned by the RL Agent (Layer 3)
+class RLAction(BaseModel):
+    optimal_action: str  # e.g., "LONG", "SHORT", "HOLD"
+    optimal_size_pct: float = Field(..., ge=0.0, le=1.0) # Absolute size
+    execution_style: str # e.g., "TWAP_15M", "AGGRESSIVE"
+    mode: str  # "rl_live" or "rule_fallback"
+    debug_state: List[float] = Field(default_factory=list)
+
+
 class HybridDecision(BaseModel):
     """
     Final decision object consumed by:
-      - /hybrid-signal API
-      - HybridSignal DB model
-      - Frontend AI tab
-
-    It merges:
-      Layer 1: Expert votes
-      Layer 2: DecisionNet-style fusion
-      Layer 3: RL Head Trader execution suggestion
+      - /hybrid-signal API (as response)
+      - Execution services (as instruction)
+      - Database (for audit)
     """
-
-    # Core identifiers
     symbol: str
-    instrument_type: str = Field(
-        "futures", description="Nowa internal instrument type"
-    )
+    instrument_type: str
+    timestamp: datetime
 
-    # Layer 2: final directional view
+    # Core decision
     direction: Literal["up", "down", "flat"]
     p_edge: float = Field(
-        ..., description="Estimated probability edge of being correct (0-1)"
+        ..., ge=0.0, le=1.0, description="Probability of a positive-edge trade (0-1)"
     )
     confidence: float = Field(
-        ..., description="Strength of conviction based on ensemble alignment (0-1)"
+        ..., ge=0.0, le=1.0, description="Overall confidence in the direction (0-1)"
     )
-
-    # Position sizing / routing
     size_factor: float = Field(
         ...,
-        description="Recommended relative size (0-1) based on risk & RL suggestion",
+        ge=0.0,
+        le=1.0,
+        description="Final suggested size factor (0=none, 1=full)",
     )
     strategy_tag: str = Field(
         "nowa_hybrid_v1",
@@ -87,6 +99,8 @@ class HybridDecision(BaseModel):
             "'options_psychologist': 0.1, 'macro_economist': 0.05, 'llm_narrative': 0.15}"
         ),
     )
+    
+    # --- FIELDS ADDED TO MATCH INFERENCE SERVICE OUTPUT ---
     llm_headline: Optional[str] = Field(
         None,
         description="Key narrative summary from the LLM specialist.",
@@ -95,22 +109,24 @@ class HybridDecision(BaseModel):
     # Layer 3: RL execution layer
     rl_action: Optional[str] = Field(
         None,
-        description="Human-friendly action label, e.g. LONG_50 / SHORT_100 / FLAT.",
+        description="Human-friendly action label, e.g. LONG / SHORT / HOLD.",
     )
     rl_mode: Optional[str] = Field(
         None,
-        description="How the decision was produced: 'rl', 'rule_fallback', etc.",
+        description="How the decision was produced: 'rl_live', 'rule_fallback', etc.",
     )
     rl_target_position: Optional[float] = Field(
         None,
-        description="Suggested net exposure in [-1, 1] where 1=full long, -1=full short.",
+        description="Suggested net exposure, e.g. -1.0, 0.5, 1.0",
     )
-
-    # Debug payloads (for logs / training / UI explainability)
+    rl_execution_style: Optional[str] = Field(
+        None,
+        description="Suggested execution style, e.g. 'TWAP_15M'",
+    )
+    
+    # Full debug payload
     debug: Dict[str, Any] = Field(
         default_factory=dict,
-        description="Nested diagnostics: raw expert signals, scores, RL internals, etc.",
+        description="Full debug payload with L1, L2, L3 state."
     )
-
-    class Config:
-        orm_mode = True
+    # --- END OF ADDED FIELDS ---

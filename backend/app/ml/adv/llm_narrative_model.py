@@ -1,191 +1,208 @@
-import logging
 import os
 import json
-from typing import List, Dict, Optional
+import logging
+from typing import Optional, Dict, Any
 
-# httpx is an async-compatible version of 'requests'
-# This is crucial for FastAPI so it doesn't block the server
-import httpx 
+import httpx
+from pydantic import BaseModel, Field
 
-# Configure logging
-logger = logging.getLogger(__name__)
+logger = logging.getLogger(_name_)
 
-# --- CONFIGURATION ---
-# The API key is left as "" and will be provided by the production environment.
-GEMINI_API_KEY = os.environ.get("GEMINI_API_KEY", "")
-API_URL = f"https://generativelanguage.googleapis.com/v1beta/models/gemini-2.5-flash-preview-09-2025:generateContent?key={GEMINI_API_KEY}"
 
-# --- THE "ENGINE" PROMPT ---
-# This is the "brain" of this specialist. It defines its persona,
-# rules, and output format.
-SYSTEM_PROMPT = """
-You are a 'Narrative Analyst' AI for a quantitative crypto trading firm.
-Your sole function is to analyze a list of news headlines and social media posts for a specific crypto asset and determine the *real-time narrative signal*.
-
-You must ignore all previous context and only analyze the text provided in the user prompt.
-You must not be conversational. You must not explain your reasoning.
-You must *only* respond with a valid JSON object.
-
-The market is volatile, and your analysis must be immediate and precise.
-- A score of 1.0 is an extremely bullish, high-impact event (e.g., "BTC ETF APPROVED BY SEC").
-- A score of -1.0 is an extremely bearish, high-impact event (e.g., "Binance exchange hacked, funds lost").
-- A score of 0.0 is pure noise or neutral (e.g., "Crypto markets are open today").
-
-Your output *must* be a JSON object with this exact schema:
-{"sentiment_score": float, "key_headline": "The single most important headline"}
-"""
-
-# --- THE "ENGINE" SCHEMA ---
-# This schema *forces* the LLM to return the exact JSON format we need.
-# This makes the output reliable and machine-readable.
-JSON_SCHEMA = {
-    "type": "OBJECT",
-    "properties": {
-        "sentiment_score": {
-            "type": "NUMBER",
-            "description": "The narrative sentiment score from -1.0 to 1.0"
-        },
-        "key_headline": {
-            "type": "STRING",
-            "description": "The single most impactful headline from the list"
-        }
-    },
-    "required": ["sentiment_score", "key_headline"]
-}
+class NarrativeOutput(BaseModel):
+    """
+    Output of the LLM Narrative Specialist (Layer 1).
+    - sentiment_score: -1 (very negative) to +1 (very positive)
+    - key_headline: short human-readable summary for logs / UI
+    """
+    sentiment_score: float = Field(..., ge=-1.0, le=1.0)
+    key_headline: str = Field(..., max_length=260)
 
 
 class LLMNarrativeModel:
     """
-    This is the complete, self-contained engine.
-    It is initialized once by the FastAPI app and provides
-    a single function: `get_narrative_signal`.
+    Layer 1: LLM-based Narrative Specialist
+
+    Role:
+      - Read external narrative (news, social, macro context).
+      - Return a compact numeric sentiment + one synthesized headline.
+      - Feeds into DecisionNet (Layer 2) & RL Head Trader (Layer 3).
+
+    Notes:
+      - If GEMINI_API_KEY is missing or any call fails → safe mock output.
+      - You can later replace _mock_output and/or add real news fetching.
     """
-    def __init__(self):
-        # Use an async client for FastAPI compatibility
-        self.client = httpx.AsyncClient(timeout=10.0)
-        # We check if the key is *actually* set in the environment
-        self.use_mock = os.environ.get("GEMINI_API_KEY") is None
-        
-        if self.use_mock:
+
+    def _init_(
+        self,
+        model: str = "gemini-1.5-flash-latest",
+        timeout: float = 8.0,
+    ) -> None:
+        key = os.getenv("GEMINI_API_KEY", "").strip()
+        self.use_mock = not bool(key)
+        self.model = model
+        self.timeout = timeout
+        self._client: Optional[httpx.AsyncClient] = None
+
+        if not self.use_mock:
+            self.api_url = (
+                f"https://generativelanguage.googleapis.com/v1beta/models/"
+                f"{self.model}:generateContent?key={key}"
+            )
+            logger.info("[LLM-Narrative] Using live Gemini model=%s", self.model)
+        else:
+            self.api_url = None
             logger.warning(
-                "GEMINI_API_KEY env var not set. "
-                "LLM Narrative Model will run in MOCK mode."
-            )
-        else:
-            # Re-build the URL with the key now that we know it exists
-            self.api_url = f"https://generativelanguage.googleapis.com/v1beta/models/gemini-2.5-flash-preview-09-2025:generateContent?key={os.environ.get('GEMINI_API_KEY')}"
-            logger.info(
-                "LLM Narrative Model initialized in LIVE mode. "
-                "Ready to call Gemini API."
+                "[LLM-Narrative] GEMINI_API_KEY missing or empty. "
+                "Falling back to deterministic mock outputs."
             )
 
-    def _fetch_realtime_news(self, asset: str) -> List[str]:
-        """
-        --- ACTION REQUIRED: DATA PIPELINE ---
-        This is the *only* placeholder.
-        You must replace this mock list with a call to your
-        real-time news/social data provider (e.g., Kafka, Redis, API).
-        """
-        logger.warning(f"Data pipeline not connected. Using MOCK news for {asset}.")
-        
-        # Mock data for demonstration:
-        if asset == "BTC":
-            return [
-                "Market is choppy, BTC drifts around 68k",
-                "BREAKING: Major US Senator proposes bill to allow Bitcoin for federal tax payments",
-                "Whale Alert: 10,000 BTC moved to unknown wallet",
-                "Glassnode: Long-term holder supply remains high"
-            ]
-        elif asset == "ETH":
-            return [
-                "Consensys reports 'major security breach' on testnet, mainnet safe",
-                "Vitalik Buterin publishes new paper on ZK-rollups",
-                "ETH/BTC ratio hits 3-month low"
-            ]
-        else:
-            return [
-                f"{asset} developer team announces 'minor update' next week",
-                f"Rumors of a new partnership for {asset} circulating on X"
-            ]
+    async def _get_client(self) -> httpx.AsyncClient:
+        if self._client is None:
+            self._client = httpx.AsyncClient(timeout=self.timeout)
+        return self._client
 
-    async def get_narrative_signal(self, asset: str) -> Dict[str, any]:
+    async def aclose(self) -> None:
+        """Call once on shutdown if you want to cleanly close the client."""
+        if self._client:
+            await self._client.aclose()
+            self._client = None
+
+    async def get_narrative_model_output(self, asset: str) -> NarrativeOutput:
         """
-        Analyzes the latest narrative for a given asset.
-        This is the core function of the engine.
+        Main entrypoint.
+
+        Returns a NarrativeOutput. Always succeeds:
+        - Uses real Gemini call when configured.
+        - Falls back to mock, deterministic sentiment when anything fails.
         """
+        asset = (asset or "BTC").upper()
+
         if self.use_mock:
-            # Fallback to mock if API key is missing
-            mock_score = (hash(asset) % 100) / 100.0 * 1.6 - 0.8 # Consistent mock
-            return {
-                "sentiment_score": round(mock_score, 2), 
-                "key_headline": "MOCK: GEMINI_API_KEY environment variable not set"
-            }
+            return self._mock_output(asset)
 
-        # 1. Fetch real-time data from your pipeline
-        headlines = self._fetch_realtime_news(asset)
-        headlines_text = "\n".join(headlines)
+        system_instruction = (
+            "You are Nowa's narrative intelligence module for crypto markets.\n"
+            "You read recent, reputable crypto news, macro headlines, and social context.\n"
+            "You MUST respond with a single JSON object only, no extra text, in this schema:\n"
+            "{\n"
+            '  \"sentiment_score\": float   // between -1 and 1\n'
+            '  \"key_headline\": string    // short concise summary headline\n'
+            "}\n"
+            "Rules:\n"
+            "- sentiment_score < -0.3 = clearly negative narrative.\n"
+            "- sentiment_score > 0.3 = clearly positive narrative.\n"
+            "- Keep key_headline under 200 characters.\n"
+            "- Do not include any other fields.\n"
+        )
 
-        # 2. Construct the user query
-        user_query = f"""
-        Analyze the following data for the asset '{asset}' and return the JSON response:
-
-        --- START OF DATA ---
-        {headlines_text}
-        --- END OF DATA ---
-        """
-
-        # 3. Construct the API payload
-        payload = {
-            "contents": [{"parts": [{"text": user_query}]}],
-            "systemInstruction": {"parts": [{"text": SYSTEM_PROMPT}]},
+        body: Dict[str, Any] = {
+            "systemInstruction": {
+                "parts": [{"text": system_instruction}],
+            },
+            "contents": [
+                {
+                    "role": "user",
+                    "parts": [
+                        {
+                            "text": (
+                                f"Asset: {asset}\n"
+                                "Based only on trusted, non-spam sources, how positive or negative "
+                                "is the current narrative around this asset right now?"
+                            )
+                        }
+                    ],
+                }
+            ],
             "generationConfig": {
                 "responseMimeType": "application/json",
-                "responseSchema": JSON_SCHEMA,
-                "temperature": 0.0, # We want deterministic, factual analysis
-            }
+                "responseSchema": {
+                    "type": "object",
+                    "properties": {
+                        "sentiment_score": {"type": "number"},
+                        "key_headline": {"type": "string"},
+                    },
+                    "required": ["sentiment_score", "key_headline"],
+                },
+                "temperature": 0.4,
+                "topP": 0.9,
+                "topK": 40,
+            },
         }
 
-        # 4. Make the API call
-        api_response_text = ""
         try:
-            # Use the async client and the URL with the key
-            response = await self.client.post(self.api_url, json=payload)
-            
-            # Raise an error if the call failed
-            response.raise_for_status()
-            api_response = response.json()
+            client = await self._get_client()
+            resp = await client.post(self.api_url, json=body)
 
-            # 5. Safely parse the response
-            api_response_text = api_response.get('candidates', [{}])[0] \
-                                            .get('content', {}) \
-                                            .get('parts', [{}])[0] \
-                                            .get('text', '{}')
-            
-            # The 'text' field *is* our JSON object
-            result = json.loads(api_response_text)
-            
-            logger.info(f"LLM Narrative Signal for {asset}: {result}")
-            return result
+            if resp.status_code != 200:
+                logger.warning(
+                    "[LLM-Narrative] HTTP %s from Gemini: %s",
+                    resp.status_code,
+                    resp.text[:300],
+                )
+                return self._mock_output(asset)
 
-        except httpx.HTTPStatusError as e:
-            logger.error(f"Error calling Gemini API: {e} - Response: {e.response.text}")
-            return {"sentiment_score": 0.0, "key_headline": f"API Error: {e}"}
-        except (json.JSONDecodeError, KeyError, IndexError, TypeError) as e:
-            logger.error(f"Error parsing Gemini response: {e}. Raw response: {api_response_text}")
-            return {"sentiment_score": 0.0, "key_headline": f"Parse Error: {e}"}
-        except Exception as e:
-            logger.error(f"An unexpected error occurred in LLM engine: {e}", exc_info=True)
-            return {"sentiment_score": 0.0, "key_headline": f"Unexpected Error: {e}"}
+            data = resp.json()
+            payload = self._extract_payload(data)
+            if not payload:
+                logger.warning(
+                    "[LLM-Narrative] Could not parse Gemini payload, using mock."
+                )
+                return self._mock_output(asset)
 
-# --- SINGLETON INSTANCE ---
-# This single instance will be created when your FastAPI app starts
-# and imported by your API endpoints.
-llm_engine = LLMNarrativeModel()
+            out = NarrativeOutput(
+                sentiment_score=float(max(-1.0, min(1.0, payload["sentiment_score"]))),
+                key_headline=str(payload["key_headline"])[:260],
+            )
+            return out
 
-# --- PUBLIC FUNCTION ---
-# This is the *only* function your API endpoint needs to import and call.
-async def get_narrative_model_output(asset: str) -> Dict[str, any]:
-    """
-    Public async function to be called by your API endpoint (`predict.py`).
-    """
-    return await llm_engine.get_narrative_signal(asset)
+        except Exception as e:  # noqa: BLE001
+            logger.warning("[LLM-Narrative] Exception, using mock: %s", e)
+            return self._mock_output(asset)
+
+    @staticmethod
+    def _extract_payload(data: Any) -> Optional[Dict[str, Any]]:
+        """
+        Gemini may either:
+        - Return JSON directly, or
+        - Wrap JSON as text in candidates[0].content.parts[0].text
+        """
+        if isinstance(data, dict) and "sentiment_score" in data:
+            return data
+
+        try:
+            candidates = data.get("candidates") or []
+            if not candidates:
+                return None
+            parts = candidates[0].get("content", {}).get("parts", [])
+            if not parts:
+                return None
+            raw = parts[0].get("text", "").strip()
+            if not raw:
+                return None
+            # If it's already JSON, parse it.
+            return json.loads(raw)
+        except Exception:  # noqa: BLE001
+            return None
+
+    def _mock_output(self, asset: str) -> NarrativeOutput:
+        """
+        Safe deterministic-ish fallback for demos / missing API key.
+        No external calls, no side effects.
+        """
+        # Cheap deterministic pseudo-random based on asset
+        seed = sum(ord(c) for c in asset) % 200
+        score = (seed - 100) / 150.0  # approx [-0.67, 0.67]
+        score = max(-0.8, min(0.8, score))
+
+        if score > 0.25:
+            headline = f"{asset}: Constructive market narrative with supportive flows (demo)."
+        elif score < -0.25:
+            headline = f"{asset}: Cautious narrative with elevated risk signals (demo)."
+        else:
+            headline = f"{asset}: Mixed but balanced narrative, no extreme stress (demo)."
+
+        return NarrativeOutput(
+            sentiment_score=float(score),
+            key_headline=headline,
+        )

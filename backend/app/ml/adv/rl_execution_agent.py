@@ -1,394 +1,396 @@
 import logging
+import os
+from dataclasses import dataclass
+from typing import Any, Dict, List, Optional, Tuple
+
 import gymnasium as gym
 import numpy as np
-import pandas as pd
-import os
 from gymnasium import spaces
 from stable_baselines3 import PPO
-from stable_baselines3.common.vec_env import DummyVecEnv
-from pydantic import BaseModel
-from typing import Dict, Any, List, Optional
 
-# --- NOTE ---
-# This file contains the complete, automated RL system.
-# 1. `TradingEnv`: The "flight simulator" for your agent.
-# 2. `RLExecutionAgent`: The "pilot" (inference agent) your API uses.
-# 3. `AutomatedTrainingPipeline`: The "flight school" (automated data scientist).
-# 
-# A Celery task will call `AutomatedTrainingPipeline.run_training()`
-# weekly to automatically re-train the bot.
-# -----------------------------------------------------------------
+logger = logging.getLogger(_name_)
 
-logger = logging.getLogger(__name__)
+# Canonical feature layout shared by:
+# - training data
+# - TradingEnv
+# - RLExecutionAgent live inference
+FEATURE_COLUMNS: List[str] = [
+    "decisionnet_confidence",
+    "decisionnet_direction",  # -1, 0, 1
+    "tft_visionary",
+    "tcn_reflex",
+    "xgb_analyst",
+    "options_psychologist",
+    "macro_economist",
+    "llm_narrative",
+]
 
-# --- CONFIGURATION ---
-# The final, trained "Head Trader" model will be saved here
-MODEL_SAVE_PATH = "backend/models/rl_agent_ppo.zip"
-# The master dataset (auto-generated) will be saved here
-TRAINING_DATA_CSV = "backend/data/master_training_data.csv"
-# The raw price data to use for training
-HISTORICAL_PRICE_DATA = "backend/data/BTC_SPOT_1h.csv" # Example
-
-# --- Data Structures (matching schemas.py) ---
-class Layer2Prediction(BaseModel):
-    """ The consensus prediction from DecisionNet (Layer 2) """
-    asset: str
-    direction: str
-    price_confidence: float
-
-class MarketContext(BaseModel):
-    """ Real-time market state """
-    current_regime: str
-    current_volatility: float
-
-class RLAction(BaseModel):
-    """ The final, executable action from the RL Agent (Layer 3) """
-    optimal_action: str
-    optimal_size_pct: float
-    execution_style: str
+# Where we store the trained policy
+DEFAULT_POLICY_PATH = os.getenv(
+    "NOWA_RL_POLICY_PATH", "backend/app/ml/adv/rl_head_trader_ppo.zip"
+)
 
 
-# --- 1. The Training Environment (The "Flight Simulator") ---
+@dataclass
+class Layer2Decision:
+    """
+    Minimal view of Layer 2 (DecisionNet) output consumed by RL Head Trader.
+    """
+
+    direction: str  # "up", "down", or "flat"
+    confidence: float  # 0-1
+    model_votes: Dict[str, float]  # keys MUST match FEATURE_COLUMNS where applicable
+
 
 class TradingEnv(gym.Env):
     """
-    A custom Gymnasium environment for training the RL "Head Trader".
-    It takes a DataFrame of historical prices AND signals.
+    Simple portfolio environment for PPO training.
+
+    State = [FEATURE_COLUMNS..., current_position]
+      - features: normalized signals from DecisionNet + all Layer 1 specialists.
+      - current_position: -1.0 short, 0 flat, +1 long.
+
+    Action space:
+      0 -> flat (close / stay flat)
+      1 -> long (e.g. +1x)
+      2 -> short (e.g. -1x)
+
+    Reward:
+      - PnL based on "true" move (simulated) vs position
+      - Penalty for churn & leverage
+      - Heavy penalty for "liquidation" events
     """
-    metadata = {'render_modes': ['human']}
 
-    def __init__(self, df: pd.DataFrame, feature_columns: List[str], price_column: str = 'price'):
-        super(TradingEnv, self).__init__()
-        
-        self.df = df
-        self.feature_columns = feature_columns
-        self.price_column = price_column
-        self.current_step = 0
-        self.max_steps = len(self.df) - 2 # (n - 1 for index, -1 for next_price)
+    metadata = {"render_modes": []}
 
-        # Observation space: All feature columns + 1 (for current_position)
-        self.num_features = len(self.feature_columns)
+    def _init_(
+        self,
+        episode_len: int = 256,
+        transaction_cost: float = 0.0005,
+        liq_penalty: float = -5.0,
+        seed: int = 42,
+    ):
+        super()._init_()
+        self.episode_len = episode_len
+        self.transaction_cost = transaction_cost
+        self.liq_penalty = liq_penalty
+
+        self.rng = np.random.default_rng(seed)
+
+        # Observation = len(FEATURE_COLUMNS) + current_position
+        obs_dim = len(FEATURE_COLUMNS) + 1
         self.observation_space = spaces.Box(
-            low=-np.inf, high=np.inf, shape=(self.num_features + 1,), dtype=np.float32
+            low=-5.0, high=5.0, shape=(obs_dim,), dtype=np.float32
         )
-
-        # Action space: 0 = HOLD, 1 = LONG, 2 = SHORT
+        # 0 flat, 1 long, 2 short
         self.action_space = spaces.Discrete(3)
-        self.action_map = {0: 0, 1: 1, 2: -1} # Map code to position
 
-        # Portfolio state
-        self.initial_balance = 10000.0
-        self.balance = self.initial_balance
-        self.current_position = 0 # -1 (short), 0 (flat), 1 (long)
+        self._t = 0
+        self._position = 0.0
+        self._last_price = 1.0
 
-    def _get_observation(self) -> np.ndarray:
-        """Build the state vector for the current time step."""
-        try:
-            # Get all feature values for the current step
-            obs = self.df.iloc[self.current_step][self.feature_columns].values
-            # Add the agent's current position to the state
-            obs_with_position = np.append(obs, [self.current_position])
-            return obs_with_position.astype(np.float32)
-        except Exception as e:
-            logger.error(f"Error getting observation at step {self.current_step}: {e}")
-            return np.zeros(self.num_features + 1).astype(np.float32)
-
-    def reset(self, seed=None, options=None):
+    def reset(
+        self, *, seed: Optional[int] = None, options: Optional[dict] = None
+    ) -> Tuple[np.ndarray, Dict[str, Any]]:
         super().reset(seed=seed)
-        self.current_step = 0
-        self.balance = self.initial_balance
-        self.current_position = 0
-        return self._get_observation(), {}
+        if seed is not None:
+            self.rng = np.random.default_rng(seed)
 
-    def step(self, action):
-        if self.current_step >= self.max_steps:
-            # We are at the end of the data
-            return self._get_observation(), 0, True, False, {}
+        self._t = 0
+        self._position = 0.0
+        self._last_price = 1.0
+        return self._sample_state(), {}
 
-        # 1. Get current state data
-        current_price = self.df.iloc[self.current_step][self.price_column]
-        target_position = self.action_map[action] # What the agent *wants* to do
-        
-        # 2. Advance time to the next step
-        self.current_step += 1
-        next_price = self.df.iloc[self.current_step][self.price_column]
-        
-        # 3. Calculate Reward (PnL)
-        # We calculate the reward based on the position we *were* in
-        reward = 0.0
-        price_change_pct = (next_price - current_price) / current_price
-        
-        if self.current_position == 1: # We were LONG
-            reward = price_change_pct
-        elif self.current_position == -1: # We were SHORT
-            reward = -price_change_pct
-        
-        # Simple transaction cost (0.1% per trade)
-        if target_position != self.current_position:
-             reward -= 0.001 
-            
-        # 4. Update portfolio
-        self.balance *= (1 + reward) # Apply PnL
-        self.current_position = target_position # Update to new position
+    def step(
+        self, action: int
+    ) -> Tuple[np.ndarray, float, bool, bool, Dict[str, Any]]:
+        assert self.action_space.contains(action)
 
-        # 5. Check for termination
-        done = self.current_step >= self.max_steps
-        if self.balance < self.initial_balance * 0.5: # Stop if we lose 50%
-            done = True
-            logger.warning("RL Agent was 'liquidated' during training.")
+        prev_pos = self._position
+        # Map discrete action to target position
+        if action == 0:
+            self._position = 0.0
+        elif action == 1:
+            self._position = 1.0
+        else:
+            self._position = -1.0
 
-        return self._get_observation(), reward, done, False, {}
+        # Simulate price move: small random plus weak drift from "true" signal
+        true_signal = self._latent_trend()
+        price_move = true_signal * 0.003 + self.rng.normal(0, 0.003)
+        new_price = self._last_price * (1.0 + price_move)
 
+        # PnL approx: position * return
+        pnl = self._position * ((new_price / self._last_price) - 1.0)
 
-# --- 2. The Automated "Data Scientist" (The "Flight School") ---
+        # Transaction cost on change in position
+        cost = abs(self._position - prev_pos) * self.transaction_cost
+        reward = pnl - cost
+
+        # Rare "liquidation" event when highly misaligned
+        terminated = False
+        truncated = False
+        info: Dict[str, Any] = {}
+
+        if abs(price_move) > 0.05 and np.sign(price_move) != np.sign(self._position):
+            reward += self.liq_penalty
+            terminated = True
+            info["liquidation"] = True
+
+        self._last_price = new_price
+        self._t += 1
+
+        if self._t >= self.episode_len:
+            truncated = True
+
+        obs = self._sample_state()
+        return obs, float(reward), terminated, truncated, info
+
+    # ----- helpers -----
+
+    def _latent_trend(self) -> float:
+        # Slow mean-reverting latent drift in [-1,1]
+        phase = (self._t % 200) / 200.0
+        return float(np.sin(2 * np.pi * phase))
+
+    def _sample_state(self) -> np.ndarray:
+        # For training scaffold: random-ish but bounded feature vector.
+        # In real training, you will feed recorded features instead.
+        core = self.rng.normal(0.0, 0.6, size=(len(FEATURE_COLUMNS),))
+        state = np.concatenate([core, [self._position]]).astype(np.float32)
+        return state
+
 
 class AutomatedTrainingPipeline:
     """
-    This is the "bot data scientist".
-    It's responsible for fetching data, generating historical signals
-    from all Layer 1 models, and training the Layer 3 RL agent.
+    Automated RL training pipeline (offline).
+
+    For now this uses a synthetic TradingEnv. In production:
+    - Replace env with one that replays real historical hybrid decisions.
+    - Use real Layer 1 + DecisionNet features as observations.
     """
-    def __init__(self):
-        # This list defines the "state" for the RL agent.
-        # It MUST match the features in `_generate_historical_signals`
-        self.feature_columns = [
-            'decisionnet_confidence', 'decisionnet_direction',
-            'tft_signal', 'tcn_signal', 'xgb_signal',
-            'options_signal', 'macro_signal', 'llm_signal'
-        ]
-        self.price_column = 'price'
-        self.num_features = len(self.feature_columns)
-        logger.info("AutomatedTrainingPipeline (Bot Data Scientist) initialized.")
 
-    def _generate_historical_signals(self) -> pd.DataFrame:
-        """
-        --- ACTION REQUIRED: REAL DATA PIPELINE ---
-        This is the most critical function you must build.
-        You must replace this mock with your *actual* historical data pipeline.
-        
-        This function needs to:
-        1. Load historical price data (e.g., from HISTORICAL_PRICE_DATA)
-        2. Load all your trained Layer 1 models (TFT, TCN, XGB, etc.)
-        3. Iterate through the *entire* price history (e.g., 5 years) and run 
-           `model.predict()` for *every single timestep* to get the historical signals.
-        4. (Mock) Run the DecisionNet (Layer 2) over those signals.
-        5. (Mock) Run the LLM over historical news (this is complex/expensive) 
-           or use a proxy (e.g., a simple sentiment score on headlines).
-        6. Return a single, massive DataFrame with all signals aligned to the price.
-        """
-        logger.warning("--- MOCK DATA --- Using mock data for RL training.")
-        logger.warning("--- ACTION REQUIRED --- Replace `_generate_historical_signals` with your real backtesting pipeline.")
-        
-        try:
-            # 1. Load historical price data
-            price_df = pd.read_csv(HISTORICAL_PRICE_DATA)
-            price_df = price_df.rename(columns={'close': self.price_column}) # Adjust as needed
-            size = len(price_df)
-            
-            # 2. Create a new DataFrame for all features
-            df = pd.DataFrame(index=price_df.index)
-            df[self.price_column] = price_df[self.price_column]
-            
-            # 3. (MOCK) Generate signals for all models
-            #    Replace these random numbers with your *actual* model.predict() calls
-            df['tft_signal'] = np.random.uniform(-1, 1, size)
-            df['tcn_signal'] = np.random.uniform(-1, 1, size)
-            df['xgb_signal'] = np.random.uniform(-1, 1, size)
-            df['options_signal'] = np.random.uniform(-1, 1, size)
-            df['macro_signal'] = np.random.uniform(-1, 1, size)
-            df['llm_signal'] = np.random.uniform(-1, 1, size)
-            
-            # 4. (MOCK) Generate signals for DecisionNet (Layer 2)
-            #    This would be your `decision_net.predict()`
-            avg_signal = df[self.feature_columns[2:]].mean(axis=1) # Mock fusion
-            df['decisionnet_confidence'] = np.abs(avg_signal)
-            df['decisionnet_direction'] = np.sign(avg_signal)
-            
-            # 5. Save and return
-            df.dropna(inplace=True) # Ensure no NaNs
-            df.to_csv(TRAINING_DATA_CSV, index=False)
-            logger.info(f"Mock training data generated and saved to {TRAINING_DATA_CSV}")
-            return df
-        
-        except FileNotFoundError:
-            logger.error(f"CRITICAL: Historical price data not found at {HISTORICAL_PRICE_DATA}")
-            return pd.DataFrame()
-        except Exception as e:
-            logger.error(f"CRITICAL: Failed to generate historical signals: {e}", exc_info=True)
-            return pd.DataFrame()
+    def _init_(
+        self,
+        policy_path: str = DEFAULT_POLICY_PATH,
+        total_timesteps: int = 300_000,
+    ) -> None:
+        self.policy_path = policy_path
+        self.total_timesteps = total_timesteps
 
+    def train(self) -> None:
+        logger.info("[RL-HeadTrader] Starting PPO training (synthetic env)...")
+        env = TradingEnv()
+        model = PPO(
+            "MlpPolicy",
+            env,
+            verbose=0,
+            tensorboard_log=None,
+        )
+        model.learn(total_timesteps=self.total_timesteps)
+        os.makedirs(os.path.dirname(self.policy_path), exist_ok=True)
+        model.save(self.policy_path)
+        logger.info("[RL-HeadTrader] Saved PPO policy to %s", self.policy_path)
 
-    def run_training(self):
-        """
-        The main function called by the Celery task.
-        This function *is* the automated data scientist.
-        """
-        logger.info("--- STARTING AUTOMATED RL AGENT TRAINING ---")
-        
-        # 1. Generate the master training dataset
-        logger.info("Step 1/4: Generating historical signals...")
-        df = self._generate_historical_signals()
-        if df.empty:
-            logger.error("Training halted: Historical signal generation failed.")
-            return
-
-        # 2. Create the environment
-        logger.info("Step 2/4: Initializing training environment...")
-        env = DummyVecEnv([lambda: TradingEnv(df, self.feature_columns, self.price_column)])
-
-        # 3. Create or load the PPO model
-        logger.info("Step 3/4: Initializing PPO model...")
-        os.makedirs(os.path.dirname(MODEL_SAVE_PATH), exist_ok=True)
-        
-        if os.path.exists(MODEL_SAVE_PATH):
-            logger.info(f"Loading existing model from {MODEL_SAVE_PATH} to continue training.")
-            model = PPO.load(MODEL_SAVE_PATH, env=env)
-        else:
-            logger.info("No existing model found. Creating new PPO model.")
-            # We use "MlpPolicy" because our state vector is a simple 1D array of numbers
-            model = PPO("MlpPolicy", env, verbose=0)
-        
-        # 4. Train the model
-        # 100k timesteps is a small-to-medium run, good for weekly updates.
-        # A full, initial training might be 1M or 10M timesteps.
-        training_timesteps = 100_000
-        logger.info(f"Step 4/4: Starting training for {training_timesteps} timesteps...")
-        model.learn(total_timesteps=training_timesteps, tb_log_name="rl_agent_run")
-        logger.info("...Training complete.")
-
-        # 5. Save the newly trained model
-        model.save(MODEL_SAVE_PATH)
-        logger.info(f"Trained RL model saved to {MODEL_SAVE_PATH}")
-        logger.info("--- AUTOMATED RL AGENT TRAINING COMPLETE ---")
-
-
-# --- 3. The Live Inference Engine (The "Pilot") ---
 
 class RLExecutionAgent:
     """
-    The "Head Trader" (Layer 3) Inference Engine.
-    Loads the pre-trained PPO model and provides optimal actions.
-    This class is instantiated once when the FastAPI app starts.
+    Layer 3: RL Head Trader
+
+    Inputs:
+      - Layer2Decision (DecisionNet output):
+          direction: "up" / "down" / "flat"
+          confidence: 0..1
+          model_votes: {
+            "tft_visionary": float,
+            "tcn_reflex": float,
+            "xgb_analyst": float,
+            "options_psychologist": float,
+            "macro_economist": float,
+            "llm_narrative": float,
+          }
+
+    Behavior:
+      - If trained PPO policy is available:
+          uses it to map features -> optimal discrete action.
+      - Else:
+          falls back to a transparent rule-based policy.
+
+    Output:
+      dict with:
+        - action: "FLAT" | "LONG_50" | "LONG_100" | "SHORT_50" | "SHORT_100"
+        - target_position: float in [-1,1]
+        - mode: "rl" or "rule_fallback"
     """
-    def __init__(self, model_path: str = MODEL_SAVE_PATH):
-        self.model_path = model_path
-        self.model: Optional[PPO] = None
-        
-        # This MUST match the feature_columns in the TrainingPipeline
-        self.feature_columns = [
-            'decisionnet_confidence', 'decisionnet_direction',
-            'tft_signal', 'tcn_signal', 'xgb_signal',
-            'options_signal', 'macro_signal', 'llm_signal'
-        ]
+
+    def _init_(
+        self,
+        policy_path: str = DEFAULT_POLICY_PATH,
+    ) -> None:
+        self.policy_path = policy_path
+        self.feature_columns = FEATURE_COLUMNS
         self.num_features = len(self.feature_columns)
-        self.load_model()
+        self._model: Optional[PPO] = None
 
-    def load_model(self):
-        """ Loads the trained model from disk. """
+        if os.path.exists(self.policy_path):
+            try:
+                self._model = PPO.load(self.policy_path)
+                logger.info(
+                    "[RL-HeadTrader] Loaded PPO policy from %s",
+                    self.policy_path,
+                )
+            except Exception as e:  # noqa: BLE001
+                logger.warning(
+                    "[RL-HeadTrader] Failed to load PPO policy (%s). "
+                    "Falling back to rules.",
+                    e,
+                )
+                self._model = None
+        else:
+            logger.warning(
+                "[RL-HeadTrader] PPO policy not found at %s. Using rule-based fallback.",
+                self.policy_path,
+            )
+
+    # ---------- PUBLIC API ----------
+
+    def choose_action(
+        self,
+        decision: Layer2Decision,
+    ) -> Dict[str, Any]:
+        """
+        Main entry for Layer 3.
+
+        decision is the fused signal from DecisionNet (Layer 2).
+        Returns a dict describing the chosen position.
+        """
+        obs = self._format_state(decision)
+
+        if obs is None:
+            # Bad input; safest is always FLAT.
+            return {
+                "action": "FLAT",
+                "target_position": 0.0,
+                "mode": "invalid_input",
+            }
+
+        if self._model is not None:
+            return self._rl_action(obs, decision)
+        else:
+            return self._rule_based_action(decision)
+
+    # ---------- INTERNALS ----------
+
+    def _format_state(self, decision: Layer2Decision) -> Optional[np.ndarray]:
         try:
-            if os.path.exists(self.model_path):
-                self.model = PPO.load(self.model_path)
-                logger.info(f"Successfully loaded trained RL model from {self.model_path}")
-            else:
-                logger.error(f"RL model file not found at {self.model_path}. Agent will run in MOCK mode.")
-                self.model = None
-        except Exception as e:
-            logger.error(f"Error loading RL model: {e}. Agent will run in MOCK mode.", exc_info=True)
-            self.model = None
+            dir_map = {"up": 1.0, "down": -1.0, "flat": 0.0}
+            direction_num = dir_map.get(decision.direction.lower(), 0.0)
+            conf = float(max(0.0, min(1.0, decision.confidence)))
 
-    def _format_state(
+            # model_votes keys must match these:
+            mv = decision.model_votes or {}
+            obs_values: List[float] = [
+                conf,  # decisionnet_confidence
+                direction_num,  # decisionnet_direction
+                float(mv.get("tft_visionary", 0.0)),
+                float(mv.get("tcn_reflex", 0.0)),
+                float(mv.get("xgb_analyst", 0.0)),
+                float(mv.get("options_psychologist", 0.0)),
+                float(mv.get("macro_economist", 0.0)),
+                float(mv.get("llm_narrative", 0.0)),
+            ]
+
+            if len(obs_values) != self.num_features:
+                logger.warning(
+                    "[RL-HeadTrader] Feature length mismatch. "
+                    "Expected %d, got %d.",
+                    self.num_features,
+                    len(obs_values),
+                )
+                return None
+
+            # append current_position for policy input (0 here; real impl can track)
+            current_position = 0.0
+            obs = np.array(
+                obs_values + [current_position],
+                dtype=np.float32,
+            )
+            return obs
+        except Exception as e:  # noqa: BLE001
+            logger.warning("[RL-HeadTrader] Failed to format state: %s", e)
+            return None
+
+    def _rl_action(
         self,
-        prediction: Layer2Prediction,
-        model_votes: Dict[str, float],
-        current_position: int
-    ) -> np.ndarray:
+        obs: np.ndarray,
+        decision: Layer2Decision,
+    ) -> Dict[str, Any]:
+        try:
+            action_id, _ = self._model.predict(obs, deterministic=True)
+        except Exception as e:  # noqa: BLE001
+            logger.warning(
+                "[RL-HeadTrader] PPO predict failed (%s). "
+                "Falling back to rule-based.",
+                e,
+            )
+            return self._rule_based_action(decision)
+
+        # Map PPO discrete action to a target position / label.
+        # You can refine this mapping if you extend the action space.
+        mapping = {
+            0: ("FLAT", 0.0),
+            1: ("LONG_50", 0.5),
+            2: ("SHORT_50", -0.5),
+        }
+        label, pos = mapping.get(int(action_id), ("FLAT", 0.0))
+
+        return {
+            "action": label,
+            "target_position": float(pos),
+            "mode": "rl",
+        }
+
+    def _rule_based_action(self, decision: Layer2Decision) -> Dict[str, Any]:
         """
-        Formats the live API data into the 1D state vector
-        that the trained RL model expects.
-        
-        The order MUST be identical to `self.feature_columns` + `current_position`.
+        Transparent fallback: behaves like a risk-aware head trader.
+
+        - High confidence & strong alignment -> larger positions.
+        - Medium -> smaller.
+        - Low or conflicting -> flat.
         """
-        direction_numeric = 1.0 if prediction.direction == 'up' else -1.0 if prediction.direction == 'down' else 0.0
+        d = (decision.direction or "flat").lower()
+        c = max(0.0, min(1.0, float(decision.confidence)))
 
-        obs_values = [
-            prediction.price_confidence,
-            direction_numeric,
-            model_votes.get('tft_visionary', 0.0),
-            model_votes.get('tcn_reflex', 0.0),
-            model_votes.get('xgb_analyst', 0.0),
-            model_votes.get('options_psychologist', 0.0),
-            model_votes.get('macro_economist', 0.0),
-            model_votes.get('llm_narrative', 0.0),
-        ]
-        
-        # Append the final piece of state: our current position
-        obs_values.append(current_position)
-        
-        if len(obs_values) != self.num_features + 1:
-            logger.error(f"State vector length mismatch! Expected {self.num_features + 1}, got {len(obs_values)}")
-            # Return a "neutral" state
-            return np.zeros(self.num_features + 1).astype(np.float32)
+        if d == "up":
+            if c >= 0.8:
+                return {
+                    "action": "LONG_100",
+                    "target_position": 1.0,
+                    "mode": "rule_fallback",
+                }
+            if c >= 0.6:
+                return {
+                    "action": "LONG_50",
+                    "target_position": 0.5,
+                    "mode": "rule_fallback",
+                }
+        elif d == "down":
+            if c >= 0.8:
+                return {
+                    "action": "SHORT_100",
+                    "target_position": -1.0,
+                    "mode": "rule_fallback",
+                }
+            if c >= 0.6:
+                return {
+                    "action": "SHORT_50",
+                    "target_position": -0.5,
+                    "mode": "rule_fallback",
+                }
 
-        return np.array(obs_values).astype(np.float32)
-
-    def get_optimal_action(
-        self,
-        prediction: Layer2Prediction,
-        context: MarketContext,
-        model_votes: Dict[str, float]
-    ) -> RLAction:
-        """
-        Takes the Layer 2 prediction and market state, and returns
-        the optimal Layer 3 action.
-        """
-        if not self.model:
-            # --- MOCK LOGIC (if model fails to load) ---
-            logger.warning("RL Agent running in MOCK mode (model not loaded).")
-            action, size = "HOLD", 0.0
-            if prediction.direction == "up" and prediction.price_confidence > 0.7:
-                action, size = "LONG", 0.5
-            elif prediction.direction == "down" and prediction.price_confidence > 0.7:
-                action, size = "SHORT", 0.5
-            return RLAction(optimal_action=action, optimal_size_pct=size, execution_style="Market")
-
-        # --- REAL INFERENCE ---
-        # 1. Get current portfolio state (from your OrderManager service)
-        #    !!! ACTION REQUIRED: Replace this with your *real* portfolio query !!!
-        current_position = 0 # 0=flat, 1=long, -1=short
-        
-        # 2. Format the observation
-        obs = self._format_state(prediction, model_votes, current_position)
-        
-        # 3. Predict the action from the state
-        #    `deterministic=True` means we take the "best" action, not a random one
-        action_code, _states = self.model.predict(obs, deterministic=True)
-        
-        # 4. Decode the action and return
-        if action_code == 1:
-            return RLAction(optimal_action="LONG", optimal_size_pct=1.0, execution_style="Market")
-        elif action_code == 2:
-            return RLAction(optimal_action="SHORT", optimal_size_pct=1.0, execution_style="Market")
-        else: # action_code == 0
-            return RLAction(optimal_action="HOLD", optimal_size_pct=0.0, execution_style="Market")
-
-# --- 4. Singleton Instances ---
-# These are loaded once by FastAPI on startup
-rl_agent_engine = RLExecutionAgent()
-automated_trainer_instance = AutomatedTrainingPipeline()
-
-# --- 5. Public Functions for API and Celery ---
-
-def get_optimal_action(
-    prediction: Layer2Prediction,
-    context: MarketContext,
-    model_votes: Dict[str, float]
-) -> RLAction:
-    """Public function called by the API endpoint (`predict.py`)."""
-    return rl_agent_engine.get_optimal_action(prediction, context, model_votes)
-
-def run_automated_training():
-    """Public function called by the Celery task (`training_tasks.py`)."""
-    automated_trainer_instance.run_training()
-    # After training, tell the live agent to reload the new model
-    logger.info("Reloading live RL Agent with newly trained model...")
-    rl_agent_engine.load_model()
+        # Anything else → stand aside
+        return {
+            "action": "FLAT",
+            "target_position": 0.0,
+            "mode": "rule_fallback",
+        }

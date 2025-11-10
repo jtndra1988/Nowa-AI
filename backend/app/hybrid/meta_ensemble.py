@@ -1,19 +1,24 @@
 import joblib
 from pathlib import Path
 from typing import Dict, Any
+
 from .schemas import ExpertSignals, MarketContext
 
 _META_MODEL_PATH = Path("./model_artifacts/meta_ensemble.joblib")
 _meta_model = None
+
 
 def _lazy_load():
     global _meta_model
     if _meta_model is None and _META_MODEL_PATH.exists():
         _meta_model = joblib.load(_META_MODEL_PATH)
 
-def meta_predict(features: Dict[str, Any],
-                 expert: ExpertSignals,
-                 ctx: MarketContext) -> Dict[str, Any]:
+
+def meta_predict(
+    features: Dict[str, Any],
+    expert: ExpertSignals,
+    ctx: MarketContext,
+) -> Dict[str, Any]:
     """
     Returns:
       p_edge: P(trade has positive edge)
@@ -36,20 +41,25 @@ def meta_predict(features: Dict[str, Any],
     if _meta_model is not None:
         proba = float(_meta_model.predict_proba([row])[0, 1])
     else:
-        # Fallback: soft-normalized blend of expert prices
-        scores = [s for s in [expert.tft_price, expert.tcn_price, expert.xgb_price] if s is not None]
+        scores = [
+            s
+            for s in [expert.tft_price, expert.tcn_price, expert.xgb_price]
+            if s is not None
+        ]
         if scores:
             avg = sum(scores) / len(scores)
-            proba = max(0.0, min(0.5 + 0.5 * (avg / (abs(avg) + 1e-6)), 1.0))
+            # squashed into [0,1]
+            proba = max(
+                0.0,
+                min(0.5 + 0.5 * (avg / (abs(avg) + 1e-6)), 1.0),
+            )
         else:
             proba = 0.5
 
-    # Direction: sign of blended view, unless edge is weak
-    blended = (
-        (expert.tft_price or 0.0) +
-        (expert.tcn_price or 0.0) +
-        (expert.xgb_price or 0.0)
-    ) / max(1, len([x for x in [expert.tft_price, expert.tcn_price, expert.xgb_price] if x is not None])
+    scores_for_dir = [
+        s for s in [expert.tft_price, expert.tcn_price, expert.xgb_price] if s is not None
+    ]
+    blended = sum(scores_for_dir) / len(scores_for_dir) if scores_for_dir else 0.0
 
     if proba < 0.52:
         dir_raw = "flat"

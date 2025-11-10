@@ -1,16 +1,20 @@
 from typing import Dict, Any, Tuple
+
 from .schemas import ExpertSignals, MarketContext
 
-def bandit_weights(features: Dict[str, Any],
-                   expert: ExpertSignals,
-                   meta: Dict[str, Any],
-                   ctx: MarketContext) -> Tuple[Dict[str, float], str]:
+
+def bandit_weights(
+    features: Dict[str, Any],
+    expert: ExpertSignals,
+    meta: Dict[str, Any],
+    ctx: MarketContext,
+) -> Tuple[Dict[str, float], str]:
     """
-    For now, simple rules:
+    Simple heuristic "bandit":
       - trend & sane vol -> trend-follow
       - high vol -> momentum
       - else -> mean-revert
-    Later: replace with real contextual bandit using logged rewards.
+    Replace with proper contextual bandit later.
     """
     rv = float(features.get("rv_24h", 0.05))
     trend = float(features.get("trend_score", 0.0))

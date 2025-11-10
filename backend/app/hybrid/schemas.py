@@ -3,11 +3,13 @@ from typing import Literal, Optional, Dict
 
 InstrumentType = Literal["spot", "perp", "future", "option"]
 
+
 class MarketContext(BaseModel):
     symbol: str
     instrument_type: InstrumentType = "perp"
     exchange: str = "deribit"
-    timestamp: int  # epoch ms or s; used mainly for logging/routing later
+    timestamp: int  # epoch ms or s; mainly for logging/routing
+
 
 class ExpertSignals(BaseModel):
     tft_price: Optional[float] = None
@@ -16,6 +18,7 @@ class ExpertSignals(BaseModel):
     tft_vol: Optional[float] = None
     tcn_vol: Optional[float] = None
     xgb_vol: Optional[float] = None
+
 
 class HybridDecision(BaseModel):
     symbol: str

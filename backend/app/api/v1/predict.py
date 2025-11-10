@@ -83,14 +83,7 @@ def predict(
         raise HTTPException(status_code=500, detail=str(e))
 @router.post("/hybrid-signal", response_model=HybridDecision)
 def hybrid_signal(ctx: MarketContext, db: Session = Depends(get_db)):
-    """
-    Returns a trade-ready hybrid decision using the existing TFT + TCN + XGB stack
-    plus meta-ensemble, meta-label, and bandit logic.
-    """
     if inference_service is None or not inference_service.is_ready:
         logger.error("Inference service not ready.")
         raise HTTPException(status_code=503, detail="InferenceService is not available")
-
-    decision = inference_service.build_decision(ctx)
-    # (optional) save decision to DB for training meta / bandit later
-    return decision    
+    return inference_service.build_decision(ctx)

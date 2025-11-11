@@ -515,11 +515,9 @@ class HybridInferenceService:
             {"high": closes + 1.0, "low": closes - 1.0, "close": closes}
         )
         return seq, tab, ohlc_df
-
     # -------------------------------------------------------------------------
     # Risk integration + persistence + HybridDecision
     # -------------------------------------------------------------------------
-
     def _risk_aware_persist_and_build_decision(
         self,
         symbol: str,
@@ -533,13 +531,19 @@ class HybridInferenceService:
         tab_features: Dict[str, float],
         ohlc_df: pd.DataFrame,
     ) -> HybridDecision:
+        """
+        Apply RL + RiskEngine, persist audit rows, and return HybridDecision.
+
+        This implementation is aligned exactly with hybrid/schemas.HybridDecision.
+        """
         now = datetime.utcnow()
 
-        # RL raw action
+        # ---- Base RL interpretation ----
         act = (rl_action.optimal_action or "HOLD").upper()
+        rl_exec_style = rl_action.execution_style
         rl_mode = rl_action.mode or self.rl_agent.get_mode()
 
-        # Base direction (for HybridDecision)
+        # Map RL action to an initial directional view
         if act == "LONG":
             base_direction = "up"
         elif act == "SHORT":
@@ -547,11 +551,11 @@ class HybridInferenceService:
         else:
             base_direction = l2_pred.direction
 
-        # RL suggested size [0,1]
+        # Raw size suggestion from RL [0,1]
         raw_size = float(rl_action.optimal_size_pct or 0.0)
         raw_size = max(0.0, min(1.0, raw_size))
 
-        # Candidate execution?
+        # Candidate for live execution?
         meta_execute = act in ("LONG", "SHORT") and raw_size > 0.0
 
         # ---- RiskEngine integration ----
@@ -560,23 +564,24 @@ class HybridInferenceService:
         rl_target_position = 0.0
 
         if meta_execute and not ohlc_df.empty:
+            # Initialize per-symbol risk engine
             risk_engine = RiskEngine(symbol)
 
-            # 1) Global guard (rolling DD, etc.)
+            # 1) Global / session guards (dd, halt flags, etc.)
             current_equity = DEFAULT_ACCOUNT_EQUITY
             guard = risk_engine.check_global_guards(current_equity=current_equity)
             risk_debug["global_guard"] = guard
 
             if guard.get("halt"):
-                # Hard stop: no new risk
+                # Hard stop: no new exposure
                 meta_execute = False
                 final_size = 0.0
                 rl_target_position = 0.0
             else:
-                # 2) Side for RiskEngine
+                # 2) Side for risk proposal
                 side = "BUY" if base_direction == "up" else "SELL"
 
-                # 3) Regime from context (int)
+                # 3) Regime (optional, from context)
                 regime = 0
                 if ctx.current_regime is not None:
                     try:
@@ -587,7 +592,7 @@ class HybridInferenceService:
                 # 4) Mark price from last close
                 mark_price = float(ohlc_df["close"].iloc[-1])
 
-                # 5) RiskEngine position proposal
+                # 5) Ask RiskEngine for allowed position
                 proposal = risk_engine.propose_position(
                     dfe=ohlc_df,
                     side=side,
@@ -600,33 +605,45 @@ class HybridInferenceService:
                 risk_debug["proposal"] = proposal
 
                 if proposal.get("reason") == "ok":
+                    # Convert allowed notional -> max fraction of equity
                     max_risk_size = float(proposal["qty_usd"]) / max(
                         current_equity, 1e-9
                     )
                     max_risk_size = max(0.0, min(1.0, max_risk_size))
+
+                    # Final size is min(RL suggestion, risk cap)
                     final_size = min(raw_size, max_risk_size)
                     rl_target_position = (
                         final_size if side == "BUY" else -final_size
                     )
                 else:
+                    # RiskEngine vetoed
                     meta_execute = False
                     final_size = 0.0
                     rl_target_position = 0.0
 
-                risk_engine.save_state()
+                # Persist updated risk state if engine supports it
+                try:
+                    risk_engine.save_state()
+                except Exception:
+                    # Don't break decision flow on risk save failure
+                    pass
         else:
-            # no exec / no data → flat
+            # No execution or no OHLC data -> flat
             final_size = 0.0
             rl_target_position = 0.0
 
+        # ---- Derive high-level decision metrics ----
         confidence = float(l2_pred.price_confidence)
-        p_edge = confidence
+        p_edge = confidence  # you can refine if needed
         direction = base_direction
-        rl_exec_style = rl_action.execution_style
 
         debug_payload: Dict[str, Any] = {
             "layer2_prediction": l2_pred.dict(),
-            "llm": {"sentiment_score": llm_score, "headline": llm_headline},
+            "llm": {
+                "sentiment_score": llm_score,
+                "headline": llm_headline,
+            },
             "rl_action": rl_action.dict(),
             "model_votes": model_votes,
             "tab_features": tab_features,
@@ -635,7 +652,7 @@ class HybridInferenceService:
 
         # ---- Persist DB artifacts ----
         with SessionLocal() as db:
-            # Prediction
+            # 1) Prediction (minimal generic record)
             pred_row = models.Prediction(
                 model_version_id=None,
                 symbol=symbol,
@@ -647,7 +664,7 @@ class HybridInferenceService:
             db.add(pred_row)
             db.flush()
 
-            # HybridSignal
+            # 2) HybridSignal snapshot
             hs = models.HybridSignal(
                 symbol=symbol,
                 instrument_type=instrument_type,
@@ -663,7 +680,7 @@ class HybridInferenceService:
             db.add(hs)
             db.flush()
 
-            # AIExecutionLog
+            # 3) AIExecutionLog for auditability
             try:
                 log = models.AIExecutionLog(
                     hybrid_signal_id=hs.id,
@@ -682,7 +699,10 @@ class HybridInferenceService:
                     confidence=confidence,
                     p_edge=p_edge,
                     rl_diagnostics=risk_debug,
-                    exec_meta={"source": "HybridInferenceService", "rl_mode": rl_mode},
+                    exec_meta={
+                        "source": "HybridInferenceService",
+                        "rl_mode": rl_mode,
+                    },
                 )
                 db.add(log)
             except Exception as e:
@@ -694,7 +714,7 @@ class HybridInferenceService:
 
             db.commit()
 
-        # ---- Final HybridDecision (matches schemas.py) ----
+        # ---- Return HybridDecision (matches schemas.HybridDecision) ----
         return HybridDecision(
             symbol=symbol,
             instrument_type=instrument_type,
@@ -713,7 +733,6 @@ class HybridInferenceService:
             rl_execution_style=rl_exec_style,
             debug=debug_payload,
         )
-
 
 # Singleton used by routes
 inference_service = HybridInferenceService()

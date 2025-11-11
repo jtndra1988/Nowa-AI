@@ -1,132 +1,249 @@
 # app/hybrid/schemas.py
+
 from __future__ import annotations
 
-from typing import Optional, Dict, Any, Literal
-from pydantic import BaseModel, Field
 from datetime import datetime
+from typing import Any, Dict, Optional, Literal
 
+from pydantic import BaseModel, Field
+
+
+# =============================================================================
+# Market Context
+# =============================================================================
 
 class MarketContext(BaseModel):
     """
-    Context passed into the decision engine.
+    Snapshot of the trading environment provided to the hybrid brain.
 
-    This is what /hybrid-signal should receive from frontend,
-    workers, or scheduled jobs.
+    Only a few fields are strictly required by the current pipeline.
+    Others are optional hooks for future use / RL / risk.
     """
-    exchange: str = Field(..., description="Exchange, e.g. 'binance'")
-    symbol: str = Field(..., description="Symbol, e.g. 'BTCUSDT'")
-    
-    # --- FIX: Changed 'mode' to 'instrument_type' to align with InferenceService
-    # This was a minor conflict. 'instrument_type' is used by the service.
-    instrument_type: Optional[str] = Field(
-        "futures", description="Market mode: 'spot', 'futures', 'options'"
+
+    # Core routing
+    symbol: str = Field(..., description="Trading symbol, e.g. BTCUSDT")
+    exchange: str = Field("BYBIT", description="Exchange identifier")
+    instrument_type: str = Field(
+        "futures", description="Instrument type, e.g. 'spot' | 'futures'"
     )
 
-    timeframe: Optional[str] = Field(
-        "15m", description="Candle timeframe used for features"
-    )
-    # --- FIX: Renamed 'position' to 'current_position_size' ---
-    # This aligns with the 'MarketContext' expected by the RLAgent
-    current_position_size: Optional[float] = Field(
-        0.0, description="Current net position (from -1.0 to 1.0)"
-    )
-    current_regime: Optional[str] = Field(
-        None, description="Detected regime label if available"
+    # Optional: macro / regime / vol info (used in RL or can be ignored)
+    current_regime: Optional[int] = Field(
+        None,
+        description="Discrete regime label if available (e.g., 0=neutral,1=bull,-1=bear).",
     )
     current_volatility: Optional[float] = Field(
-        None, description="Realized / implied vol snapshot"
+        None,
+        description="Realized/Implied vol metric for context (0-1 or annualized).",
     )
 
+    # Optional: position / risk context
+    current_position_size: Optional[float] = Field(
+        None,
+        description="Current net position as fraction of equity or contracts; RL may use.",
+    )
+    max_position_pct: Optional[float] = Field(
+        None,
+        description="Per-trade or per-symbol cap hint (0-1). Not enforced here directly.",
+    )
 
-# --- NEW: Added Layer2Prediction Schema ---
-# This is the internal object passed from Layer 2 to Layer 3
+    class Config:
+        orm_mode = True
+
+
+# =============================================================================
+# Layer 2 Prediction (Ensemble Output)
+# =============================================================================
+
+DirectionLiteral = Literal["up", "down", "flat"]
+
+
 class Layer2Prediction(BaseModel):
-    asset: str
-    direction: Literal["up", "down", "flat"]
-    price_confidence: float = Field(..., ge=0.0, le=1.0)
+    """
+    Output of the ensemble / decision net (L2).
+
+    This is what flows into:
+      - RLAgent.get_optimal_action(...)
+      - HybridInferenceService final decision logic
+    """
+
+    asset: str = Field(..., description="Symbol/asset this prediction refers to.")
+    direction: DirectionLiteral = Field(
+        ..., description="Directional view: 'up', 'down', or 'flat'."
+    )
+    price_confidence: float = Field(
+        ...,
+        ge=0.0,
+        le=1.0,
+        description="Confidence in the directional view (0..1).",
+    )
+
+    # Optional metadata for debugging / introspection
+    meta: Optional[Dict[str, Any]] = Field(
+        default=None,
+        description="Optional metadata (trend stats, features used, etc.).",
+    )
+
+    class Config:
+        orm_mode = True
 
 
-# --- NEW: Added RLAction Schema ---
-# This is the internal object returned by the RL Agent (Layer 3)
+# =============================================================================
+# RL Action (Layer 3 Execution Policy)
+# =============================================================================
+
 class RLAction(BaseModel):
-    optimal_action: str  # e.g., "LONG", "SHORT", "HOLD"
-    optimal_size_pct: float = Field(..., ge=0.0, le=1.0) # Absolute size
-    execution_style: str # e.g., "TWAP_15M", "AGGRESSIVE"
-    mode: str  # "rl_live" or "rule_fallback"
-    debug_state: List[float] = Field(default_factory=list)
+    """
+    Output of the RL execution agent.
 
+    This is consumed by HybridInferenceService for:
+      - mapping to final direction
+      - size suggestion (before risk constraints)
+      - execution style & diagnostics
+    """
+
+    optimal_action: Literal["LONG", "SHORT", "FLAT", "HOLD"] = Field(
+        ...,
+        description="Proposed action from RL: LONG / SHORT / FLAT / HOLD.",
+    )
+    optimal_size_pct: float = Field(
+        ...,
+        ge=0.0,
+        le=1.0,
+        description="Suggested size as fraction of max/equity (0..1).",
+    )
+    execution_style: str = Field(
+        ...,
+        description="Execution style hint, e.g. 'MARKET', 'TWAP_5M', 'TWAP_15M', 'NONE'.",
+    )
+
+    # Optional: used by inference_service & for observability
+    mode: Optional[str] = Field(
+        default=None,
+        description="RL agent mode label, e.g. 'rl_live', 'disabled', 'rule_fallback'.",
+    )
+    debug_state: Optional[Dict[str, Any]] = Field(
+        default=None,
+        description="Optional diagnostics / raw policy state.",
+    )
+
+    class Config:
+        orm_mode = True
+
+
+# =============================================================================
+# Hybrid Decision (Final API Surface)
+# =============================================================================
 
 class HybridDecision(BaseModel):
     """
-    Final decision object consumed by:
-      - /hybrid-signal API (as response)
-      - Execution services (as instruction)
-      - Database (for audit)
-    """
-    symbol: str
-    instrument_type: str
-    timestamp: datetime
+    Final decision object returned by the HybridInferenceService
+    and exposed via the /hybrid-signal (or equivalent) endpoint.
 
-    # Core decision
-    direction: Literal["up", "down", "flat"]
+    It merges:
+      - Ensemble view (L2)
+      - LLM narrative context
+      - RL execution suggestion
+      - Applied risk constraints
+      - Debug payload for transparency
+    """
+
+    # Core identifiers
+    symbol: str = Field(..., description="Trading symbol, e.g. BTCUSDT.")
+    instrument_type: str = Field(
+        ...,
+        description="Instrument type, e.g. 'spot' | 'futures'.",
+    )
+    timestamp: datetime = Field(
+        ..., description="UTC timestamp when this decision was generated."
+    )
+
+    # View & quality
+    direction: DirectionLiteral = Field(
+        ..., description="Final directional stance after RL & risk."
+    )
     p_edge: float = Field(
-        ..., ge=0.0, le=1.0, description="Probability of a positive-edge trade (0-1)"
+        ...,
+        ge=0.0,
+        le=1.0,
+        description="Probability/edge proxy derived from L2 confidence.",
     )
     confidence: float = Field(
-        ..., ge=0.0, le=1.0, description="Overall confidence in the direction (0-1)"
+        ...,
+        ge=0.0,
+        le=1.0,
+        description="Overall confidence score (mirrors or refines p_edge).",
     )
+
+    # Sizing & execution intent
     size_factor: float = Field(
         ...,
         ge=0.0,
         le=1.0,
-        description="Final suggested size factor (0=none, 1=full)",
+        description="Final size factor after RL + RiskEngine constraints (0..1).",
     )
     strategy_tag: str = Field(
-        "nowa_hybrid_v1",
-        description="Label for which logic/profile produced this decision",
+        ...,
+        description="Identifier for this hybrid strategy version.",
     )
     meta_execute: bool = Field(
-        True,
-        description="If True, this decision is eligible for execution by infra",
+        ...,
+        description="Whether this decision is eligible to be executed live.",
     )
 
-    # Layer 1 / 2 introspection
+    # Model ensemble / narrative
     model_votes: Dict[str, float] = Field(
         default_factory=dict,
-        description=(
-            "Per-expert scores, e.g. "
-            "{'tft_visionary': 0.4, 'tcn_reflex': -0.1, 'xgb_analyst': 0.2, "
-            "'options_psychologist': 0.1, 'macro_economist': 0.05, 'llm_narrative': 0.15}"
-        ),
+        description="Key model scores/signals used in the decision.",
     )
-    
-    # --- FIELDS ADDED TO MATCH INFERENCE SERVICE OUTPUT ---
     llm_headline: Optional[str] = Field(
-        None,
-        description="Key narrative summary from the LLM specialist.",
+        default=None,
+        description="Condensed narrative from the LLM specialist.",
     )
 
-    # Layer 3: RL execution layer
-    rl_action: Optional[str] = Field(
-        None,
-        description="Human-friendly action label, e.g. LONG / SHORT / HOLD.",
+    # RL summary (flattened for convenience)
+    rl_action: Literal["LONG", "SHORT", "FLAT", "HOLD"] = Field(
+        ...,
+        description="Flattened RL action used in this decision.",
     )
-    rl_mode: Optional[str] = Field(
-        None,
-        description="How the decision was produced: 'rl_live', 'rule_fallback', etc.",
+    rl_mode: str = Field(
+        ...,
+        description="Execution agent mode, e.g. 'rl_live', 'disabled'.",
     )
-    rl_target_position: Optional[float] = Field(
-        None,
-        description="Suggested net exposure, e.g. -1.0, 0.5, 1.0",
+    rl_target_position: float = Field(
+        ...,
+        description="Signed target position as fraction of equity (-1..1).",
     )
-    rl_execution_style: Optional[str] = Field(
-        None,
-        description="Suggested execution style, e.g. 'TWAP_15M'",
+    rl_execution_style: str = Field(
+        ...,
+        description="Execution style hint chosen for this decision.",
     )
-    
-    # Full debug payload
+
+    # Full debug / audit payload
     debug: Dict[str, Any] = Field(
         default_factory=dict,
-        description="Full debug payload with L1, L2, L3 state."
+        description="Nested diagnostics: L2 prediction, LLM output, RL, risk, features.",
     )
-    # --- END OF ADDED FIELDS ---
+
+    class Config:
+        orm_mode = True
+
+
+# =============================================================================
+# (Optional) Backwards-compat ExpertSignals stub
+# =============================================================================
+
+class ExpertSignals(BaseModel):
+    """
+    Lightweight container if other parts of the code still import ExpertSignals.
+    Not required by the new HybridInferenceService, but safe to keep.
+    """
+    trend: Optional[float] = None
+    sentiment: Optional[float] = None
+    onchain: Optional[float] = None
+    options: Optional[float] = None
+    macro: Optional[float] = None
+    llm: Optional[float] = None
+
+    class Config:
+        orm_mode = True

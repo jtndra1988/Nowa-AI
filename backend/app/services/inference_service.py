@@ -206,6 +206,62 @@ class ModelEngine:
         else:
             # If only 1 model ran, use TFT confidence or default
             ensemble_conf = preds_conf[0] if preds_conf else 0.5
+            # Tabular nudges
+        sent = float(tab_features.get("final_sentiment", 0.0))
+        put_call = float(tab_features.get("put_call_oi_ratio", 1.0))
+        whale_vol = float(tab_features.get("whale_volume_usd", 0.0))
+        ex_flow = float(tab_features.get("exchange_net_flow_usd", 0.0))
+
+        # NEW: orderbook microstructure
+        ob_imb = float(tab_features.get("ob_bid_ask_imb", 0.0))       # -1..1
+        ob_skew = float(tab_features.get("ob_vw_price_skew", 0.0))    # signed skew
+        ob_cdv = float(tab_features.get("ob_cdv_1m", 0.0))            # signed delta vol
+        ob_liq = float(tab_features.get("ob_liquidity", 0.0))         # depth proxy
+
+        conf_sent = min(0.2, abs(sent) * 0.2)
+        conf_pc = 0.1 if 0.7 <= put_call <= 1.3 else 0.0
+        conf_flow = 0.1 if whale_vol > 0 and ex_flow != 0 else 0.0
+
+        # NEW: microstructure contributes confidence if liquidity+signal present
+        conf_ob = 0.0
+        if ob_liq > 0:
+         # confidence scales with how directional the book is
+         conf_ob = min(0.2, abs(ob_imb) * 0.2 + abs(ob_cdv) * 0.1)
+
+         price_confidence = max(
+        0.0,
+        min(1.0, conf_sent + conf_sent + conf_pc + conf_flow + conf_ob),
+        )
+
+        # Direction bias from sentiment, flows, orderbook
+        dir_bias = 0.0
+        dir_bias += np.sign(sent) * min(0.5, abs(sent))
+
+        # flows
+        if ex_flow < 0:
+          dir_bias -= 0.15
+        elif ex_flow > 0:
+          dir_bias += 0.15
+
+        # NEW: orderbook tilt
+        dir_bias += np.sign(ob_imb) * min(0.25, abs(ob_imb))
+        dir_bias += np.sign(ob_cdv) * min(0.15, abs(ob_cdv))
+
+        final_score = {"up": 0.0, "down": 0.0, "flat": 0.0}
+
+        if base_dir == "up":
+          final_score["up"] += 1.0
+        elif base_dir == "down":
+          final_score["down"] += 1.0
+        else:
+          final_score["flat"] += 0.5
+
+        if dir_bias > 0.1:
+          final_score["up"] += 0.5
+        elif dir_bias < -0.1:
+          final_score["down"] += 0.5
+        else:
+          final_score["flat"] += 0.2
 
         return Layer2Prediction(
             asset=symbol,
@@ -254,8 +310,9 @@ class HybridInferenceService:
         # Service is ready if LLM and RL are loaded.
         # ModelEngine handles its own partial failures gracefully.
         self.is_ready: bool = (
-            self.llm_engine.is_model_loaded()
-            and self.rl_agent.is_model_loaded()
+        self.model_engine.is_ready
+        and self.llm_engine.is_model_loaded()
+        and self.rl_agent.is_model_loaded()
         )
 
         if self.is_ready:

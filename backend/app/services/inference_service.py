@@ -4,16 +4,21 @@ from __future__ import annotations
 
 import logging
 import os
-import joblib  # Required for loading XGBoost
-import torch   # Required for TFT/TCN
 import numpy as np
 import pandas as pd
 from datetime import datetime, timedelta
 from typing import Any, Dict, Tuple
-
+from pathlib import Path
 from sqlalchemy import select, desc
 from sqlalchemy.orm import Session
-
+try:
+    import joblib
+except ImportError:  # safe-guard
+    joblib = None
+try:
+    import torch
+except ImportError:  # safe-guard
+    torch = None    
 # --- Internal Imports ---
 from app.db.database import SessionLocal
 from app.db import models
@@ -47,74 +52,75 @@ DEVICE = "cuda" if torch.cuda.is_available() else "cpu"
 # ModelEngine (REAL L2 Ensemble: TFT + TCN + XGB)
 # =============================================================================
 
+# =============================================================================
+# ModelEngine (Real TFT / TCN / XGB ensemble with explicit fallback)
+# =============================================================================
+
 class ModelEngine:
     """
-    The 'Brain's' Pattern Recognition Layer.
+    L2 ensemble over trained TFT / TCN / XGB models + tabular signals.
 
-    Orchestrates:
-      1. Temporal Fusion Transformer (TFT)
-      2. Temporal Convolutional Network (TCN)
-      3. XGBoost (Gradient Boosting)
+    Behavior:
+      - If at least one of TFT / TCN / XGB artifacts loads -> use ensemble.
+      - If none load:
+          - If MARS_ALLOW_L2_FALLBACK=true  -> use deterministic rule-based logic.
+          - If MARS_ALLOW_L2_FALLBACK=false -> is_ready=False, HybridInferenceService not ready.
 
-    It runs all three on live data and ensembles their outputs.
+    This class is the ONLY thing HybridInferenceService depends on for L2.
     """
 
     def __init__(self) -> None:
-        self.is_ready: bool = False
-        self.device = DEVICE
+        artifact_dir = Path(os.getenv("MARS_ARTIFACT_DIR", "model_artifacts"))
 
-        # -- 1. Initialize Model Architectures --
-        # NOTE: Ensure these params match exactly what you used in training!
-        # If you trained with different dimensions, update these numbers.
-        self.tft = TemporalFusionTransformer(
-            feature_dims={"price": 2},  # Assuming [Close, Volume]
-            seq_len=SEQ_LEN_DEFAULT,
-            d_model=128,
-            nhead=4
-        ).to(self.device)
+        self.allow_fallback = (
+            os.getenv("MARS_ALLOW_L2_FALLBACK", "true").lower() == "true"
+        )
 
-        self.tcn = TemporalConvNet(
-            in_feat=2,  # Assuming [Close, Volume]
-            channels=(64, 128, 128)
-        ).to(self.device)
+        # Artifact paths (adjust to your training outputs)
+        self.tft_path = Path(
+            os.getenv("MARS_TFT_MODEL_PATH", artifact_dir / "tft_model.pt")
+        )
+        self.tcn_path = Path(
+            os.getenv("MARS_TCN_MODEL_PATH", artifact_dir / "tcn_model.pt")
+        )
+        self.xgb_path = Path(
+            os.getenv("MARS_XGB_MODEL_PATH", artifact_dir / "xgb_price_model.joblib")
+        )
 
-        self.xgb_model = None
+        # Loaded models
+        self.tft_model = self._load_torch_model(self.tft_path, "TFT")
+        self.tcn_model = self._load_torch_model(self.tcn_path, "TCN")
+        self.xgb_model = self._load_xgb_model(self.xgb_path, "XGB")
 
-        # -- 2. Load Trained Weights --
-        try:
-            logger.info(f"[ModelEngine] Loading artifacts from {ARTIFACT_DIR}...")
+        self.has_real_models = any(
+            [self.tft_model is not None, self.tcn_model is not None, self.xgb_model is not None]
+        )
 
-            # Load PyTorch models (TFT & TCN)
-            tft_path = os.path.join(ARTIFACT_DIR, "tft_model.pt")
-            tcn_path = os.path.join(ARTIFACT_DIR, "tcn_model.pt")
-
-            if os.path.exists(tft_path):
-                self.tft.load_state_dict(torch.load(tft_path, map_location=self.device))
-                self.tft.eval()
-            else:
-                logger.warning(f"[ModelEngine] TFT model not found at {tft_path}")
-
-            if os.path.exists(tcn_path):
-                self.tcn.load_state_dict(torch.load(tcn_path, map_location=self.device))
-                self.tcn.eval()
-            else:
-                logger.warning(f"[ModelEngine] TCN model not found at {tcn_path}")
-
-            # Load XGBoost
-            xgb_path = os.path.join(ARTIFACT_DIR, "xgb_price_model.joblib")
-            if os.path.exists(xgb_path):
-                self.xgb_model = joblib.load(xgb_path)
-            else:
-                logger.warning(f"[ModelEngine] XGBoost model not found at {xgb_path}")
-
-            # We consider the engine ready if at least one model loaded,
-            # but ideally you want all three.
+        if self.has_real_models:
             self.is_ready = True
-            logger.info("[ModelEngine] Advanced models initialization complete.")
+            logger.info(
+                "[ModelEngine] Loaded L2 ensemble models: "
+                f"TFT={'Y' if self.tft_model else 'N'}, "
+                f"TCN={'Y' if self.tcn_model else 'N'}, "
+                f"XGB={'Y' if self.xgb_model else 'N'}"
+            )
+        else:
+            if self.allow_fallback:
+                self.is_ready = True
+                logger.warning(
+                    "[ModelEngine] No TFT/TCN/XGB artifacts found. "
+                    "Using deterministic rule-based fallback."
+                )
+            else:
+                self.is_ready = False
+                logger.error(
+                    "[ModelEngine] No TFT/TCN/XGB artifacts found and "
+                    "MARS_ALLOW_L2_FALLBACK is false. L2 is NOT READY."
+                )
 
-        except Exception as e:
-            logger.error(f"[ModelEngine] Failed to load models: {e}", exc_info=True)
-            self.is_ready = False
+    # -------------------------------------------------------------------------
+    # Public API (used by HybridInferenceService)
+    # -------------------------------------------------------------------------
 
     def build_layer2_prediction(
         self,
@@ -122,171 +128,299 @@ class ModelEngine:
         seq_features: np.ndarray,
         tab_features: Dict[str, float],
     ) -> Layer2Prediction:
-        """
-        Runs the ensemble (TFT, TCN, XGB) and returns a fused prediction.
-        """
         if not self.is_ready:
-            logger.warning("[ModelEngine] Models not ready, using simple fallback.")
-            return self._fallback_rule_based(symbol, seq_features)
+            raise RuntimeError("[ModelEngine] Called while not ready.")
 
-        # 1. Prepare Data for PyTorch
-        # seq_features is [T, 2] (Close, Volume).
-        # PyTorch expects [Batch, Seq, Features] -> [1, T, 2]
-        x_tensor = torch.tensor(seq_features, dtype=torch.float32).unsqueeze(0).to(self.device)
+        if seq_features.size == 0 or seq_features.shape[0] < 10:
+            raise RuntimeError(
+                "[ModelEngine] Not enough sequential data for prediction."
+            )
 
-        # Input block dictionary for TFT/TCN
-        x_blocks = {"price": x_tensor}
+        if self.has_real_models:
+            return self._predict_with_ensemble(symbol, seq_features, tab_features)
+        else:
+            return self._rule_based_fallback(symbol, seq_features, tab_features)
 
-        current_price = float(seq_features[-1, 0])
+    # -------------------------------------------------------------------------
+    # Loaders
+    # -------------------------------------------------------------------------
 
-        # 2. Run Inference
-        preds_price = []
-        preds_conf = []
+    def _load_torch_model(self, path: Path, name: str):
+        if not path or not Path(path).exists():
+            return None
+        if torch is None:
+            logger.error(
+                f"[ModelEngine] {name} artifact present at {path}, but torch not installed."
+            )
+            return None
+        try:
+            model = torch.load(path, map_location="cpu")
+            # If it's a dict with 'model', unwrap (common pattern)
+            if isinstance(model, dict) and "model" in model:
+                model = model["model"]
+            model.eval()
+            logger.info(f"[ModelEngine] Loaded {name} from {path}.")
+            return model
+        except Exception as e:
+            logger.error(
+                f"[ModelEngine] Failed to load {name} from {path}: {e}",
+                exc_info=True,
+            )
+            return None
 
-        with torch.no_grad():
-            # --- A. TFT Inference ---
+    def _load_xgb_model(self, path: Path, name: str):
+        if not path or not Path(path).exists():
+            return None
+        if joblib is None:
+            logger.error(
+                f"[ModelEngine] {name} artifact present at {path}, but joblib not installed."
+            )
+            return None
+        try:
+            model = joblib.load(path)
+            logger.info(f"[ModelEngine] Loaded {name} from {path}.")
+            return model
+        except Exception as e:
+            logger.error(
+                f"[ModelEngine] Failed to load {name} from {path}: {e}",
+                exc_info=True,
+            )
+            return None
+
+    # -------------------------------------------------------------------------
+    # Feature builder (MUST match your training setup)
+    # -------------------------------------------------------------------------
+
+    def _build_tabular_features(
+        self,
+        seq_features: np.ndarray,
+        tab: Dict[str, float],
+    ) -> np.ndarray:
+        """
+        Shared feature vector for XGB and as input summary for TFT/TCN.
+
+        This is intentionally simple & robust. Make sure your training
+        pipeline uses the same construction.
+        """
+        closes = seq_features[:, 0]
+        rets = np.diff(closes) / closes[:-1]
+
+        last_close = float(closes[-1])
+        ma_10 = float(closes[-10:].mean()) if len(closes) >= 10 else last_close
+        ma_20 = float(closes[-20:].mean()) if len(closes) >= 20 else ma_10
+        vol_20 = float(rets[-20:].std()) if len(rets) >= 20 else float(rets.std() or 0.0)
+
+        feats = [
+            last_close,
+            last_close / (ma_10 + 1e-8) - 1.0,
+            last_close / (ma_20 + 1e-8) - 1.0,
+            vol_20,
+            float(tab.get("final_sentiment", 0.0)),
+            float(tab.get("put_call_oi_ratio", 1.0)),
+            float(tab.get("whale_volume_usd", 0.0)),
+            float(tab.get("exchange_net_flow_usd", 0.0)),
+            float(tab.get("funding_rate", 0.0)),
+            float(tab.get("fear_greed_global", 0.0)),
+            float(tab.get("ob_bid_ask_imb", 0.0)),
+            float(tab.get("ob_vw_price_skew", 0.0)),
+            float(tab.get("ob_cdv_1m", 0.0)),
+            float(tab.get("ob_liquidity", 0.0)),
+        ]
+
+        return np.array(feats, dtype=np.float32).reshape(1, -1)
+
+    # -------------------------------------------------------------------------
+    # Ensemble prediction
+    # -------------------------------------------------------------------------
+
+    def _predict_with_ensemble(
+        self,
+        symbol: str,
+        seq_features: np.ndarray,
+        tab_features: Dict[str, float],
+    ) -> Layer2Prediction:
+        x = self._build_tabular_features(seq_features, tab_features)
+
+        scores = []   # signed directional scores in [-1, 1]
+        confs = []    # confidence contributions in [0, 1]
+
+        # ----- XGB -----
+        if self.xgb_model is not None:
             try:
-                tft_out = self.tft(x_blocks)
-                p_tft = float(tft_out["price"].item())
-                # Use inverse of predicted volatility as a proxy for confidence
-                v_tft = float(tft_out["vol"].item())
-                preds_price.append(p_tft)
-                # Simple normalization for confidence (avoid div by zero)
-                preds_conf.append(1.0 / (1.0 + v_tft))
+                m = self.xgb_model
+                if hasattr(m, "predict_proba"):
+                    proba = m.predict_proba(x)[0]
+                    # Heuristic: 3-class [down, flat, up] or 2-class [down, up]
+                    if len(proba) == 3:
+                        p_down, p_flat, p_up = proba
+                    elif len(proba) == 2:
+                        p_down, p_up = proba
+                        p_flat = 0.0
+                    else:
+                        # unexpected shape - collapse
+                        p_down = proba[0]
+                        p_up = proba[-1]
+                        p_flat = 0.0
+                    score = float(p_up - p_down)
+                    conf = float(max(p_up, p_down) - p_flat)
+                else:
+                    y = float(m.predict(x)[0])
+                    # assume y in [-1,1]
+                    score = float(np.clip(y, -1.0, 1.0))
+                    conf = abs(score)
+                scores.append(score)
+                confs.append(conf)
             except Exception as e:
-                logger.error(f"TFT Inference failed: {e}")
+                logger.error(
+                    f"[ModelEngine] XGB inference failed: {e}",
+                    exc_info=True,
+                )
 
-            # --- B. TCN Inference ---
+        # ----- TFT -----
+        if self.tft_model is not None and torch is not None:
             try:
-                tcn_out = self.tcn(x_blocks)
-                p_tcn = float(tcn_out["price"].item())
-                preds_price.append(p_tcn)
+                model = self.tft_model
+                with torch.no_grad():
+                    t_x = torch.from_numpy(x).float()
+                    if hasattr(model, "predict"):
+                        out = model.predict(t_x)
+                    else:
+                        out = model(t_x)
+                pred = float(out.view(-1)[0])
+                # treat as expected return; squash to [-1,1]
+                score = float(np.tanh(pred))
+                conf = abs(score)
+                scores.append(score)
+                confs.append(conf)
             except Exception as e:
-                logger.error(f"TCN Inference failed: {e}")
+                logger.error(
+                    f"[ModelEngine] TFT inference failed: {e}",
+                    exc_info=True,
+                )
 
-        # --- C. XGBoost Inference ---
-        if self.xgb_model:
+        # ----- TCN -----
+        if self.tcn_model is not None and torch is not None:
             try:
-                # Create single-row DataFrame for XGBoost
-                # Note: Features here must match what you used in `train_xgb.py`
-                xgb_input = pd.DataFrame([{
-                    "close": current_price,
-                    "volume": float(seq_features[-1, 1]),
-                    "ma_5": float(seq_features[-5:, 0].mean()),
-                    "volatility": float(seq_features[-20:, 0].std())
-                }])
-                p_xgb = float(self.xgb_model.predict(xgb_input)[0])
-                preds_price.append(p_xgb)
+                model = self.tcn_model
+                with torch.no_grad():
+                    t_x = torch.from_numpy(x).float()
+                    if hasattr(model, "predict"):
+                        out = model.predict(t_x)
+                    else:
+                        out = model(t_x)
+                pred = float(out.view(-1)[0])
+                score = float(np.tanh(pred))
+                conf = abs(score)
+                scores.append(score)
+                confs.append(conf)
             except Exception as e:
-                logger.error(f"XGB Inference failed: {e}")
+                logger.error(
+                    f"[ModelEngine] TCN inference failed: {e}",
+                    exc_info=True,
+                )
 
-        # 3. Ensemble Fusion
-        if not preds_price:
-            return self._fallback_rule_based(symbol, seq_features)
+        if not scores:
+            # No model produced a usable output.
+            if not self.allow_fallback:
+                raise RuntimeError(
+                    "[ModelEngine] No valid TFT/TCN/XGB outputs and fallback disabled."
+                )
+            logger.warning(
+                "[ModelEngine] No valid model outputs; using rule-based fallback."
+            )
+            return self._rule_based_fallback(symbol, seq_features, tab_features)
 
-        avg_pred_price = sum(preds_price) / len(preds_price)
+        avg_score = float(np.mean(scores))
+        avg_conf = float(np.clip(np.mean(confs), 0.0, 1.0))
 
-        # Determine Direction
-        # If predicted price > current price by threshold (e.g. 0.05%)
-        threshold = current_price * 0.0005
-        if avg_pred_price > current_price + threshold:
+        if avg_score > 0.05:
             direction = "up"
-        elif avg_pred_price < current_price - threshold:
+        elif avg_score < -0.05:
             direction = "down"
+            # neutrals in between
         else:
             direction = "flat"
 
-        # Determine Confidence
-        # Calculate disagreement (std dev) among models. Lower std = Higher confidence.
-        if len(preds_price) > 1:
-            disagreement = np.std(preds_price)
-            rel_disagreement = disagreement / current_price
-            # Heuristic: 0% diff = 1.0 conf, 1% diff = 0.0 conf
-            ensemble_conf = max(0.0, 1.0 - (rel_disagreement * 100))
+        return Layer2Prediction(
+            asset=symbol,
+            direction=direction,
+            price_confidence=round(avg_conf, 3),
+        )
+
+    # -------------------------------------------------------------------------
+    # Deterministic fallback (your existing logic)
+    # -------------------------------------------------------------------------
+
+    def _rule_based_fallback(
+        self,
+        symbol: str,
+        seq_features: np.ndarray,
+        tab_features: Dict[str, float],
+    ) -> Layer2Prediction:
+        closes = seq_features[:, 0]
+
+        last_close = float(closes[-1])
+        ma_short = float(closes[-5:].mean())
+        ma_long = float(closes[-20:].mean()) if len(closes) >= 20 else ma_short
+
+        if last_close > ma_short * 1.002 and ma_short >= ma_long:
+            base_dir = "up"
+        elif last_close < ma_short * 0.998 and ma_short <= ma_long:
+            base_dir = "down"
         else:
-            # If only 1 model ran, use TFT confidence or default
-            ensemble_conf = preds_conf[0] if preds_conf else 0.5
-            # Tabular nudges
+            base_dir = "flat"
+
+        if len(closes) >= 20:
+            price_std = float(closes[-20:].std())
+        else:
+            price_std = float(closes.std())
+        price_std = max(price_std, 1e-8)
+
+        trend_strength = abs(last_close - ma_long) / price_std
+        conf_trend = max(0.0, min(1.0, trend_strength / 4.0))
+
         sent = float(tab_features.get("final_sentiment", 0.0))
         put_call = float(tab_features.get("put_call_oi_ratio", 1.0))
         whale_vol = float(tab_features.get("whale_volume_usd", 0.0))
         ex_flow = float(tab_features.get("exchange_net_flow_usd", 0.0))
 
-        # NEW: orderbook microstructure
-        ob_imb = float(tab_features.get("ob_bid_ask_imb", 0.0))       # -1..1
-        ob_skew = float(tab_features.get("ob_vw_price_skew", 0.0))    # signed skew
-        ob_cdv = float(tab_features.get("ob_cdv_1m", 0.0))            # signed delta vol
-        ob_liq = float(tab_features.get("ob_liquidity", 0.0))         # depth proxy
-
         conf_sent = min(0.2, abs(sent) * 0.2)
         conf_pc = 0.1 if 0.7 <= put_call <= 1.3 else 0.0
         conf_flow = 0.1 if whale_vol > 0 and ex_flow != 0 else 0.0
 
-        # NEW: microstructure contributes confidence if liquidity+signal present
-        conf_ob = 0.0
-        if ob_liq > 0:
-         # confidence scales with how directional the book is
-         conf_ob = min(0.2, abs(ob_imb) * 0.2 + abs(ob_cdv) * 0.1)
-
-         price_confidence = max(
-        0.0,
-        min(1.0, conf_sent + conf_sent + conf_pc + conf_flow + conf_ob),
+        price_confidence = max(
+            0.0, min(1.0, conf_trend + conf_sent + conf_pc + conf_flow)
         )
 
-        # Direction bias from sentiment, flows, orderbook
         dir_bias = 0.0
         dir_bias += np.sign(sent) * min(0.5, abs(sent))
-
-        # flows
         if ex_flow < 0:
-          dir_bias -= 0.15
+            dir_bias -= 0.15
         elif ex_flow > 0:
-          dir_bias += 0.15
-
-        # NEW: orderbook tilt
-        dir_bias += np.sign(ob_imb) * min(0.25, abs(ob_imb))
-        dir_bias += np.sign(ob_cdv) * min(0.15, abs(ob_cdv))
+            dir_bias += 0.15
 
         final_score = {"up": 0.0, "down": 0.0, "flat": 0.0}
 
         if base_dir == "up":
-          final_score["up"] += 1.0
+            final_score["up"] += 1.0
         elif base_dir == "down":
-          final_score["down"] += 1.0
+            final_score["down"] += 1.0
         else:
-          final_score["flat"] += 0.5
+            final_score["flat"] += 0.5
 
         if dir_bias > 0.1:
-          final_score["up"] += 0.5
+            final_score["up"] += 0.5
         elif dir_bias < -0.1:
-          final_score["down"] += 0.5
+            final_score["down"] += 0.5
         else:
-          final_score["flat"] += 0.2
+            final_score["flat"] += 0.2
+
+        direction = max(final_score.items(), key=lambda x: x[1])[0]
 
         return Layer2Prediction(
             asset=symbol,
             direction=direction,
-            price_confidence=float(round(ensemble_conf, 3)),
-        )
-
-    def _fallback_rule_based(self, symbol, seq_features):
-        """Original logic kept as backup safety net."""
-        if seq_features.size == 0:
-             return Layer2Prediction(asset=symbol, direction="flat", price_confidence=0.0)
-
-        closes = seq_features[:, 0]
-        last_close = float(closes[-1])
-        ma_short = float(closes[-5:].mean())
-
-        if last_close > ma_short:
-            d = "up"
-        else:
-            d = "down"
-
-        return Layer2Prediction(
-            asset=symbol,
-            direction=d,
-            price_confidence=0.1  # Low confidence for fallback
+            price_confidence=float(round(price_confidence, 3)),
         )
 
 

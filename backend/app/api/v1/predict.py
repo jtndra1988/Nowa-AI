@@ -16,13 +16,6 @@ router = APIRouter(tags=["Prediction"])
 # --- FIX: Changed _name_ to __name__ ---
 logger = logging.getLogger(__name__)
 
-
-# ---
-# NOTE: I have removed the broken `@router.get("/predict")` route.
-# It was calling a non-existent function (inference_service.predict) and
-# was architecturally incompatible with your 3-layer logic, which requires
-# the MarketContext body provided by this POST route.
-# ---
 @router.post("/hybrid-signal", response_model=HybridDecision)
 async def hybrid_signal(ctx: MarketContext, db: Session = Depends(get_db)):
     if inference_service is None or not inference_service.is_ready:

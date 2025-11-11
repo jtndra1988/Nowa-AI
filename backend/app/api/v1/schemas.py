@@ -1,70 +1,202 @@
-# app/api/schemas.py
 from __future__ import annotations
 
-from typing import Optional, List
 from datetime import datetime
+from typing import Any, Dict, Optional, Literal, List
+
 from pydantic import BaseModel, Field
 
-# ---- Normalized instrument schema (matches your collectors/adapters/ETL) ----
-class OptionInstrument(BaseModel):
-    symbol: str = Field(..., description="Underlying (e.g., 'BTC')")
-    expiry: Optional[datetime] = Field(None, description="Option expiry (UTC)")
-    strike: Optional[float] = None
-    option_type: Optional[str] = Field(None, description="'CALL' or 'PUT'")
-    timestamp: Optional[datetime] = Field(None, description="Quote time (UTC)")
-    bid: Optional[float] = None
-    ask: Optional[float] = None
-    last_price: Optional[float] = None
-    mark_price: Optional[float] = None
-    volume: Optional[float] = None
-    open_interest: Optional[float] = None
-    iv: Optional[float] = Field(None, description="Implied volatility (decimal)")
-    delta: Optional[float] = None
-    gamma: Optional[float] = None
-    theta: Optional[float] = None
-    vega: Optional[float] = None
 
-    # Backward-compat aliases (if some older clients used these):
-    # instrument_name ↔ symbol, expiration (epoch) ↔ expiry, mark_iv ↔ iv
-    instrument_name: Optional[str] = Field(None, alias="instrument_name")
-    expiration: Optional[int] = Field(None, alias="expiration")
-    mark_iv: Optional[float] = Field(None, alias="mark_iv")
+# =============================================================================
+# Market Context
+# =============================================================================
+
+class MarketContext(BaseModel):
+    """
+    Context passed into the decision engine.
+    This is what /hybrid-signal should receive from frontend, workers, or jobs.
+    """
+
+    exchange: str = Field(..., description="Exchange, e.g. 'binance'")
+    symbol: str = Field(..., description="Symbol, e.g. 'BTCUSDT'")
+
+    # Instrument type used by InferenceService / routing
+    instrument_type: Optional[str] = Field(
+        "futures", description="Market type: 'spot', 'futures', 'options'"
+    )
+
+    # Timeframe is informational; not enforced by service
+    timeframe: Optional[str] = Field(
+        "15m", description="Candle timeframe used for features"
+    )
+
+    # Current exposure / state (used by RL)
+    current_position_size: Optional[float] = Field(
+        0.0,
+        description="Current net position as fraction of equity (-1.0..1.0)",
+    )
+
+    current_regime: Optional[str] = Field(
+        None,
+        description="Regime label if available, e.g. 'bull', 'bear', 'chop'.",
+    )
+
+    current_volatility: Optional[float] = Field(
+        None,
+        description="Realized / implied vol snapshot.",
+    )
 
     class Config:
         orm_mode = True
-        allow_population_by_field_name = True
 
 
-# ---
-# --- NEW SCHEMAS ADDED FOR READ APIS ---
-# ---
+# =============================================================================
+# Layer 2 Prediction (Ensemble Output)
+# =============================================================================
 
-class SentimentResponse(BaseModel):
-    symbol: str
-    timestamp: datetime
-    sentiment_score: Optional[float] = Field(None, alias="sent_score_1m")
-    sentiment_score_15m: Optional[float] = Field(None, alias="sent_score_15m")
-    
+DirectionLiteral = Literal["up", "down", "flat"]
+
+
+class Layer2Prediction(BaseModel):
+    """
+    Output of ModelEngine (L2 ensemble).
+    Consumed by RLAgent + HybridInferenceService.
+    """
+
+    asset: str
+    direction: DirectionLiteral
+    price_confidence: float = Field(..., ge=0.0, le=1.0)
+
+    # Optional metadata for debugging (not required by pipeline)
+    meta: Optional[Dict[str, Any]] = None
+
     class Config:
         orm_mode = True
-        allow_population_by_field_name = True
-        
-class OnchainResponse(BaseModel):
-    symbol: str
-    timestamp: datetime
-    nvt_ratio: Optional[float]
-    sopr: Optional[float]
-    # Add other on-chain fields here as needed
-    
+
+
+# =============================================================================
+# RL Action (Layer 3 Execution Policy)
+# =============================================================================
+
+class RLAction(BaseModel):
+    """
+    Output of RLAgent.get_optimal_action.
+
+    This is what HybridInferenceService uses to:
+      - choose LONG/SHORT/FLAT/HOLD
+      - get raw size suggestion
+      - get execution style hints
+    """
+
+    optimal_action: Literal["LONG", "SHORT", "FLAT", "HOLD"]
+    optimal_size_pct: float = Field(..., ge=0.0, le=1.0)
+    execution_style: str
+
+    # Mode is optional so current RLAgent (which doesn't set it) is valid.
+    mode: str = Field(
+        "rl_live",
+        description="RL mode label, e.g. 'rl_live', 'disabled', 'rule_fallback'.",
+    )
+
+    # Optional debug payload; RLAgent can populate if desired.
+    debug_state: List[float] = Field(
+        default_factory=list,
+        description="Optional raw policy / state diagnostics.",
+    )
+
     class Config:
         orm_mode = True
 
-class DeveloperResponse(BaseModel):
+
+# =============================================================================
+# Hybrid Decision (Final Surface)
+# =============================================================================
+
+class HybridDecision(BaseModel):
+    """
+    Final decision object returned by HybridInferenceService and
+    exposed via /hybrid-signal.
+
+    It merges:
+      - L2 ensemble view
+      - LLM narrative context
+      - RL execution suggestion
+      - RiskEngine-constrained sizing
+      - Full debug payload for observability
+    """
+
+    # Identity
     symbol: str
+    instrument_type: str
     timestamp: datetime
-    commit_count: Optional[int]
-    stars: Optional[int]
-    # Add other dev fields here as needed
+
+    # Direction & quality
+    direction: DirectionLiteral
+    p_edge: float = Field(..., ge=0.0, le=1.0)
+    confidence: float = Field(..., ge=0.0, le=1.0)
+
+    # Sizing & strategy
+    size_factor: float = Field(
+        ..., ge=0.0, le=1.0,
+        description="Final suggested size factor after RL + RiskEngine."
+    )
+    strategy_tag: str = Field(
+        "nowa_hybrid_v1",
+        description="Label for the active hybrid strategy profile.",
+    )
+    meta_execute: bool = Field(
+        ...,
+        description="If True, infra is allowed to execute this decision.",
+    )
+
+    # Model / narrative context
+    model_votes: Dict[str, float] = Field(
+        default_factory=dict,
+        description="Key model & signal scores used.",
+    )
+    llm_headline: Optional[str] = Field(
+        default=None,
+        description="Key narrative summary from LLM.",
+    )
+
+    # RL summary
+    rl_action: Optional[Literal["LONG", "SHORT", "FLAT", "HOLD"]] = Field(
+        default=None,
+        description="RL-chosen discrete action.",
+    )
+    rl_mode: Optional[str] = Field(
+        default=None,
+        description="RL decision mode, e.g. 'rl_live', 'disabled'.",
+    )
+    rl_target_position: Optional[float] = Field(
+        default=None,
+        description="Signed net target exposure as fraction of equity (-1..1).",
+    )
+    rl_execution_style: Optional[str] = Field(
+        default=None,
+        description="Execution style hint, e.g. 'TWAP_5M', 'TWAP_15M'.",
+    )
+
+    # Full nested debug object (L2, LLM, RL, risk, features)
+    debug: Dict[str, Any] = Field(
+        default_factory=dict,
+        description="Full diagnostics payload.",
+    )
+
+    class Config:
+        orm_mode = True
+
+
+# =============================================================================
+# Optional: Backwards-compat ExpertSignals
+# =============================================================================
+
+class ExpertSignals(BaseModel):
+    trend: Optional[float] = None
+    sentiment: Optional[float] = None
+    onchain: Optional[float] = None
+    options: Optional[float] = None
+    macro: Optional[float] = None
+    llm: Optional[float] = None
 
     class Config:
         orm_mode = True

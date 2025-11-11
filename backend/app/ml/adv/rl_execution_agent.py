@@ -1,3 +1,5 @@
+# app/ml/adv/rl_execution_agent.py
+
 import logging
 import os
 from pathlib import Path
@@ -12,7 +14,7 @@ logger = logging.getLogger(__name__)
 
 FEATURE_COLUMNS: List[str] = [
     "decisionnet_confidence",
-    "decisionnet_direction",      # -1, 0, 1
+    "decisionnet_direction",  # -1, 0, 1
     "tft_visionary",
     "tcn_reflex",
     "xgb_analyst",
@@ -34,13 +36,8 @@ class RLAgent:
     Layer 3: LIVE RL Execution Agent ("Head Trader").
 
     - Loads a trained PPO policy.
-    - NO rule-based / mock fallback.
-    - If policy not loaded, `is_model_loaded()` is False and
-      `get_optimal_action()` will raise RuntimeError.
-
-    Policy contract (example expectation):
-      - Observation: vector of FEATURE_COLUMNS (len == N).
-      - Action space: discrete mapping to trade decisions.
+    - NO mock / rule fallback here.
+    - If policy not loaded: is_model_loaded() = False and get_optimal_action() raises.
     """
 
     def __init__(self, policy_path: str = DEFAULT_POLICY_PATH) -> None:
@@ -51,7 +48,7 @@ class RLAgent:
         if self.policy is None:
             logger.error(
                 f"[RLAgent] Failed to load RL policy from '{self.policy_path}'. "
-                "RL agent is DISABLED (no fallback)."
+                "RL agent is DISABLED."
             )
         else:
             logger.info(
@@ -76,16 +73,11 @@ class RLAgent:
     # -------- Public API used by InferenceService --------
 
     def is_model_loaded(self) -> bool:
-        """
-        Used by InferenceService readiness.
-        True ONLY when PPO policy is successfully loaded.
-        """
+        """True ONLY when PPO policy is successfully loaded."""
         return self.policy is not None
 
     def get_mode(self) -> str:
-        """
-        For observability.
-        """
+        """For observability."""
         return "rl_live" if self.policy is not None else "disabled"
 
     def get_optimal_action(
@@ -96,13 +88,6 @@ class RLAgent:
     ) -> RLAction:
         """
         Main entry called by InferenceService.
-
-        Behavior:
-          - If policy not loaded → raises RuntimeError.
-          - Otherwise:
-              - Builds state vector from prediction/context/model_votes.
-              - Runs PPO policy.predict(state).
-              - Maps discrete action -> RLAction.
         """
         if not self.is_model_loaded():
             raise RuntimeError(
@@ -111,8 +96,10 @@ class RLAgent:
 
         state = self._build_state(prediction, context, model_votes)
         action_idx, _ = self.policy.predict(state, deterministic=True)  # type: ignore[union-attr]
-
-        return self._map_action(int(action_idx))
+        rl_action = self._map_action(int(action_idx))
+        # Ensure mode is set for downstream observability
+        rl_action.mode = self.get_mode()
+        return rl_action
 
     # -------- Internal helpers --------
 
@@ -130,9 +117,6 @@ class RLAgent:
         context: MarketContext,
         model_votes: Dict[str, float],
     ) -> np.ndarray:
-        """
-        Build observation vector in fixed FEATURE_COLUMNS order.
-        """
         obs: Dict[str, Any] = {
             "decisionnet_confidence": float(
                 getattr(prediction, "price_confidence", 0.0) or 0.0
@@ -154,29 +138,16 @@ class RLAgent:
             ),
         }
 
-        try:
-            vec = np.array(
-                [float(obs[c]) for c in self.feature_columns],
-                dtype=np.float32,
-            )
-        except Exception as e:
-            logger.error(f"[RLAgent] Failed to build state vector: {e}", exc_info=True)
-            raise
-
+        vec = np.array(
+            [float(obs[c]) for c in self.feature_columns], dtype=np.float32
+        )
         return vec
 
     def _map_action(self, action_idx: int) -> RLAction:
         """
         Map discrete PPO action index -> RLAction.
-        This mapping MUST match how you trained the RL policy.
 
-        Example mapping (adjust if your training used different semantics):
-
-          0 -> FLAT (no position)
-          1 -> SMALL LONG  (e.g., +0.25 of max size)
-          2 -> FULL LONG   (e.g., +1.00 of max size)
-          3 -> SMALL SHORT (e.g., -0.25 of max size)
-          4 -> FULL SHORT  (e.g., -1.00 of max size)
+        This MUST match your training setup.
         """
         if action_idx == 0:
             return RLAction(
@@ -209,7 +180,6 @@ class RLAgent:
                 execution_style="TWAP_15M",
             )
 
-        # Unknown index: treat as flat, but do NOT invent a heuristic trade.
         logger.error(f"[RLAgent] Unknown action_idx={action_idx}, forcing FLAT.")
         return RLAction(
             optimal_action="FLAT",
@@ -224,8 +194,6 @@ try:
     rl_agent = RLAgent(policy_path=DEFAULT_POLICY_PATH)
 except Exception as e:
     logger.critical(
-        f"[RLAgent] Failed to initialize rl_agent: {e}",
-        exc_info=True,
+        f"[RLAgent] Failed to initialize rl_agent: {e}", exc_info=True
     )
-    # No fallback / no silent mock here; surface failure.
     raise

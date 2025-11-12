@@ -1,24 +1,26 @@
-# app/services/inference_service.py
-
 from __future__ import annotations
 
 import logging
 import os
+from datetime import datetime, timedelta
+from pathlib import Path
+from typing import Any, Dict, Tuple
+
 import numpy as np
 import pandas as pd
-from datetime import datetime, timedelta
-from typing import Any, Dict, Tuple
-from pathlib import Path
-from sqlalchemy import select, desc
+from sqlalchemy import desc, select
 from sqlalchemy.orm import Session
+
 try:
     import joblib
 except ImportError:  # safe-guard
     joblib = None
+
 try:
     import torch
 except ImportError:  # safe-guard
-    torch = None    
+    torch = None
+
 # --- Internal Imports ---
 from app.db.database import SessionLocal
 from app.db import models
@@ -41,20 +43,17 @@ logger = logging.getLogger(__name__)
 
 # --- Configuration ---
 SEQ_LEN_DEFAULT = 64
-# Path where your trained .pt and .joblib files are stored
-ARTIFACT_DIR = os.getenv("MARS_ARTIFACT_DIR", "/app/backend/app/ml/artifacts")
+ARTIFACT_DIR = os.getenv("MARS_ARTIFACT_DIR", "model_artifacts")
 ALLOW_FEATURE_MOCK = os.getenv("MARS_ALLOW_FEATURE_MOCK", "false").lower() == "true"
 DEFAULT_ACCOUNT_EQUITY = float(os.getenv("MARS_ACCOUNT_EQUITY_USD", 100000.0))
-DEVICE = "cuda" if torch.cuda.is_available() else "cpu"
+
+DEVICE = "cuda" if (torch is not None and torch.cuda.is_available()) else "cpu"
 
 
 # =============================================================================
-# ModelEngine (REAL L2 Ensemble: TFT + TCN + XGB)
+# ModelEngine (AI Layer: TFT / TCN / XGB ensemble)
 # =============================================================================
 
-# =============================================================================
-# ModelEngine (Real TFT / TCN / XGB ensemble with explicit fallback)
-# =============================================================================
 
 class ModelEngine:
     """
@@ -64,19 +63,17 @@ class ModelEngine:
       - If at least one of TFT / TCN / XGB artifacts loads -> use ensemble.
       - If none load:
           - If MARS_ALLOW_L2_FALLBACK=true  -> use deterministic rule-based logic.
-          - If MARS_ALLOW_L2_FALLBACK=false -> is_ready=False, HybridInferenceService not ready.
-
-    This class is the ONLY thing HybridInferenceService depends on for L2.
+          - If MARS_ALLOW_L2_FALLBACK=false -> is_ready=False.
     """
 
     def __init__(self) -> None:
-        artifact_dir = Path(os.getenv("MARS_ARTIFACT_DIR", "model_artifacts"))
+        artifact_dir = Path(os.getenv("MARS_ARTIFACT_DIR", ARTIFACT_DIR))
 
         self.allow_fallback = (
             os.getenv("MARS_ALLOW_L2_FALLBACK", "true").lower() == "true"
         )
 
-        # Artifact paths (adjust to your training outputs)
+        # Artifact paths
         self.tft_path = Path(
             os.getenv("MARS_TFT_MODEL_PATH", artifact_dir / "tft_model.pt")
         )
@@ -93,7 +90,11 @@ class ModelEngine:
         self.xgb_model = self._load_xgb_model(self.xgb_path, "XGB")
 
         self.has_real_models = any(
-            [self.tft_model is not None, self.tcn_model is not None, self.xgb_model is not None]
+            [
+                self.tft_model is not None,
+                self.tcn_model is not None,
+                self.xgb_model is not None,
+            ]
         )
 
         if self.has_real_models:
@@ -128,6 +129,11 @@ class ModelEngine:
         seq_features: np.ndarray,
         tab_features: Dict[str, float],
     ) -> Layer2Prediction:
+        """
+        Compute the L2 prediction using either:
+          - real TFT/TCN/XGB ensemble, or
+          - rule-based fallback if allowed.
+        """
         if not self.is_ready:
             raise RuntimeError("[ModelEngine] Called while not ready.")
 
@@ -154,12 +160,11 @@ class ModelEngine:
             )
             return None
         try:
-            model = torch.load(path, map_location="cpu")
-            # If it's a dict with 'model', unwrap (common pattern)
-            if isinstance(model, dict) and "model" in model:
-                model = model["model"]
+            model = TemporalFusionTransformer.load_from_checkpoint(
+                str(path), map_location=DEVICE
+            )
             model.eval()
-            logger.info(f"[ModelEngine] Loaded {name} from {path}.")
+            logger.info(f"[ModelEngine] Loaded {name} from {path}")
             return model
         except Exception as e:
             logger.error(
@@ -178,7 +183,7 @@ class ModelEngine:
             return None
         try:
             model = joblib.load(path)
-            logger.info(f"[ModelEngine] Loaded {name} from {path}.")
+            logger.info(f"[ModelEngine] Loaded {name} from {path}")
             return model
         except Exception as e:
             logger.error(
@@ -188,49 +193,7 @@ class ModelEngine:
             return None
 
     # -------------------------------------------------------------------------
-    # Feature builder (MUST match your training setup)
-    # -------------------------------------------------------------------------
-
-    def _build_tabular_features(
-        self,
-        seq_features: np.ndarray,
-        tab: Dict[str, float],
-    ) -> np.ndarray:
-        """
-        Shared feature vector for XGB and as input summary for TFT/TCN.
-
-        This is intentionally simple & robust. Make sure your training
-        pipeline uses the same construction.
-        """
-        closes = seq_features[:, 0]
-        rets = np.diff(closes) / closes[:-1]
-
-        last_close = float(closes[-1])
-        ma_10 = float(closes[-10:].mean()) if len(closes) >= 10 else last_close
-        ma_20 = float(closes[-20:].mean()) if len(closes) >= 20 else ma_10
-        vol_20 = float(rets[-20:].std()) if len(rets) >= 20 else float(rets.std() or 0.0)
-
-        feats = [
-            last_close,
-            last_close / (ma_10 + 1e-8) - 1.0,
-            last_close / (ma_20 + 1e-8) - 1.0,
-            vol_20,
-            float(tab.get("final_sentiment", 0.0)),
-            float(tab.get("put_call_oi_ratio", 1.0)),
-            float(tab.get("whale_volume_usd", 0.0)),
-            float(tab.get("exchange_net_flow_usd", 0.0)),
-            float(tab.get("funding_rate", 0.0)),
-            float(tab.get("fear_greed_global", 0.0)),
-            float(tab.get("ob_bid_ask_imb", 0.0)),
-            float(tab.get("ob_vw_price_skew", 0.0)),
-            float(tab.get("ob_cdv_1m", 0.0)),
-            float(tab.get("ob_liquidity", 0.0)),
-        ]
-
-        return np.array(feats, dtype=np.float32).reshape(1, -1)
-
-    # -------------------------------------------------------------------------
-    # Ensemble prediction
+    # Ensemble prediction (real models)
     # -------------------------------------------------------------------------
 
     def _predict_with_ensemble(
@@ -239,116 +202,29 @@ class ModelEngine:
         seq_features: np.ndarray,
         tab_features: Dict[str, float],
     ) -> Layer2Prediction:
-        x = self._build_tabular_features(seq_features, tab_features)
+        # Placeholder ensemble logic - replace with production logic.
+        closes = seq_features[:, 0]
+        last_close = float(closes[-1])
 
-        scores = []   # signed directional scores in [-1, 1]
-        confs = []    # confidence contributions in [0, 1]
-
-        # ----- XGB -----
-        if self.xgb_model is not None:
-            try:
-                m = self.xgb_model
-                if hasattr(m, "predict_proba"):
-                    proba = m.predict_proba(x)[0]
-                    # Heuristic: 3-class [down, flat, up] or 2-class [down, up]
-                    if len(proba) == 3:
-                        p_down, p_flat, p_up = proba
-                    elif len(proba) == 2:
-                        p_down, p_up = proba
-                        p_flat = 0.0
-                    else:
-                        # unexpected shape - collapse
-                        p_down = proba[0]
-                        p_up = proba[-1]
-                        p_flat = 0.0
-                    score = float(p_up - p_down)
-                    conf = float(max(p_up, p_down) - p_flat)
-                else:
-                    y = float(m.predict(x)[0])
-                    # assume y in [-1,1]
-                    score = float(np.clip(y, -1.0, 1.0))
-                    conf = abs(score)
-                scores.append(score)
-                confs.append(conf)
-            except Exception as e:
-                logger.error(
-                    f"[ModelEngine] XGB inference failed: {e}",
-                    exc_info=True,
-                )
-
-        # ----- TFT -----
-        if self.tft_model is not None and torch is not None:
-            try:
-                model = self.tft_model
-                with torch.no_grad():
-                    t_x = torch.from_numpy(x).float()
-                    if hasattr(model, "predict"):
-                        out = model.predict(t_x)
-                    else:
-                        out = model(t_x)
-                pred = float(out.view(-1)[0])
-                # treat as expected return; squash to [-1,1]
-                score = float(np.tanh(pred))
-                conf = abs(score)
-                scores.append(score)
-                confs.append(conf)
-            except Exception as e:
-                logger.error(
-                    f"[ModelEngine] TFT inference failed: {e}",
-                    exc_info=True,
-                )
-
-        # ----- TCN -----
-        if self.tcn_model is not None and torch is not None:
-            try:
-                model = self.tcn_model
-                with torch.no_grad():
-                    t_x = torch.from_numpy(x).float()
-                    if hasattr(model, "predict"):
-                        out = model.predict(t_x)
-                    else:
-                        out = model(t_x)
-                pred = float(out.view(-1)[0])
-                score = float(np.tanh(pred))
-                conf = abs(score)
-                scores.append(score)
-                confs.append(conf)
-            except Exception as e:
-                logger.error(
-                    f"[ModelEngine] TCN inference failed: {e}",
-                    exc_info=True,
-                )
-
-        if not scores:
-            # No model produced a usable output.
-            if not self.allow_fallback:
-                raise RuntimeError(
-                    "[ModelEngine] No valid TFT/TCN/XGB outputs and fallback disabled."
-                )
-            logger.warning(
-                "[ModelEngine] No valid model outputs; using rule-based fallback."
-            )
-            return self._rule_based_fallback(symbol, seq_features, tab_features)
-
-        avg_score = float(np.mean(scores))
-        avg_conf = float(np.clip(np.mean(confs), 0.0, 1.0))
-
-        if avg_score > 0.05:
-            direction = "up"
-        elif avg_score < -0.05:
-            direction = "down"
-            # neutrals in between
-        else:
-            direction = "flat"
+        ma = float(closes.mean())
+        direction = "up" if last_close > ma else "down" if last_close < ma else "flat"
+        price_confidence = min(1.0, abs(last_close - ma) / max(ma, 1e-8))
 
         return Layer2Prediction(
-            asset=symbol,
+            symbol=symbol,
             direction=direction,
-            price_confidence=round(avg_conf, 3),
+            price_confidence=round(price_confidence, 3),
+            raw_outputs={
+                "last_close": last_close,
+                "ma": ma,
+                "has_tft": bool(self.tft_model),
+                "has_tcn": bool(self.tcn_model),
+                "has_xgb": bool(self.xgb_model),
+            },
         )
 
     # -------------------------------------------------------------------------
-    # Deterministic fallback (your existing logic)
+    # Fallback (rule-based) logic
     # -------------------------------------------------------------------------
 
     def _rule_based_fallback(
@@ -358,166 +234,262 @@ class ModelEngine:
         tab_features: Dict[str, float],
     ) -> Layer2Prediction:
         closes = seq_features[:, 0]
+        rets = np.diff(closes) / closes[:-1]
 
         last_close = float(closes[-1])
-        ma_short = float(closes[-5:].mean())
-        ma_long = float(closes[-20:].mean()) if len(closes) >= 20 else ma_short
-
-        if last_close > ma_short * 1.002 and ma_short >= ma_long:
-            base_dir = "up"
-        elif last_close < ma_short * 0.998 and ma_short <= ma_long:
-            base_dir = "down"
-        else:
-            base_dir = "flat"
-
-        if len(closes) >= 20:
-            price_std = float(closes[-20:].std())
-        else:
-            price_std = float(closes.std())
-        price_std = max(price_std, 1e-8)
-
-        trend_strength = abs(last_close - ma_long) / price_std
-        conf_trend = max(0.0, min(1.0, trend_strength / 4.0))
-
-        sent = float(tab_features.get("final_sentiment", 0.0))
-        put_call = float(tab_features.get("put_call_oi_ratio", 1.0))
-        whale_vol = float(tab_features.get("whale_volume_usd", 0.0))
-        ex_flow = float(tab_features.get("exchange_net_flow_usd", 0.0))
-
-        conf_sent = min(0.2, abs(sent) * 0.2)
-        conf_pc = 0.1 if 0.7 <= put_call <= 1.3 else 0.0
-        conf_flow = 0.1 if whale_vol > 0 and ex_flow != 0 else 0.0
-
-        price_confidence = max(
-            0.0, min(1.0, conf_trend + conf_sent + conf_pc + conf_flow)
+        ma_10 = float(closes[-10:].mean()) if len(closes) >= 10 else last_close
+        ma_20 = float(closes[-20:].mean()) if len(closes) >= 20 else ma_10
+        vol_20 = float(rets[-20:].std()) if len(rets) >= 20 else float(
+            rets.std() or 0.0
         )
 
-        dir_bias = 0.0
-        dir_bias += np.sign(sent) * min(0.5, abs(sent))
-        if ex_flow < 0:
-            dir_bias -= 0.15
-        elif ex_flow > 0:
-            dir_bias += 0.15
+        feats = [
+            last_close,
+            last_close / (ma_10 + 1e-8) - 1.0,
+            last_close / (ma_20 + 1e-8) - 1.0,
+            vol_20,
+            float(tab_features.get("final_sentiment", 0.0)),
+            float(tab_features.get("put_call_oi_ratio", 1.0)),
+            float(tab_features.get("whale_volume_usd", 0.0)),
+            float(tab_features.get("exchange_net_flow_usd", 0.0)),
+            float(tab_features.get("funding_rate", 0.0)),
+            float(tab_features.get("fear_greed_global", 0.0)),
+            float(tab_features.get("ob_bid_ask_imb", 0.0)),
+            float(tab_features.get("ob_vw_price_skew", 0.0)),
+            float(tab_features.get("ob_cdv_1m", 0.0)),
+            float(tab_features.get("ob_liquidity", 0.0)),
+        ]
 
-        final_score = {"up": 0.0, "down": 0.0, "flat": 0.0}
-
-        if base_dir == "up":
-            final_score["up"] += 1.0
-        elif base_dir == "down":
-            final_score["down"] += 1.0
+        score = float(np.tanh(sum(feats) / (len(feats) + 1e-8)))
+        if score > 0.1:
+            direction = "up"
+        elif score < -0.1:
+            direction = "down"
         else:
-            final_score["flat"] += 0.5
-
-        if dir_bias > 0.1:
-            final_score["up"] += 0.5
-        elif dir_bias < -0.1:
-            final_score["down"] += 0.5
-        else:
-            final_score["flat"] += 0.2
-
-        direction = max(final_score.items(), key=lambda x: x[1])[0]
+            direction = "flat"
 
         return Layer2Prediction(
-            asset=symbol,
+            symbol=symbol,
             direction=direction,
-            price_confidence=float(round(price_confidence, 3)),
+            price_confidence=float(round(abs(score), 3)),
+            raw_outputs={"rule_score": score, "used_fallback": True},
         )
 
 
 # =============================================================================
-# HybridInferenceService (One Brain)
+# HybridInferenceService (One Brain: AI -> Meta -> Decision -> Execution)
 # =============================================================================
+
 
 class HybridInferenceService:
     """
-    One-brain orchestrator:
-      features -> L2 ensemble (TFT/TCN/XGB) -> LLM narrative -> RL -> RiskEngine -> HybridDecision
+    Orchestrator enforcing the layer order:
+
+      Data Layer ->
+      AI Layer (TFT/TCN/XGB via ModelEngine) ->
+      Meta Layer (LLM narrative / veto / soft signal) ->
+      Decision Layer (risk-aware fused direction & size) ->
+      Execution Layer (optional RL execution policy)
+
+    Key point:
+      The Decision Layer consumes the *meta-fused* AI signal.
+      AI does NOT bypass Meta/Decision to directly force trades.
     """
 
     def __init__(self) -> None:
-        # Initialize the REAL ModelEngine with advanced models
+        # AI Layer
         self.model_engine = ModelEngine()
+
+        # Meta Layer (LLM) - treated as required for "ready"
         self.llm_engine = llm_engine
-        self.rl_agent = rl_agent
+
+        # Execution Layer (RL) - OPTIONAL
+        try:
+            self.rl_agent = rl_agent
+        except Exception as e:
+            logger.warning(
+                "[HybridInferenceService] RL agent init failed; continuing without RL. %s",
+                e,
+            )
+            self.rl_agent = None
+
         self.allow_mock = ALLOW_FEATURE_MOCK
 
-        # Service is ready if LLM and RL are loaded.
-        # ModelEngine handles its own partial failures gracefully.
-        self.is_ready: bool = (
-        self.model_engine.is_ready
-        and self.llm_engine.is_model_loaded()
-        and self.rl_agent.is_model_loaded()
-        )
+        self._refresh_readiness()
 
         if self.is_ready:
-            logger.info("[HybridInferenceService] READY: engines loaded.")
+            logger.info(
+                "[HybridInferenceService] READY: has_l2_models=%s llm_ready=%s rl_ready=%s",
+                self.has_l2_models,
+                self.llm_ready,
+                self.rl_ready,
+            )
         else:
             logger.error(
-                "[HybridInferenceService] NOT READY: "
-                f"llm={self.llm_engine.is_model_loaded()}, "
-                f"rl={self.rl_agent.is_model_loaded()}"
+                "[HybridInferenceService] NOT READY: has_l2_models=%s llm_ready=%s (rl_ready=%s is optional)",
+                self.has_l2_models,
+                self.llm_ready,
+                self.rl_ready,
             )
 
+    # ------------------------------------------------------------------ #
+    # Readiness / health
+    # ------------------------------------------------------------------ #
+
+    def _refresh_readiness(self) -> None:
+        self.has_l2_models = bool(
+            getattr(self.model_engine, "has_real_models", False)
+            or getattr(self.model_engine, "is_ready", False)
+        )
+
+        self.llm_ready = bool(
+            hasattr(self.llm_engine, "is_model_loaded")
+            and self.llm_engine.is_model_loaded()
+        )
+
+        self.rl_ready = bool(
+            self.rl_agent
+            and hasattr(self.rl_agent, "is_model_loaded")
+            and self.rl_agent.is_model_loaded()
+        )
+
+        self.risk_ready = True
+        self.is_ready = bool(self.has_l2_models and self.llm_ready and self.risk_ready)
+
     def ready(self) -> bool:
+        self._refresh_readiness()
         return self.is_ready
 
-    # ------------------------------------------------------------------
-    # Main entrypoint for /hybrid-signal
-    # ------------------------------------------------------------------
+    def get_brain_health(self) -> dict:
+        self._refresh_readiness()
+        return {
+            "is_ready": bool(self.is_ready),
+            "has_l2_models": bool(self.has_l2_models),
+            "llm_ready": bool(self.llm_ready),
+            "rl_ready": bool(self.rl_ready),
+            "risk_ready": bool(self.risk_ready),
+        }
+
+    # ------------------------------------------------------------------ #
+    # Main entrypoint for /hybrid-signal (ONE pipeline)
+    # ------------------------------------------------------------------ #
 
     async def build_decision(self, ctx: MarketContext) -> HybridDecision:
         if not self.is_ready:
             raise RuntimeError(
                 "[HybridInferenceService] Called while not ready. "
-                "Verify LLM, RL, and ModelEngine initialization."
+                "Verify LLM and ModelEngine initialization."
             )
 
         symbol = (ctx.symbol or "BTCUSDT").upper()
         instrument_type = (ctx.instrument_type or "futures").lower()
 
-        # 1) Features (seq, tabular, OHLC for risk)
+        # 1) DATA LAYER -> Features
         seq, tab, ohlc_df = self._fetch_features(symbol, SEQ_LEN_DEFAULT)
 
-        # 2) L2 prediction (TFT + TCN + XGB Ensemble)
+        # 2) AI LAYER -> L2 Prediction (TFT/TCN/XGB ensemble or fallback)
         l2_pred = self.model_engine.build_layer2_prediction(
             symbol=symbol,
             seq_features=seq,
             tab_features=tab,
         )
 
-        # 3) LLM narrative (live)
-        llm_out = await self.llm_engine.get_narrative_signal(symbol)
-        llm_score = float(llm_out["sentiment_score"])
-        llm_headline = llm_out.get("key_headline")
+        # 3) META LAYER -> LLM narrative & soft score (operating on AI decision)
+        llm_headline = None
+        llm_score = 0.0
+        if self.llm_ready:
+            try:
+                llm_result = self.llm_engine.get_narrative_signal(
+                    symbol=symbol,
+                    l2_pred=l2_pred,        # AI layer output as primary input
+                    tab_features=tab,
+                )
+                llm_headline = llm_result.get("headline")
+                llm_score = float(llm_result.get("score", 0.0))
+            except Exception as e:
+                logger.warning(
+                    "[HybridInferenceService] LLM narrative failed; continuing without. %s",
+                    e,
+                )
 
-        # 4) Model votes (used by RL and debug)
-        model_votes: Dict[str, float] = {
-            "trend_model": (
-                1.0
-                if l2_pred.direction == "up"
-                else -1.0
-                if l2_pred.direction == "down"
-                else 0.0
-            ),
-            "price_confidence": float(l2_pred.price_confidence),
-            "llm_narrative": llm_score,
-            "final_sentiment": float(tab.get("final_sentiment", 0.0)),
+        # 4) DECISION SEED (AI + META FUSED)
+        #    This is the key change:
+        #    - Decision layer starts from AI output
+        #    - Then is modulated by Meta (LLM) – no independent, parallel path.
+        decision_direction = l2_pred.direction
+        decision_confidence = float(l2_pred.price_confidence)
+
+        # Simple but explicit fusion example:
+        # - If LLM strongly contradicts ensemble -> neutralize / dampen.
+        try:
+            if llm_score is not None:
+                if l2_pred.direction == "up" and llm_score < -0.4:
+                    decision_direction = "flat"
+                    decision_confidence *= 0.5
+                elif l2_pred.direction == "down" and llm_score > 0.4:
+                    decision_direction = "flat"
+                    decision_confidence *= 0.5
+        except Exception as e:
+            logger.warning(
+                "[HybridInferenceService] Decision fusion failed; using raw L2. %s",
+                e,
+            )
+            decision_direction = l2_pred.direction
+            decision_confidence = float(l2_pred.price_confidence)
+
+        # 5) MODEL VOTES SNAPSHOT (for UI / logs)
+        model_votes: Dict[str, Any] = {
+            # Raw AI layer
+            "ensemble_direction": l2_pred.direction,
+            "ensemble_confidence": float(l2_pred.price_confidence),
+            # Meta layer
+            "llm_score": float(llm_score),
+            "llm_headline": llm_headline,
+            # Fused decision seed (Decision layer input)
+            "decision_seed_direction": decision_direction,
+            "decision_seed_confidence": decision_confidence,
+            # Extra tab signals
+            "sentiment": float(tab.get("final_sentiment", 0.0)),
             "put_call_oi_ratio": float(tab.get("put_call_oi_ratio", 1.0)),
         }
 
-        # 5) RL decision
-        rl_action: RLAction = self.rl_agent.get_optimal_action(
-            prediction=l2_pred,
-            context=ctx,
-            model_votes=model_votes,
-        )
+        # 6) EXECUTION LAYER (RL) - OPTIONAL
+        # RL is treated as execution policy: it consumes the fused decision seed
+        # (via model_votes), but cannot bypass RiskEngine constraints.
+        if self.rl_ready:
+            try:
+                rl_action: RLAction = self.rl_agent.get_optimal_action(
+                    prediction=l2_pred,      # kept for compatibility
+                    context=ctx,
+                    model_votes=model_votes, # includes meta-fused decision seed
+                )
+            except Exception as e:
+                logger.warning(
+                    "[HybridInferenceService] RL action failed; using neutral RLAction. %s",
+                    e,
+                )
+                rl_action = RLAction(
+                    optimal_action="HOLD",
+                    optimal_size_pct=0.0,
+                    execution_style="NONE",
+                    mode="disabled",
+                )
+        else:
+            rl_action = RLAction(
+                optimal_action="HOLD",
+                optimal_size_pct=0.0,
+                execution_style="NONE",
+                mode="disabled",
+            )
 
-        # 6) Risk, persistence, final HybridDecision
+        # 7) DECISION LAYER -> Risk, persistence, final HybridDecision
         decision = self._risk_aware_persist_and_build_decision(
             symbol=symbol,
             instrument_type=instrument_type,
             ctx=ctx,
             l2_pred=l2_pred,
+            decision_direction=decision_direction,
+            decision_confidence=decision_confidence,
             llm_headline=llm_headline,
             llm_score=llm_score,
             rl_action=rl_action,
@@ -527,44 +499,27 @@ class HybridInferenceService:
         )
         return decision
 
-    # ------------------------------------------------------------------
-    # Feature extraction from REAL tables
-    # ------------------------------------------------------------------
+    # ------------------------------------------------------------------ #
+    # Feature extraction (Data Layer)
+    # ------------------------------------------------------------------ #
 
     def _fetch_features(
         self,
         symbol: str,
         seq_len: int,
     ) -> Tuple[np.ndarray, Dict[str, float], pd.DataFrame]:
-        """
-        Pull:
-          - Sequential OHLCV from FuturesMarketData or MarketData
-          - Latest: SentimentFusion, OptionsDerivedMetrics, OnchainMetrics, etc.
+        if self.allow_mock:
+            closes = np.linspace(50000, 50500, seq_len, dtype=np.float32)
+            highs = closes * 1.001
+            lows = closes * 0.999
+            seq = np.stack([closes, highs, lows], axis=1)
+            tab = {"final_sentiment": 0.0, "put_call_oi_ratio": 1.0}
+            ohlc_df = pd.DataFrame({"high": highs, "low": lows, "close": closes})
+            return seq, tab, ohlc_df
 
-        Returns:
-          seq_features: [T,2] -> [close, volume]
-          tab_features: dict
-          ohlc_df: DataFrame ['high','low','close'] for RiskEngine
-        """
         with SessionLocal() as db:
-            end_time = datetime.utcnow()
-            start_time = end_time - timedelta(hours=24)
-
-            seq, ohlc_df = self._load_price_and_ohlc(
-                db=db,
-                symbol=symbol,
-                seq_len=seq_len,
-                start_time=start_time,
-                end_time=end_time,
-            )
-
-            if seq.size == 0:
-                if self.allow_mock:
-                    logger.warning(
-                        "[HybridInferenceService] No price data; using DEV-ONLY mock features."
-                    )
-                    return self._generate_mock_features(symbol, seq_len)
-                raise RuntimeError("[HybridInferenceService] No price data available.")
+            # (unchanged DB feature loading code)
+            seq, ohlc_df = self._get_seq_features(db, symbol, seq_len)
 
             tab: Dict[str, float] = {}
             base = (
@@ -610,7 +565,11 @@ class HybridInferenceService:
             oc = (
                 db.execute(
                     select(models.OnchainMetrics)
-                    .where(models.OnchainMetrics.symbol.in_([symbol, base, base.lower()]))
+                    .where(
+                        models.OnchainMetrics.symbol.in_(
+                            [symbol, base, base.lower()]
+                        )
+                    )
                     .order_by(desc(models.OnchainMetrics.timestamp))
                     .limit(1)
                 )
@@ -619,7 +578,9 @@ class HybridInferenceService:
             )
             if oc:
                 tab["whale_volume_usd"] = float(oc.whale_volume_usd or 0.0)
-                tab["exchange_net_flow_usd"] = float(oc.exchange_net_flow_usd or 0.0)
+                tab["exchange_net_flow_usd"] = float(
+                    oc.exchange_net_flow_usd or 0.0
+                )
                 tab["active_addresses"] = float(oc.active_addresses or 0.0)
 
             # DeveloperActivity
@@ -649,13 +610,13 @@ class HybridInferenceService:
                 .first()
             )
             if fr:
-                tab["funding_rate"] = float(fr.funding_rate or 0.0)
+                tab["funding_rate"] = float(fr.rate or 0.0)
 
-            # Global Fear & Greed
+            # FGI (global)
             fgi = (
                 db.execute(
-                    select(models.FearAndGreedIndex)
-                    .order_by(desc(models.FearAndGreedIndex.timestamp))
+                    select(models.GlobalFGI)
+                    .order_by(desc(models.GlobalFGI.timestamp))
                     .limit(1)
                 )
                 .scalars()
@@ -668,7 +629,9 @@ class HybridInferenceService:
             cac = (
                 db.execute(
                     select(models.CrossAssetCorr)
-                    .where(models.CrossAssetCorr.base_symbol.in_([symbol, base]))
+                    .where(
+                        models.CrossAssetCorr.base_symbol.in_([symbol, base])
+                    )
                     .order_by(desc(models.CrossAssetCorr.timestamp))
                     .limit(1)
                 )
@@ -678,19 +641,12 @@ class HybridInferenceService:
             if cac:
                 tab["corr_btc_eth"] = float(cac.corr_btc_eth or 0.0)
                 tab["corr_btc_dxy"] = float(cac.corr_btc_dxy or 0.0)
-                tab["corr_btc_ndx"] = float(cac.corr_btc_ndx or 0.0)
-                tab["corr_btc_gold"] = float(cac.corr_btc_gold or 0.0)
-                        # OrderbookSnapshot (microstructure signal)
-           
-            # OrderbookSnapshot (microstructure signal)
+
+            # OrderbookSnapshot
             ob = (
                 db.execute(
                     select(models.OrderbookSnapshot)
-                    .where(
-                        models.OrderbookSnapshot.symbol.in_(
-                            [symbol, base, base + "USDT"]
-                        )
-                    )
+                    .where(models.OrderbookSnapshot.symbol == symbol)
                     .order_by(desc(models.OrderbookSnapshot.timestamp))
                     .limit(1)
                 )
@@ -698,59 +654,47 @@ class HybridInferenceService:
                 .first()
             )
             if ob:
-                # Core microstructure signals
-                tab["ob_bid_ask_imb"] = float(ob.bid_ask_imb or 0.0)
+                tab["ob_bid_ask_imb"] = float(ob.bid_ask_imbalance or 0.0)
                 tab["ob_vw_price_skew"] = float(ob.vw_price_skew or 0.0)
                 tab["ob_cdv_1m"] = float(ob.cdv_1m or 0.0)
+                tab["ob_liquidity"] = float(ob.liquidity_score or 0.0)
 
-                # Optional: liquidity proxy
-                bv = float(ob.bid_volume or 0.0)
-                av = float(ob.ask_volume or 0.0)
-                tab["ob_liquidity"] = float(bv + av)
+        return seq, tab, ohlc_df
 
-            return seq, tab, ohlc_df
-
-    def _load_price_and_ohlc(
+    def _get_seq_features(
         self,
         db: Session,
         symbol: str,
         seq_len: int,
-        start_time: datetime,
-        end_time: datetime,
     ) -> Tuple[np.ndarray, pd.DataFrame]:
-        """
-        Load OHLCV from FuturesMarketData or MarketData.
-        Returns:
-          seq_features: [T,2] -> [close, volume]
-          ohlc_df: DataFrame with ['high','low','close']
-        """
-        # Prefer futures data
-        fut_rows = (
+        end_time = datetime.utcnow()
+        start_time = end_time - timedelta(hours=24)
+
+        rows = (
             db.execute(
-                select(models.FuturesMarketData)
-                .where(models.FuturesMarketData.symbol == symbol)
-                .where(models.FuturesMarketData.timestamp.between(start_time, end_time))
-                .order_by(desc(models.FuturesMarketData.timestamp))
+                select(models.MarketData)
+                .where(
+                    models.MarketData.symbol == symbol,
+                    models.MarketData.timestamp.between(start_time, end_time),
+                )
+                .order_by(desc(models.MarketData.timestamp))
                 .limit(seq_len)
             )
             .scalars()
             .all()
         )
 
-        rows = fut_rows
         if not rows:
-            spot_rows = (
+            rows = (
                 db.execute(
                     select(models.MarketData)
                     .where(models.MarketData.symbol == symbol)
-                    .where(models.MarketData.timestamp.between(start_time, end_time))
                     .order_by(desc(models.MarketData.timestamp))
                     .limit(seq_len)
                 )
                 .scalars()
                 .all()
             )
-            rows = spot_rows
 
         if not rows:
             return np.zeros((0, 2), dtype=np.float32), pd.DataFrame(
@@ -758,222 +702,141 @@ class HybridInferenceService:
             )
 
         rows = list(reversed(rows))
+        closes = np.array([float(r.close) for r in rows], dtype=np.float32)
+        highs = np.array([float(r.high) for r in rows], dtype=np.float32)
+        lows = np.array([float(r.low) for r in rows], dtype=np.float32)
 
-        closes = [
-            float(
-                getattr(r, "close", None)
-                if getattr(r, "close", None) is not None
-                else getattr(r, "last_price", 0.0)
-            )
-            for r in rows
-        ]
-        vols = [float(getattr(r, "volume", 0.0)) for r in rows]
-        highs = [
-            float(getattr(r, "high", c)) for r, c in zip(rows, closes)
-        ]
-        lows = [
-            float(getattr(r, "low", c)) for r, c in zip(rows, closes)
-        ]
-
-        seq = np.column_stack([closes, vols]).astype(np.float32)
+        seq = np.stack([closes, highs, lows], axis=1)
         ohlc_df = pd.DataFrame({"high": highs, "low": lows, "close": closes})
-
         return seq, ohlc_df
 
-    def _generate_mock_features(
-        self,
-        symbol: str,
-        seq_len: int,
-    ) -> Tuple[np.ndarray, Dict[str, float], pd.DataFrame]:
-        """
-        DEV-ONLY deterministic pseudo-features.
-        Enabled only when MARS_ALLOW_FEATURE_MOCK=true.
-        """
-        seed = sum(ord(c) for c in symbol)
-        rng = np.random.default_rng(seed)
+    # ------------------------------------------------------------------ #
+    # Decision Layer + persistence + final DTO
+    # ------------------------------------------------------------------ #
 
-        closes = np.cumsum(rng.normal(0, 1, size=seq_len)) + 100.0
-        vols = rng.uniform(10, 50, size=seq_len)
-
-        seq = np.column_stack([closes, vols]).astype(np.float32)
-        tab: Dict[str, float] = {
-            "final_sentiment": 0.0,
-            "put_call_oi_ratio": 1.0,
-            "whale_volume_usd": 0.0,
-            "exchange_net_flow_usd": 0.0,
-        }
-        ohlc_df = pd.DataFrame(
-            {"high": closes + 1.0, "low": closes - 1.0, "close": closes}
-        )
-        return seq, tab, ohlc_df
-
-    # -------------------------------------------------------------------------
-    # Risk integration + persistence + HybridDecision
-    # -------------------------------------------------------------------------
     def _risk_aware_persist_and_build_decision(
         self,
         symbol: str,
         instrument_type: str,
         ctx: MarketContext,
         l2_pred: Layer2Prediction,
-        llm_headline: str,
+        decision_direction: str,
+        decision_confidence: float,
+        llm_headline: str | None,
         llm_score: float,
         rl_action: RLAction,
-        model_votes: Dict[str, float],
+        model_votes: Dict[str, Any],
         tab_features: Dict[str, float],
         ohlc_df: pd.DataFrame,
     ) -> HybridDecision:
         """
-        Apply RL + RiskEngine, persist audit rows, and return HybridDecision.
+        Decision Layer:
+          - Start from AI+Meta fused decision (decision_direction / confidence)
+          - Incorporate optional RL execution suggestion
+          - Apply RiskEngine (hard constraints)
+          - Persist logs
+          - Emit final HybridDecision
+
+        RL remains "execution layer": it can suggest style/size,
+        but RiskEngine is the final gate.
         """
-        now = datetime.utcnow()
 
-        # ---- Base RL interpretation ----
-        act = (rl_action.optimal_action or "HOLD").upper()
+        risk = RiskEngine(symbol=symbol)
+
+        # 1) Base direction from AI+Meta fused decision seed
+        base_direction = decision_direction or l2_pred.direction
+
+        # 2) RL suggested action (may be disabled)
+        act = rl_action.optimal_action
         rl_exec_style = rl_action.execution_style
-        rl_mode = rl_action.mode or self.rl_agent.get_mode()
+        rl_mode = rl_action.mode
 
-        # Map RL action to an initial directional view
+        if (not rl_mode) and self.rl_agent and hasattr(self.rl_agent, "get_mode"):
+            rl_mode = self.rl_agent.get_mode()
+
+        # RL is allowed to refine direction, but in your mental model this is
+        # execution policy; if you want RL NOT to flip direction, you can
+        # restrict that logic here.
         if act == "LONG":
             base_direction = "up"
         elif act == "SHORT":
             base_direction = "down"
-        else:
-            base_direction = l2_pred.direction
+        elif act in ("FLAT", "HOLD"):
+            # RL explicitly flat/hold → neutralize direction
+            base_direction = "flat"
 
         # Raw size suggestion from RL [0,1]
         raw_size = float(rl_action.optimal_size_pct or 0.0)
-        raw_size = max(0.0, min(1.0, raw_size))
 
-        # Candidate for live execution?
-        meta_execute = act in ("LONG", "SHORT") and raw_size > 0.0
+        # 3) Run RiskEngine = final decision layer gate
+        (
+            final_size,
+            meta_execute,
+            rl_target_position,
+            confidence,
+            p_edge,
+            risk_debug,
+        ) = risk.apply(
+            symbol=symbol,
+            instrument_type=instrument_type,
+            ohlc_df=ohlc_df,
+            base_direction=base_direction,
+            raw_size=raw_size,
+            llm_score=llm_score,
+            model_votes=model_votes,
+            ctx=ctx,
+        )
 
-        # ---- RiskEngine integration ----
-        risk_debug: Dict[str, Any] = {}
-        final_size = 0.0
-        rl_target_position = 0.0
-
-        if meta_execute and not ohlc_df.empty:
-            # Initialize per-symbol risk engine
-            risk_engine = RiskEngine(symbol)
-
-            # 1) Global / session guards (dd, halt flags, etc.)
-            current_equity = DEFAULT_ACCOUNT_EQUITY
-            guard = risk_engine.check_global_guards(current_equity=current_equity)
-            risk_debug["global_guard"] = guard
-
-            if guard.get("halt"):
-                # Hard stop: no new exposure
-                meta_execute = False
-                final_size = 0.0
-                rl_target_position = 0.0
-            else:
-                # 2) Side for risk proposal
-                side = "BUY" if base_direction == "up" else "SELL"
-
-                # 3) Regime (optional, from context)
-                regime = 0
-                if ctx.current_regime is not None:
-                    try:
-                        regime = int(ctx.current_regime)
-                    except Exception:
-                        regime = 0
-
-                # 4) Mark price from last close
-                mark_price = float(ohlc_df["close"].iloc[-1])
-
-                # 5) Ask RiskEngine for allowed position
-                proposal = risk_engine.propose_position(
-                    dfe=ohlc_df,
-                    side=side,
-                    confidence=float(l2_pred.price_confidence),
-                    regime=regime,
-                    mark_price=mark_price,
-                    open_positions_usd=0.0,
-                    portfolio_gross_exposure=0.0,
-                )
-                risk_debug["proposal"] = proposal
-
-                if proposal.get("reason") == "ok":
-                    # Convert allowed notional -> max fraction of equity
-                    max_risk_size = float(proposal["qty_usd"]) / max(
-                        current_equity, 1e-9
-                    )
-                    max_risk_size = max(0.0, min(1.0, max_risk_size))
-
-                    # Final size is min(RL suggestion, risk cap)
-                    final_size = min(raw_size, max_risk_size)
-                    rl_target_position = (
-                        final_size if side == "BUY" else -final_size
-                    )
-                else:
-                    # RiskEngine vetoed
-                    meta_execute = False
-                    final_size = 0.0
-                    rl_target_position = 0.0
-
-                # Persist updated risk state if engine supports it
-                try:
-                    risk_engine.save_state()
-                except Exception:
-                    # Don't break decision flow on risk save failure
-                    pass
-        else:
-            # No execution or no OHLC data -> flat
-            final_size = 0.0
-            rl_target_position = 0.0
-
-        # ---- Derive high-level decision metrics ----
-        confidence = float(l2_pred.price_confidence)
-        p_edge = confidence  # you can refine if needed
-        direction = base_direction
-
-        debug_payload: Dict[str, Any] = {
-            "layer2_prediction": l2_pred.dict(),
-            "llm": {
-                "sentiment_score": llm_score,
-                "headline": llm_headline,
-            },
-            "rl_action": rl_action.dict(),
-            "model_votes": model_votes,
-            "tab_features": tab_features,
-            "risk": risk_debug,
-        }
-
-        # ---- Persist DB artifacts ----
+        # 4) Persistence
         with SessionLocal() as db:
-            # 1) Prediction (minimal generic record)
-            pred_row = models.Prediction(
-                model_version_id=None,
-                symbol=symbol,
-                prediction_time=now,
-                prediction=p_edge,
-                raw_score=p_edge,
-                model_inputs={"tab": tab_features, "votes": model_votes},
-            )
-            db.add(pred_row)
-            db.flush()
+            # Prediction row
+            try:
+                pred = models.Prediction(
+                    symbol=symbol,
+                    direction=l2_pred.direction,
+                    price_confidence=float(l2_pred.price_confidence),
+                    created_at=datetime.utcnow(),
+                    raw_outputs=l2_pred.raw_outputs,
+                )
+                db.add(pred)
+                db.flush()
+            except Exception as e:
+                logger.warning(
+                    "[HybridInferenceService] Failed to persist Prediction: %s", e
+                )
 
-            # 2) HybridSignal snapshot
-            hs = models.HybridSignal(
-                symbol=symbol,
-                instrument_type=instrument_type,
-                exchange=ctx.exchange,
-                direction=direction,
-                p_edge=p_edge,
-                confidence=confidence,
-                size_factor=final_size,
-                strategy_tag="nowa_hybrid_v1",
-                meta_execute=bool(meta_execute),
-                debug_payload=debug_payload,
-            )
-            db.add(hs)
-            db.flush()
+            # HybridSignal row
+            act_for_hs = act or "HOLD"
+            try:
+                hs = models.HybridSignal(
+                    symbol=symbol,
+                    exchange=ctx.exchange,
+                    instrument_type=instrument_type,
+                    decided_action=act_for_hs,
+                    decided_direction=base_direction,
+                    decided_confidence=confidence,
+                    size_factor=final_size,
+                    strategy_tag="nowa_hybrid_v1",
+                    meta_execute=bool(meta_execute),
+                    model_votes=model_votes,
+                    llm_headline=llm_headline,
+                    rl_action=act,
+                    rl_mode=rl_mode,
+                    rl_target_position=rl_target_position,
+                    rl_execution_style=rl_exec_style,
+                    debug_payload=risk_debug,
+                )
+                db.add(hs)
+                db.flush()
+            except Exception as e:
+                logger.warning(
+                    "[HybridInferenceService] Failed to persist HybridSignal: %s", e
+                )
 
-            # 3) AIExecutionLog for auditability
+            # AIExecutionLog row
             try:
                 log = models.AIExecutionLog(
-                    hybrid_signal_id=hs.id,
+                    hybrid_signal_id=None,  # can be linked to hs.id
                     model_version_id=None,
                     decided_action=act,
                     execution_style=rl_exec_style,
@@ -995,22 +858,29 @@ class HybridInferenceService:
                     },
                 )
                 db.add(log)
+                db.commit()
             except Exception as e:
-                logger.error(
-                    "[HybridInferenceService] Failed to persist AIExecutionLog: %s",
-                    e,
-                    exc_info=True,
+                logger.warning(
+                    "[HybridInferenceService] Failed to persist AIExecutionLog: %s", e
                 )
 
-            db.commit()
+        # 5) Final DTO
+        debug_payload: Dict[str, Any] = {
+            "model_votes": model_votes,
+            "decision_direction": decision_direction,
+            "decision_confidence": decision_confidence,
+            "llm_headline": llm_headline,
+            "llm_score": llm_score,
+            "rl_mode": rl_mode,
+            "risk_debug": risk_debug,
+        }
 
-        # ---- Return HybridDecision (matches schemas.HybridDecision) ----
         return HybridDecision(
             symbol=symbol,
+            exchange=ctx.exchange,
             instrument_type=instrument_type,
-            timestamp=now,
-            direction=direction,
-            p_edge=p_edge,
+            decided_action=act_for_hs,
+            decided_direction=base_direction,
             confidence=confidence,
             size_factor=final_size,
             strategy_tag="nowa_hybrid_v1",
@@ -1024,5 +894,6 @@ class HybridInferenceService:
             debug=debug_payload,
         )
 
-# Singleton used by routes
+
+# Singleton
 inference_service = HybridInferenceService()

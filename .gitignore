@@ -1,1 +1,26 @@
+# Python
+__pycache__/
+*.py[cod]
+
+# Env
+.env
+.env.*
+
+# Logs / coverage
+logs/
+*.log
+.coverage*
+coverage.xml
+htmlcov/
+
+# Notebooks
+*.ipynb
+.ipynb_checkpoints/
+
+# Editors / OS
+.DS_Store
+.vscode/
+.idea/
+Thumbs.db
 node_modules
+python - <<'PY'

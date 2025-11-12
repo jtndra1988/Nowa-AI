@@ -29,3 +29,5 @@ celerybeat-schedule
 .vscode/
 .idea/
 Thumbs.db
+
+pip.conf

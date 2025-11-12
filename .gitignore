@@ -1,26 +1,33 @@
-# Python
-__pycache__/
-*.py[cod]
-
-# Env
-.env
-.env.*
-
-# Logs / coverage
-logs/
-*.log
-.coverage*
-coverage.xml
-htmlcov/
-
-# Notebooks
-*.ipynb
-.ipynb_checkpoints/
-
-# Editors / OS
+# OS / editors
 .DS_Store
+Thumbs.db
 .vscode/
 .idea/
-Thumbs.db
-node_modules
-python - <<'PY'
+
+# node
+node_modules/
+npm-debug.log*
+yarn.lock
+pnpm-lock.yaml
+
+# python
+**/__pycache__/
+*.py[cod]
+
+# envs
+.env
+.env.*
+*.env
+
+# coverage/logs
+**/.pytest_cache/
+**/htmlcov/
+**/.coverage*
+**/coverage.xml
+**/logs/
+**/*.log
+
+# build outputs
+**/dist/
+**/build/
+**/out/

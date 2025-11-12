@@ -1,0 +1,31 @@
+# envs
+.venv/
+.env
+.env.*
+
+# python caches
+__pycache__/
+*.py[cod]
+
+# logs / coverage
+logs/
+*.log
+.coverage*
+coverage.xml
+htmlcov/
+
+# notebooks
+*.ipynb
+.ipynb_checkpoints/
+
+# artifacts / data / models
+checkpoints/
+checkpoints_futures/
+data/
+celerybeat-schedule
+
+# editors / OS
+.DS_Store
+.vscode/
+.idea/
+Thumbs.db

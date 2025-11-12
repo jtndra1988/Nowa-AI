@@ -1,0 +1,420 @@
+@tailwind base;
+@tailwind components;
+@tailwind utilities;
+
+@import "tailwindcss";
+@import "tw-animate-css";
+
+/* Shadcn-style dark variant */
+@custom-variant dark (&:is(.dark *));
+
+/* Map CSS vars into Tailwind theme tokens */
+@theme inline {
+  --color-background: var(--background);
+  --color-foreground: var(--foreground);
+  --font-sans: var(--font-geist-sans);
+  --font-mono: var(--font-geist-mono);
+
+  --color-sidebar-ring: var(--sidebar-ring);
+  --color-sidebar-border: var(--sidebar-border);
+  --color-sidebar-accent-foreground: var(--sidebar-accent-foreground);
+  --color-sidebar-accent: var(--sidebar-accent);
+  --color-sidebar-primary-foreground: var(--sidebar-primary-foreground);
+  --color-sidebar-primary: var(--sidebar-primary);
+  --color-sidebar-foreground: var(--sidebar-foreground);
+  --color-sidebar: var(--sidebar);
+
+  --color-chart-5: var(--chart-5);
+  --color-chart-4: var(--chart-4);
+  --color-chart-3: var(--chart-3);
+  --color-chart-2: var(--chart-2);
+  --color-chart-1: var(--chart-1);
+
+  --color-ring: var(--ring);
+  --color-input: var(--input);
+  --color-border: var(--border);
+  --color-destructive: var(--destructive);
+  --color-accent-foreground: var(--accent-foreground);
+  --color-accent: var(--accent);
+  --color-muted-foreground: var(--muted-foreground);
+  --color-muted: var(--muted);
+  --color-secondary-foreground: var(--secondary-foreground);
+  --color-secondary: var(--secondary);
+  --color-primary-foreground: var(--primary-foreground);
+  --color-primary: var(--primary);
+  --color-popover-foreground: var(--popover-foreground);
+  --color-popover: var(--popover);
+  --color-card-foreground: var(--card-foreground);
+  --color-card: var(--card);
+
+  --radius-sm: calc(var(--radius) - 4px);
+  --radius-md: calc(var(--radius) - 2px);
+  --radius-lg: var(--radius);
+  --radius-xl: calc(var(--radius) + 4px);
+}
+
+/* ========= LIGHT THEME (DEFAULT) ========= */
+/* This is where we fix the dull light palette */
+
+:root {
+  --radius: 0.625rem;
+
+  /* Backgrounds & text */
+  --background: oklch(0.98 0.02 255);       /* soft blue-tinted surface */
+  --foreground: oklch(0.22 0.03 260);       /* deep slate */
+
+  --card: oklch(0.995 0.01 255);            /* clean card surface */
+  --card-foreground: var(--foreground);
+
+  --popover: var(--card);
+  --popover-foreground: var(--foreground);
+
+  /* Brand / primary */
+  --primary: oklch(0.64 0.19 255);          /* vivid Nowa blue */
+  --primary-foreground: oklch(0.99 0.02 255);
+
+  /* Secondary / accent */
+  --secondary: oklch(0.97 0.03 210);        /* very light teal */
+  --secondary-foreground: var(--foreground);
+
+  --accent: oklch(0.8 0.16 250);            /* bluish accent */
+  --accent-foreground: oklch(0.18 0.03 260);
+
+  /* Muted / subtle text */
+  --muted: oklch(0.96 0.02 255);
+  --muted-foreground: oklch(0.55 0.03 250);
+
+  /* States */
+  --destructive: oklch(0.63 0.22 28);       /* red */
+  --border: oklch(0.9 0.02 255);
+  --input: oklch(0.94 0.015 255);
+  --ring: oklch(0.7 0.18 255);
+
+  /* Charts - tuned for light */
+  --chart-1: oklch(0.64 0.19 255);          /* blue */
+  --chart-2: oklch(0.62 0.16 180);          /* teal */
+  --chart-3: oklch(0.6 0.13 110);           /* lime */
+  --chart-4: oklch(0.7 0.18 320);           /* magenta */
+  --chart-5: oklch(0.72 0.18 40);           /* orange */
+
+  /* Sidebar & shell */
+  --sidebar: oklch(0.985 0.015 255);
+  --sidebar-foreground: var(--foreground);
+  --sidebar-primary: var(--primary);
+  --sidebar-primary-foreground: var(--primary-foreground);
+  --sidebar-accent: var(--accent);
+  --sidebar-accent-foreground: var(--accent-foreground);
+  --sidebar-border: var(--border);
+  --sidebar-ring: var(--ring);
+
+  /* Global color-scheme hint */
+  color-scheme: light;
+}
+
+/* ========= DARK THEME ========= */
+
+.dark {
+  /* Accent */
+  --accent: #00d492;
+  --accent-glow-shadow: 0 0 12px rgba(0, 212, 146, 0.7);
+
+  /* 1. Base Colors */
+  --background: oklch(0.12 0.02 165);       /* deep green-cyan */
+  --foreground: oklch(0.95 0.01 165);       /* light text */
+
+  /* 2. Surfaces */
+  --card: oklch(0.16 0.03 165);
+  --card-foreground: var(--foreground);
+  --popover: var(--card);
+  --popover-foreground: var(--foreground);
+
+  /* 3. Glassmorphism */
+  --glass-bg: oklch(0.16 0.03 165 / 0.78);
+  --glass-border: oklch(0.4 0.1 165 / 0.22);
+
+  /* 4. Interactive */
+  --primary: var(--accent);
+  --primary-foreground: oklch(0.1 0 0);
+  --secondary: oklch(0.25 0.04 165);
+  --secondary-foreground: var(--foreground);
+  --muted: oklch(0.2 0.03 165);
+  --muted-foreground: oklch(0.7 0.01 165);
+
+  /* 5. Utility */
+  --border: oklch(0.25 0.04 165);
+  --input: oklch(0.18 0.03 165 / 0.65);
+  --ring: var(--accent);
+  --destructive: oklch(0.704 0.191 22.216);
+
+  /* 6. Charts */
+  --chart-1: var(--accent);
+  --chart-2: oklch(0.696 0.17 162.48);
+  --chart-3: oklch(0.7 0.2 200);
+  --chart-4: oklch(0.627 0.265 303.9);
+  --chart-5: oklch(0.645 0.246 16.439);
+
+  /* 7. Sidebar */
+  --sidebar: var(--card);
+  --sidebar-foreground: var(--card-foreground);
+  --sidebar-primary: var(--accent);
+  --sidebar-primary-foreground: var(--primary-foreground);
+  --sidebar-accent: var(--secondary);
+  --sidebar-accent-foreground: var(--secondary-foreground);
+  --sidebar-border: var(--border);
+  --sidebar-ring: var(--ring);
+
+  color-scheme: dark;
+}
+
+/* ========= BASE LAYER ========= */
+
+body {
+  background-color: var(--background);
+  color: var(--foreground);
+}
+
+@layer base {
+  * {
+    @apply border-border outline-ring/50;
+  }
+  body {
+    @apply bg-background text-foreground;
+  }
+}
+
+/* ========= KPI / METRIC TEXT (retain) ========= */
+/* Fit big KPI words (e.g., MOMENTUM) without overflow */
+
+.metric-value {
+  white-space: nowrap;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  line-height: 1.1;
+  letter-spacing: 0;
+  font-size: clamp(1.1rem, 1.6vw + 0.5rem, 2rem);
+  font-weight: 700;
+}
+
+/* iOS / Safari tweak */
+@supports (-webkit-touch-callout: none) {
+  .metric-value {
+    letter-spacing: 0.2px;
+  }
+}
+
+/* ========= Recharts grid (retain) ========= */
+
+.recharts-cartesian-grid-horizontal line,
+.recharts-cartesian-grid-vertical line {
+  opacity: 0.35;
+}
+
+/* ========= Header / Sidebar Glass + Glow (adaptive) ========= */
+
+/* Sidebar keeps glass look */
+aside {
+  background-color: color-mix(in oklch, var(--card) 90%, transparent);
+  backdrop-filter: blur(22px);
+  -webkit-backdrop-filter: blur(22px);
+  border-color: var(--border);
+  box-shadow: 0 0 25px rgba(15, 23, 42, 0.06);
+}
+
+/* Header itself is transparent; NeonHeader handles its own pill */
+header {
+  background-color: transparent;
+  border-color: transparent;
+  box-shadow: none;
+}
+
+/* active link glow - retains your behavior */
+button[data-active="true"] {
+  background:
+    linear-gradient(90deg, var(--accent), transparent) 0% 50% / 4px 100%
+      no-repeat,
+    oklch(0.3 0.05 165 / 0.5);
+  box-shadow: inset 0 0 10px oklch(0.5 0.1 165 / 0.2);
+  color: var(--foreground) !important;
+}
+
+/* ========= Neon logo text (retain) ========= */
+
+.neon-glow-text {
+  animation: neonPulse 6s ease-in-out infinite;
+  color: #b6ffe3;
+}
+
+@keyframes neonPulse {
+  0%,
+  100% {
+    text-shadow:
+      0 0 4px var(--accent),
+      0 0 10px var(--accent),
+      0 0 20px var(--accent);
+    color: #b6ffe3;
+  }
+  50% {
+    text-shadow:
+      0 0 10px var(--accent),
+      0 0 25px var(--accent),
+      0 0 40px var(--accent);
+    color: #ffffff;
+  }
+}
+
+/* ========= Scrollbar Accent (retain) ========= */
+
+::-webkit-scrollbar-thumb {
+  background: oklch(0.5 0.1 165 / 0.3);
+  border-radius: 4px;
+}
+::-webkit-scrollbar-thumb:hover {
+  background: oklch(0.7 0.1 165 / 0.6);
+}
+
+/* ========= Layout helpers (retain) ========= */
+
+:root {
+  --header-h: 56px;
+}
+
+@media (max-width: 1023px) {
+  :root {
+    --header-h: 58px;
+  }
+}
+
+@media (max-width: 360px) {
+  :root {
+    --header-h: 52px;
+  }
+}
+
+/* Push page content below sticky header */
+.body-under-header {
+  padding-top: var(--header-h);
+}
+
+/* Lock scroll when drawer open */
+.drawer-open {
+  overflow: hidden;
+}
+
+/* Dimmed backdrop for drawer/modal */
+.backdrop-dim {
+  position: fixed;
+  inset: 0;
+  background: rgb(0 0 0 / 0.55);
+  -webkit-backdrop-filter: blur(3px);
+  backdrop-filter: blur(3px);
+  z-index: 40;
+}
+/* === Nowa search suggestions: readable in dark mode === */
+
+.dark .nowa-suggest-list {
+  background-color: #040714 !important; /* deep, but not pure black */
+  border-color: #1f2937 !important;
+  color: #ffffff !important;
+}
+
+.dark .nowa-suggest-list button,
+.dark .nowa-suggest-list span,
+.dark .nowa-suggest-list div {
+  color: #ffffff !important;
+}
+
+/* Hover state: subtle emerald tint */
+.dark .nowa-suggest-list button:hover {
+  background-color: rgba(16, 185, 129, 0.16) !important;
+  color: #ffffff !important;
+}
+/* ========= Nowa Insight Strip Animations ========= */
+
+/* Shared hover shimmer for all insight tags */
+.nowa-tag-hover {
+  position: relative;
+  /* overflow: hidden;  ❌ remove this line */
+  overflow: visible;   /* ✅ allow pulse/glow to render outside */
+  transition:
+    background-color 0.25s ease,
+    box-shadow 0.25s ease,
+    transform 0.22s ease,
+    border-color 0.22s ease;
+  background-image: linear-gradient(
+    90deg,
+    rgba(45, 212, 191, 0.04),
+    rgba(56, 189, 248, 0.06),
+    transparent
+  );
+  background-size: 220% 100%;
+  background-position: -40% 0;
+}
+
+.dark .nowa-tag-hover {
+  background-image: linear-gradient(
+    90deg,
+    rgba(16, 185, 129, 0.12),
+    rgba(59, 130, 246, 0.10),
+    transparent
+  );
+}
+
+.nowa-tag-hover:hover {
+  background-position: 100% 0;
+  box-shadow: 0 10px 26px rgba(15, 23, 42, 0.32);
+  transform: translateY(-1px);
+  border-color: rgba(45, 212, 191, 0.38);
+}
+
+/* Subtle pulse for Nowa Bot Signal */
+
+@keyframes nowaPulseLong {
+  0% {
+    box-shadow: 0 0 0 0 rgba(45, 212, 191, 0.32);
+  }
+  70% {
+    box-shadow: 0 0 18px 6px rgba(45, 212, 191, 0);
+  }
+  100% {
+    box-shadow: 0 0 0 0 rgba(45, 212, 191, 0);
+  }
+}
+
+@keyframes nowaPulseShort {
+  0% {
+    box-shadow: 0 0 0 0 rgba(248, 113, 113, 0.32);
+  }
+  70% {
+    box-shadow: 0 0 18px 6px rgba(248, 113, 113, 0);
+  }
+  100% {
+    box-shadow: 0 0 0 0 rgba(248, 113, 113, 0);
+  }
+}
+
+@keyframes nowaPulseNeutral {
+  0% {
+    box-shadow: 0 0 0 0 rgba(56, 189, 248, 0.18);
+  }
+  70% {
+    box-shadow: 0 0 14px 4px rgba(56, 189, 248, 0);
+  }
+  100% {
+    box-shadow: 0 0 0 0 rgba(56, 189, 248, 0);
+  }
+}
+
+.nowa-signal-pulse-long {
+  border-color: rgba(45, 212, 191, 0.75) !important;
+  animation: nowaPulseLong 1.8s ease-in-out infinite;
+}
+
+.nowa-signal-pulse-short {
+  border-color: rgba(248, 113, 113, 0.75) !important;
+  animation: nowaPulseShort 1.8s ease-in-out infinite;
+}
+
+.nowa-signal-pulse-neutral {
+  border-color: rgba(56, 189, 248, 0.6) !important;
+  animation: nowaPulseNeutral 2.2s ease-in-out infinite;
+}

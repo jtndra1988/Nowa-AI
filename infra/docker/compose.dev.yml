@@ -1,0 +1,45 @@
+version: "3.9"
+services:
+  db:
+    image: postgres:16
+    environment:
+      POSTGRES_USER: nowa
+      POSTGRES_PASSWORD: nowa
+      POSTGRES_DB: nowa
+    ports: ["5432:5432"]
+    volumes: [db_data:/var/lib/postgresql/data]
+
+  redis:
+    image: redis:7
+    ports: ["6379:6379"]
+
+  backend:
+    build:
+      context: ../../apps/backend
+    env_file:
+      - ../../apps/backend/.env.dev
+    environment:
+      DATABASE_URL: postgresql+psycopg://nowa:nowa@db:5432/nowa
+      REDIS_URL: redis://redis:6379/0
+      CORS_ORIGINS: http://localhost:3000
+    depends_on: [db, redis]
+    ports: ["8000:8000"]
+    command: uvicorn app.main:app --host 0.0.0.0 --port 8000 --reload
+    volumes:
+      - ../../apps/backend:/app
+
+  frontend:
+    build:
+      context: ../../apps/frontend
+    env_file:
+      - ../../apps/frontend/.env.local
+    environment:
+      NEXT_PUBLIC_API_BASE: http://localhost:8000
+    depends_on: [backend]
+    ports: ["3000:3000"]
+    command: npm run dev
+    volumes:
+      - ../../apps/frontend:/usr/src/app
+
+volumes:
+  db_data:

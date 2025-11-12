@@ -23,9 +23,9 @@ except ImportError:
     from app.api.v1.settings import router as settings_router
 def create_app() -> FastAPI:
     app = FastAPI(
-        title="MARS Bot API",
+        title="Nowa API",
         version="2.0.0",
-        contact={"name": "Your Team"},
+        contact={"name": "Jiten"},
         openapi_tags=[
             {"name": "health", "description": "Liveness & readiness probes"},
             {"name": "core", "description": "Core market/options endpoints"},
@@ -42,7 +42,7 @@ def create_app() -> FastAPI:
     allowed = getattr(settings, "CORS_ALLOW_ORIGINS", ["*"])
     app.add_middleware(
         CORSMiddleware,
-        allow_origins=allowed,
+        allow_origins=["http://localhost:3000"],
         allow_credentials=True,
         allow_methods=["*"],
         allow_headers=["*"],

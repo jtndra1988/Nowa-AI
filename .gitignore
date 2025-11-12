@@ -31,3 +31,8 @@ pnpm-lock.yaml
 **/dist/
 **/build/
 **/out/
+# .gitignore
+wheels/*
+!wheels/pandas_ta-0.3.14b0-py3-none-any.whl
+# root env
+.env

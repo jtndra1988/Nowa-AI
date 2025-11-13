@@ -1,45 +1,112 @@
-version: "3.9"
+# (no top-level "version" needed for modern Docker Compose)
+
 services:
+  # ---------------- DB ----------------
   db:
     image: postgres:16
     environment:
       POSTGRES_USER: nowa
       POSTGRES_PASSWORD: nowa
       POSTGRES_DB: nowa
-    ports: ["5432:5432"]
-    volumes: [db_data:/var/lib/postgresql/data]
+    ports:
+      - "5432:5432"
+    volumes:
+      - db_data:/var/lib/postgresql/data
 
+  # ---------------- Redis ----------------
   redis:
     image: redis:7
-    ports: ["6379:6379"]
+    ports:
+      - "6379:6379"
 
+  # ---------------- Backend (FastAPI) ----------------
   backend:
     build:
       context: ../../apps/backend
+      dockerfile: Dockerfile
+    image: docker-backend
+    container_name: backend
+    command: uvicorn app.main:app --host 0.0.0.0 --port 8000
+    ports:
+      - "8000:8000"
     env_file:
       - ../../apps/backend/.env.dev
-    environment:
-      DATABASE_URL: postgresql+psycopg://nowa:nowa@db:5432/nowa
-      REDIS_URL: redis://redis:6379/0
-      CORS_ORIGINS: http://localhost:3000
-    depends_on: [db, redis]
-    ports: ["8000:8000"]
-    command: uvicorn app.main:app --host 0.0.0.0 --port 8000 --reload
-    volumes:
-      - ../../apps/backend:/app
+    depends_on:
+      - db
+      - redis
+    restart: always
 
+  # ---------------- Frontend (Next.js) ----------------
   frontend:
     build:
       context: ../../apps/frontend
-    env_file:
-      - ../../apps/frontend/.env.local
+      dockerfile: Dockerfile
     environment:
-      NEXT_PUBLIC_API_BASE: http://localhost:8000
-    depends_on: [backend]
-    ports: ["3000:3000"]
-    command: npm run dev
+      NODE_ENV: development
+      # Make sure your frontend uses this:
+      # NEXT_PUBLIC_API_BASE=http://localhost:8000
+    ports:
+      - "3000:3000"
+    depends_on:
+      - backend
+
+  # ---------------- Celery Worker ----------------
+  celery:
+    build:
+      context: ../../apps/backend
+      dockerfile: Dockerfile
+    env_file:
+      - ../../apps/backend/.env.dev
+    environment:
+      PYTHONPATH: /app
     volumes:
-      - ../../apps/frontend:/usr/src/app
+      - ../../apps/backend:/app
+    command: ["celery", "-A", "app.celery_app.worker.celery_app", "worker", "--loglevel=info", "-E"]
+    depends_on:
+      - backend
+      - redis
+      - db
+
+  # ---------------- Celery Beat (scheduler) ----------------
+  beat:
+    build:
+      context: ../../apps/backend
+      dockerfile: Dockerfile
+    env_file:
+      - ../../apps/backend/.env.dev
+    environment:
+      PYTHONPATH: /app
+    volumes:
+      - ../../apps/backend:/app
+      - beatdata:/beatdata
+    command: ["celery", "-A", "app.celery_app.worker.celery_app", "beat", "--loglevel=info", "--schedule=/beatdata/celerybeat-schedule"]
+    depends_on:
+      - backend
+      - redis
+      - db
+
+  # ---------------- Prometheus ----------------
+  prometheus:
+    image: prom/prometheus:latest
+    # Host path: C:\Nowa\monitoring\prometheus
+    # Make sure prometheus.yml exists there
+    volumes:
+      - ../../monitoring/prometheus:/etc/prometheus:ro
+    command:
+      - "--config.file=/etc/prometheus/prometheus.yml"
+    ports:
+      - "9090:9090"
+    depends_on:
+      - backend
+
+  # ---------------- Grafana (optional) ----------------
+  grafana:
+    image: grafana/grafana:latest
+    ports:
+      - "3001:3000"
+    depends_on:
+      - prometheus
 
 volumes:
   db_data:
+  beatdata:

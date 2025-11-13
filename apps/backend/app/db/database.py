@@ -3,11 +3,8 @@
 import logging
 from sqlalchemy import create_engine
 from sqlalchemy.orm import sessionmaker
-
 from app.core.config import settings
-from .base import Base
-from .models import ModelVersion
-
+from .models import Base, ModelVersion
 logger = logging.getLogger(__name__)
 
 # Engine & Session

@@ -3,7 +3,7 @@ import os, json, time, redis
 import psycopg2, psycopg2.extras as extras
 
 REDIS_URL = os.getenv("REDIS_URL","redis://redis:6379/0")
-PG_URL = os.getenv("SQLALCHEMY_DATABASE_URI","postgresql://app:app@db:5432/appdb").replace("+psycopg2","")
+PG_URL = os.getenv("SQLALCHEMY_DATABASE_URI","postgresql://nowa:nowa@db:5432/nowa").replace("+psycopg2","")
 r = redis.Redis.from_url(REDIS_URL)
 
 def write_loop(symbol="BTCUSDT"):

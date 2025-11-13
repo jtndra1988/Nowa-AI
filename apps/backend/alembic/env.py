@@ -9,11 +9,11 @@ import os
 config = context.config
 
 # Load environment variables
-POSTGRES_USER = os.getenv("POSTGRES_USER", "appuser")
-POSTGRES_PASSWORD = os.getenv("POSTGRES_PASSWORD", "yoursecurepassword")
+POSTGRES_USER = os.getenv("POSTGRES_USER", "nowa")
+POSTGRES_PASSWORD = os.getenv("POSTGRES_PASSWORD", "nowa")
 POSTGRES_HOST = os.getenv("POSTGRES_HOST", "db")
 POSTGRES_PORT = os.getenv("POSTGRES_PORT", "5432")
-POSTGRES_DB = os.getenv("POSTGRES_DB", "appdb")
+POSTGRES_DB = os.getenv("POSTGRES_DB", "nowa")
 
 # Build connection URL dynamically
 db_url = f"postgresql://{POSTGRES_USER}:{POSTGRES_PASSWORD}@{POSTGRES_HOST}:{POSTGRES_PORT}/{POSTGRES_DB}"

@@ -8,6 +8,7 @@ from app.api.v1.predict import router as v1_predict_router
 from app.api.v1.brain import router as brain_router  # 👈 NEW import
 from app.core.config import settings
 from starlette_exporter import PrometheusMiddleware, handle_metrics  # type: ignore
+from prometheus_client import make_asgi_app
 # --- ADDED: Import our new ML service and DB seeder ---
 from app.services.inference_service import inference_service
 from app.db.database import init_db  # <-- NEW IMPORT
@@ -47,6 +48,9 @@ def create_app() -> FastAPI:
         allow_methods=["*"],
         allow_headers=["*"],
     )
+    @app.get("/health", tags=["health"])
+    async def health_check():
+     return {"status": "ok"}
     # Prometheus
     app.add_middleware(
         PrometheusMiddleware, app_name="ml-trading-api", group_paths=True

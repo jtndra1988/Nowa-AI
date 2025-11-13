@@ -28,7 +28,7 @@ import pandas as pd
 # --- CONFIG --- #
 
 # Prefer reading from env; fallback to typical local URL
-DB_URL = os.getenv("DATABASE_URL", "postgresql://appuser:yoursecurepassword@db:5432/appdb")
+DB_URL = os.getenv("DATABASE_URL", "postgresql://nowa:nowa@db:5432/nowa")
 
 # Horizon to evaluate outcome (in minutes)
 HORIZON_MINUTES = 60  # e.g. 1h forward return

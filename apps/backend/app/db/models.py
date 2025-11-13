@@ -16,11 +16,8 @@ from sqlalchemy import (
     ForeignKey,
 )
 from sqlalchemy.sql import func
-from sqlalchemy.orm import relationship
-
-from .base import Base
-
-
+from sqlalchemy.orm import relationship , declarative_base
+Base = declarative_base()
 class MarketData(Base):
     __tablename__ = "market_data"
 
@@ -291,6 +288,8 @@ class RiskSettingsGlobal(Base):
     __tablename__ = "risk_settings_global"
 
     id = Column(Integer, primary_key=True)
+    symbol = Column(String, index=True, unique=True, nullable=False)
+    is_active = Column(Boolean, default=True, nullable=False)
     account_equity_usd = Column(Float, nullable=False, default=100000.0)
     max_portfolio_leverage = Column(Float, nullable=False, default=2.0)
     max_concurrent_positions = Column(Integer, nullable=False, default=10)
@@ -412,7 +411,7 @@ class ModelVersion(Base):
         DateTime(timezone=True),
         server_default=func.now(),
     )
-    metadata = Column(JSON, nullable=True)
+    model_metadata = Column("metadata", JSON, nullable=True)
 
 
 class Prediction(Base):

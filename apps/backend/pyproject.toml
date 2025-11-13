@@ -10,6 +10,7 @@ packages = [{include = "app", from = "."}]
 python = "^3.10"
 fastapi = "0.109.2"
 uvicorn = {extras = ["standard"], version = "0.27.1"}
+psycopg = { extras = ["binary"], version = "^3.1" }
 sqlalchemy = "2.0.27"
 psycopg2-binary = "2.9.9"
 alembic = "1.13.1"
@@ -17,16 +18,17 @@ celery = {extras = ["redis"], version = "5.3.6"}
 redis = "5.0.1"
 pydantic-settings = "2.1.0"
 requests = "2.31.0"
-pandas = "2.2.0"
+yfinance = "^0.2.40"
+pandas = "2.2.2"
 numpy = "1.26.4"
 scipy = "1.12.0"
 vaderSentiment = "3.3.2"
 prometheus-fastapi-instrumentator = "6.1.0"
 starlette-exporter = "0.20.0"
-py-bybit = "3.1.2"
 apscheduler = "3.10.4"
 colorlog = "6.8.2"
-
+ccxt = "^4.3"
+transformers = "^4.45.0"
 # --- ADDED NEW ML DEPENDENCIES ---
 torch = "^2.2.0"
 xgboost = "^2.0.3"

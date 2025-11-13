@@ -4,6 +4,24 @@ from sqlalchemy.orm import Session
 from app.db.models import RiskSettingsGlobal, RiskSettingsSymbol, RiskLearnedState
 
 DEFAULT_REGIME = {0:0.8, 1:1.1, 2:1.0}
+# ------------------------------------------------------------------------
+# Simple class wrapper so Celery worker can use a RiskSettingsService
+# without import errors.
+# ------------------------------------------------------------------------
+class RiskSettingsService:
+    """
+    Thin wrapper around the existing risk settings helpers.
+    Used by the Celery worker to load all symbol-level risk configs.
+    """
+
+    def __init__(self, db: Session):
+        self.db = db
+
+    def get_all_settings(self):
+        """
+        Returns all RiskSettingsSymbol rows so the worker can cache them.
+        """
+        return self.db.query(RiskSettingsSymbol).all()
 
 def load_risk_settings(db: Session, symbol: str) -> Dict[str, Any]:
     g: RiskSettingsGlobal = db.query(RiskSettingsGlobal).order_by(RiskSettingsGlobal.id.asc()).first()

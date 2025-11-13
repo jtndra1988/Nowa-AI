@@ -1,52 +1,43 @@
-from celery import Celery
+# app/celery_app/app.py
+
+from celery import Celery, Task # <--- Import Task
 from app.core.config import settings
-import os
-celery_app = Celery(
-    "worker",
-    broker=os.getenv("CELERY_BROKER_URL", f"redis://{settings.REDIS_HOST}:{settings.REDIS_PORT}/0"),
-    backend=os.getenv("CELERY_RESULT_BACKEND", f"redis://{settings.REDIS_HOST}:{settings.REDIS_PORT}/0"),
-)
+import logging
 
+logger = logging.getLogger(__name__)
+
+# Single global Celery app
+celery_app = Celery("mars_worker")
+
+# ✅ Use UPPERCASE attributes from settings.py
+celery_app.conf.broker_url = settings.CELERY_BROKER_URL
+celery_app.conf.result_backend = settings.CELERY_RESULT_BACKEND
+
+# Basic config
 celery_app.conf.update(
-    task_routes={"app.tasks.*": {"queue": "default"}},
     task_serializer="json",
-    result_serializer="json",
     accept_content=["json"],
-    task_always_eager=False,
+    result_serializer="json",
     timezone="UTC",
+    enable_utc=True,
 )
 
-# --------------------------------
-# Autodiscover and log confirmation
-# --------------------------------
+# Only look in our app.tasks package
 celery_app.autodiscover_tasks(["app.tasks"])
 
-print("[✅] Celery autodiscovery initialized for app.tasks")
-
-# --------------------------------
-# Retryable Base Task
-# --------------------------------
-class BaseTaskWithRetry(celery_app.Task):
+# ==========================================
+# ✅ ADD THIS CLASS DEFINITION
+# ==========================================
+class BaseTaskWithRetry(Task):
+    """
+    Base task that retries automatically on failure.
+    """
     autoretry_for = (Exception,)
-    retry_kwargs = {"max_retries": 3, "countdown": 5}
     retry_backoff = True
+    retry_backoff_max = 600  # 10 minutes
     retry_jitter = True
+    max_retries = 3
 
-# --------------------------------
-# Fallback explicit imports
-# --------------------------------
-try:
-    import app.tasks.collectors
-    import app.tasks.sentiment_collector
-    import app.tasks.cross_asset_corre_collector
-    import app.tasks.funding_collector
-    import app.tasks.github_collector
-    import app.tasks.onchain_collector
-    import app.tasks.options_metrics_collector
-    import app.tasks.sentiment_fusion_collector
-    import app.tasks.training_tasks
-    import app.tasks.orderbook_collector
-    import app.tasks.sentiment_scorer
-    print("[✅] All fallback task modules imported successfully.")
-except Exception as e:
-    print(f"[!] Task import failed during Celery init: {e}")
+    def on_failure(self, exc, task_id, args, kwargs, einfo):
+        logger.error(f"Task {self.name} (ID: {task_id}) failed: {exc}")
+        super().on_failure(exc, task_id, args, kwargs, einfo)

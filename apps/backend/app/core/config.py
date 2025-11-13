@@ -22,7 +22,9 @@ class Settings(BaseSettings):
             f"postgresql+psycopg2://{self.POSTGRES_USER}:{self.POSTGRES_PASSWORD}"
             f"@{self.POSTGRES_HOST}:{self.POSTGRES_PORT}/{self.POSTGRES_DB}"
         )
-
+    # --- Redis ---
+    REDIS_HOST: str 
+    REDIS_PORT: int
     # --- General ---
     ENVIRONMENT: str = Field(default="development")
     SECRET_KEY: str
@@ -53,11 +55,24 @@ class Settings(BaseSettings):
     LUNARCRUSH_API_KEY: str
     CRYPTOPANIC_API_KEY: str
     COINMARKETCAP_API_KEY: str
-
+    TG_BOT_TOKEN:str
+    TG_CHAT_ID:str
+    GEMINI_API_KEY:str
     class Config:
         env_file = ENV_PATH
         env_file_encoding = "utf-8"
 
+    @property
+    def CELERY_BROKER_URL(self) -> str:
+        return f"redis://{self.REDIS_HOST}:{self.REDIS_PORT}/0"
 
+    @property
+    def CELERY_RESULT_BACKEND(self) -> str:
+        return f"redis://{self.REDIS_HOST}:{self.REDIS_PORT}/0"
+    
+    @property
+    def celery_broker_url(self) -> str:
+        """Alias for lowercase access if your app.py uses settings.celery_broker_url"""
+        return self.CELERY_BROKER_URL
 # ✅ Instantiate settings at import
 settings = Settings()

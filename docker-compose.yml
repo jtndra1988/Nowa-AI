@@ -2,9 +2,9 @@ services:
   db:
     image: postgres:15-alpine
     environment:
-      POSTGRES_DB: appdb
-      POSTGRES_USER: appuser
-      POSTGRES_PASSWORD: yoursecurepassword
+      POSTGRES_DB: nowa
+      POSTGRES_USER: nowa
+      POSTGRES_PASSWORD: nowa
     ports: ["5432:5432"]
     volumes:
       - dbdata:/var/lib/postgresql/data
@@ -22,7 +22,7 @@ services:
     command: uvicorn app.main:app --host 0.0.0.0 --port 8000 --reload
     environment:
       PYTHONPATH: /app
-      DATABASE_URL: postgresql+psycopg2://appuser:yoursecurepassword@db:5432/appdb
+      DATABASE_URL: postgresql+psycopg2://nowa:nowa@db:5432/nowa
       REDIS_URL: redis://redis:6379/0
       CELERY__BROKER_URL: redis://redis:6379/0
       CELERY__RESULT_BACKEND: redis://redis:6379/1
@@ -40,7 +40,7 @@ services:
     command: ["celery", "-A", "app.celery_app.worker", "worker", "--loglevel=debug", "-E"]
     environment:
       PYTHONPATH: /app
-      DATABASE_URL: postgresql+psycopg2://appuser:yoursecurepassword@db:5432/appdb
+      DATABASE_URL: postgresql+psycopg2://nowa:nowa@db:5432/nowa
       CELERY_BROKER_URL: redis://redis:6379/0
       CELERY_RESULT_BACKEND: redis://redis:6379/0
       TZ: UTC
@@ -52,7 +52,7 @@ services:
       - redis
     restart: unless-stopped
     healthcheck:
-      test: ["CMD-SHELL", "python - <<'PY'\nimport redis,psycopg2;redis.Redis(host='redis',port=6379,db=0).ping();psycopg2.connect('dbname=appdb user=appuser password=yoursecurepassword host=db port=5432');print('OK')\nPY"]
+      test: ["CMD-SHELL", "python - <<'PY'\nimport redis,psycopg2;redis.Redis(host='redis',port=6379,db=0).ping();psycopg2.connect('dbname=nowa user=nowa password=nowa host=db port=5432');print('OK')\nPY"]
       interval: 30s
       timeout: 5s
       retries: 3
@@ -63,7 +63,7 @@ services:
     command: ["celery", "-A", "app.celery_app.worker", "beat", "--loglevel=info"]
     environment:
       PYTHONPATH: /app
-      DATABASE_URL: postgresql+psycopg2://appuser:yoursecurepassword@db:5432/appdb
+      DATABASE_URL: postgresql+psycopg2://nowa:nowa@db:5432/nowa
       CELERY_BROKER_URL: redis://redis:6379/0
       CELERY_RESULT_BACKEND: redis://redis:6379/0
       TZ: UTC

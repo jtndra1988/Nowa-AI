@@ -1,11 +1,53 @@
 from __future__ import annotations
 
-from datetime import datetime
+from datetime import date, datetime
 from typing import Any, Dict, Optional, Literal, List
 
-from pydantic import BaseModel, Field
+from pydantic import BaseModel, Field, ConfigDict
+
+# ---------- Common small shapes ----------
+class TimePoint(BaseModel):
+    t: datetime | str  # allow ISO string or datetime
+    v: float
+
+    model_config = ConfigDict(from_attributes=True)
 
 
+# ---------- Option instruments (used by options endpoints) ----------
+class OptionInstrument(BaseModel):
+    symbol: str = Field(..., description="Underlying, e.g., BTCUSDT")
+    expiry: date = Field(..., description="YYYY-MM-DD")
+    strike: float = Field(..., gt=0)
+    option_type: Literal["C", "P", "call", "put"]
+    exchange: Optional[str] = None
+    underlying: Optional[str] = None
+
+    model_config = ConfigDict(from_attributes=True)
+
+
+# ---------- Market Intel responses ----------
+class SentimentResponse(BaseModel):
+    latest_score: float = Field(..., description="Latest sentiment score")
+    label: str = Field(..., description="Human label for score, e.g., Bullish/Bearish/Neutral")
+    series: List[TimePoint] = Field(default_factory=list, description="Time series for plotting")
+
+    model_config = ConfigDict(from_attributes=True)
+
+
+class OnchainResponse(BaseModel):
+    latest_value: float = Field(..., description="Latest on-chain metric (e.g., active addrs)")
+    label: str = Field(..., description="Human label")
+    series: List[TimePoint] = Field(default_factory=list)
+
+    model_config = ConfigDict(from_attributes=True)
+
+
+class DeveloperResponse(BaseModel):
+    latest_value: float = Field(..., description="Latest dev-activity metric")
+    label: str = Field(..., description="Human label")
+    series: List[TimePoint] = Field(default_factory=list)
+
+    model_config = ConfigDict(from_attributes=True)
 # =============================================================================
 # Market Context
 # =============================================================================

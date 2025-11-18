@@ -418,3 +418,28 @@ button[data-active="true"] {
   border-color: rgba(56, 189, 248, 0.6) !important;
   animation: nowaPulseNeutral 2.2s ease-in-out infinite;
 }
+@keyframes pulseLine {
+  0% {
+    transform: translateX(-40%);
+    opacity: 0;
+  }
+  20% {
+    opacity: 1;
+  }
+  50% {
+    transform: translateX(0%);
+    opacity: 1;
+  }
+  80% {
+    transform: translateX(40%);
+    opacity: 1;
+  }
+  100% {
+    transform: translateX(80%);
+    opacity: 0;
+  }
+}
+
+.pulse-line {
+  animation: pulseLine 2.6s ease-in-out infinite;
+}

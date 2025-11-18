@@ -2,87 +2,70 @@
 
 import React from "react";
 
-type Props = {
-  /** sentiment value in [0,1]; caller can normalize however they like */
-  value: number;
-};
+interface SentimentRingProps {
+  score: number; // 0 to 100
+  size?: number;
+  strokeWidth?: number;
+}
 
-export default function SentimentRing({ value }: Props) {
-  const safe = Number.isFinite(value)
-    ? Math.max(0, Math.min(1, value))
-    : 0.5;
+export default function SentimentRing({
+  score,
+  size = 56,
+  strokeWidth = 4,
+}: SentimentRingProps) {
+  // Calculate circle parameters
+  const radius = (size - strokeWidth) / 2;
+  const circumference = radius * 2 * Math.PI;
+  const offset = circumference - (score / 100) * circumference;
 
-  const pct = Math.round(safe * 100);
+  // Determine color based on score (matching your dashboard logic)
+  const getColor = (s: number) => {
+    if (s >= 60) return "text-emerald-400";
+    if (s <= 40) return "text-rose-400";
+    return "text-sky-400";
+  };
 
-  const r = 52;
-  const strokeWidth = 10;
-  const circumference = 2 * Math.PI * r;
-  const offset = circumference * (1 - safe);
-
-  const color =
-    safe > 0.66
-      ? "#22c55e" // strong risk-on
-      : safe > 0.55
-      ? "#4ade80"
-      : safe < 0.34
-      ? "#fb7185" // strong risk-off
-      : safe < 0.45
-      ? "#f97316"
-      : "#38bdf8";
-
-  const label =
-    safe > 0.66
-      ? "Risk-On"
-      : safe > 0.55
-      ? "Tilt On"
-      : safe < 0.34
-      ? "Risk-Off"
-      : safe < 0.45
-      ? "Tilt Off"
-      : "Neutral";
+  const colorClass = getColor(score);
 
   return (
-    <div className="relative flex items-center justify-center">
+    <div
+      className="relative flex items-center justify-center"
+      style={{ width: size, height: size }}
+    >
+      {/* SVG container */}
       <svg
-        width={140}
-        height={140}
-        className="transition-all duration-700"
+        width={size}
+        height={size}
+        className="transform -rotate-90 transition-all duration-500"
       >
-        {/* background track */}
+        {/* Background track */}
         <circle
-          cx={70}
-          cy={70}
-          r={r}
+          cx={size / 2}
+          cy={size / 2}
+          r={radius}
           fill="transparent"
-          stroke="rgba(148,163,253,0.14)"
+          stroke="currentColor"
           strokeWidth={strokeWidth}
+          className="text-slate-800"
         />
-        {/* progress arc */}
+        {/* Progress arc */}
         <circle
-          cx={70}
-          cy={70}
-          r={r}
+          cx={size / 2}
+          cy={size / 2}
+          r={radius}
           fill="transparent"
-          stroke={color}
+          stroke="currentColor"
           strokeWidth={strokeWidth}
-          strokeLinecap="round"
-          strokeDasharray={`${circumference} ${circumference}`}
+          strokeDasharray={circumference}
           strokeDashoffset={offset}
-          className="transition-all duration-700 ease-out"
-          style={{
-            transformOrigin: "50% 50%",
-            transform: "rotate(-90deg)",
-            filter: `drop-shadow(0 0 14px ${color}66)`,
-          }}
+          strokeLinecap="round"
+          className={`transition-all duration-700 ease-out ${colorClass}`}
         />
       </svg>
-
-      {/* center label */}
-      <div className="absolute flex flex-col items-center justify-center">
-        <div className="text-sm font-semibold text-slate-50">
-          {pct}%
-        </div>
-        <div className="text-[9px] text-slate-400">{label}</div>
+      
+      {/* Optional center percentage (small) */}
+      <div className={`absolute text-[10px] font-semibold ${colorClass}`}>
+        {Math.round(score)}
       </div>
     </div>
   );

@@ -8,61 +8,47 @@ import React, {
   useState,
   FormEvent,
 } from "react";
-import { motion } from "framer-motion";
 import {
   Menu,
   Search,
-  Store,
   TrendingUp,
   TrendingDown,
   Minus,
-  Shield,
-  Send,
 } from "lucide-react";
-import { useTheme } from "next-themes";
-import API, {
-  EXCHANGES,
-  MarketMode,
-  SymbolCode,
-} from "@/lib/api";
+import API, { MarketMode, SymbolCode } from "@/lib/api";
 import {
   LineChart,
   Line,
   ResponsiveContainer,
 } from "recharts";
 import { getIconSrcForSymbol } from "@/lib/cryptoIcons";
-import {
-  useAllowedExchanges,
-  useWorkspaceLabel,
-} from "@/lib/profile";
 
 type Props = {
   symbol: SymbolCode;
-  mode: MarketMode;
-  exchange: string;
   onSetSymbol: (s: SymbolCode) => void;
-  onSetMode: (m: MarketMode) => void;
-  onSetExchange: (e: string) => void;
+  activeTab: string;
+  onTabChange: (id: string) => void;
   isMobile?: boolean;
   onToggleSidebar?: () => void;
 };
 
+const DEFAULT_MODE: MarketMode = "futures";
+
+const navItems = [
+  { id: "dashboard", label: "Dashboard" },
+  { id: "strategies", label: "Strategies" },
+  { id: "intel", label: "Market Intel" },
+  { id: "system", label: "System" },
+] as const;
+
 const NeonHeader: React.FC<Props> = ({
   symbol,
-  mode,
-  exchange,
   onSetSymbol,
-  onSetMode,
-  onSetExchange,
+  activeTab,
+  onTabChange,
   isMobile = false,
   onToggleSidebar,
 }) => {
-  const { resolvedTheme } = useTheme();
-  const isDark = resolvedTheme === "dark";
-
-  const allowedExchanges = useAllowedExchanges();
-  const workspace = useWorkspaceLabel();
-
   // ---------- ticker + sparkline ----------
   const [ticker, setTicker] = useState({ price: 0, change: 0 });
   const [miniPrices, setMiniPrices] = useState<{ p: number }[]>([]);
@@ -117,12 +103,12 @@ const NeonHeader: React.FC<Props> = ({
       ticker.price > lastPrice.current
         ? "up"
         : ticker.price < lastPrice.current
-        ? "down"
-        : "none";
+          ? "down"
+          : "none";
 
     if (dir !== "none") {
       setFlash(dir);
-      const id = setTimeout(() => setFlash("none"), 220);
+      const id = setTimeout(() => setFlash("none"), 260);
       lastPrice.current = ticker.price;
       return () => clearTimeout(id);
     }
@@ -137,9 +123,9 @@ const NeonHeader: React.FC<Props> = ({
   const assets = useMemo(
     () =>
       API.TOP_ASSETS.map((a: any) =>
-        API.formatSymbol(a, mode)
+        API.formatSymbol(a, DEFAULT_MODE)
       ) as SymbolCode[],
-    [mode]
+    []
   );
 
   useEffect(() => {
@@ -209,288 +195,276 @@ const NeonHeader: React.FC<Props> = ({
   // ---------- styles ----------
   const priceColor =
     ticker.change > 0
-      ? "text-emerald-500 dark:text-emerald-300"
+      ? "text-emerald-400"
       : ticker.change < 0
-      ? "text-rose-500 dark:text-rose-300"
-      : "text-slate-500 dark:text-slate-400";
+        ? "text-rose-400"
+        : "text-slate-400";
 
   const sparkColor =
     ticker.change >= 0 ? "#22c55e" : "#fb7185";
 
   const desktopWrapper =
-    "hidden md:flex w-full relative items-center gap-4 rounded-3xl border px-6 py-3 " +
-    "border-border bg-[color-mix(in_oklch,var(--card)_96%,transparent)] backdrop-blur-xl " +
-    "shadow-[0_14px_40px_rgba(15,23,42,0.06)] " +
-    "dark:border-slate-800/70 dark:bg-slate-950/70";
+    "hidden md:flex w-full items-center gap-4 rounded-[26px] px-5 py-2.5 " +
+    "border border-slate-800/70 bg-gradient-to-br from-slate-950/95 via-slate-950/92 to-slate-900/88 " +
+    "shadow-[0_16px_50px_rgba(15,23,42,0.9)] backdrop-blur-2xl";
 
   const searchWrapperDesktop =
-    "relative flex-1 h-12 rounded-2xl flex items-center px-4 border " +
-    "bg-white/90 border-border shadow-soft-sm " +
-    "dark:bg-slate-950/92 dark:border-slate-700/70";
+    "relative w-[80%] min-w-[340px] h-10 rounded-2xl flex items-center px-4 border transition-all " +
+    "bg-slate-950/80 border-slate-800/80 hover:bg-slate-900/80 shadow-inner";
+
 
   const searchInputText =
-    "w-full bg-transparent text-sm outline-none " +
-    "text-slate-900 placeholder:text-slate-500 " +
-    "dark:text-white dark:placeholder:text-slate-500";
-
-  const modesWrapper =
-    "flex h-12 items-center rounded-2xl px-1 " +
-    "bg-[var(--muted)] border border-[var(--border)] shadow-soft-sm " +
-    "dark:bg-white/5 dark:border-slate-700/60";
-
-  const exchangeWrapper =
-    "flex h-12 items-center gap-2 rounded-2xl px-3 border " +
-    "bg-white/90 border-border shadow-soft-sm " +
-    "dark:bg-slate-950/95 dark:border-slate-700/70";
-
-  const priceBlock =
-    "flex h-12 items-center gap-3 rounded-2xl px-4 border shadow-inner " +
-    "bg-[var(--primary)]/6 border-[var(--primary)]/35 " +
-    "dark:bg-slate-950/98 dark:border-slate-700/80";
+    "w-full bg-transparent text-xs md:text-sm outline-none " +
+    "text-slate-100 placeholder:text-slate-500";
 
   const suggestionListDesktop =
-    "absolute left-0 right-0 top-[110%] z-30 max-h-64 overflow-y-auto rounded-2xl border shadow-2xl backdrop-blur-md text-[10px] " +
-    "bg-white border-slate-200 " +
-    "dark:bg-slate-950/98 dark:border-slate-700/70";
+    "absolute left-0 right-0 top-[112%] z-50 max-h-64 overflow-y-auto rounded-2xl border shadow-2xl backdrop-blur-xl text-[10px] " +
+    "bg-slate-950/98 border-slate-800";
 
-  const mobileWrapper =
-    "md:hidden relative mt-2";
+  const priceBlock =
+    "flex h-9 items-center gap-3 rounded-2xl px-4 border " +
+    "bg-slate-950/85 border-slate-800/80 shadow-[0_0_0_1px_rgba(15,23,42,0.9)] " +
+    "relative overflow-hidden";
+
+  const mobileWrapper = "md:hidden relative mt-2";
   const mobileInner =
-    "relative flex flex-col gap-2 rounded-3xl border px-3.5 py-2.5 shadow-soft-lg " +
-    "border-border bg-[color-mix(in_oklch,var(--card)_96%,transparent)] backdrop-blur-xl " +
-    "dark:border-teal-500/15 dark:bg-slate-950/95";
+    "relative flex flex-col gap-2 rounded-3xl border px-3.5 py-2.5 shadow-[0_18px_40px_rgba(15,23,42,0.9)] " +
+    "border-slate-900/80 bg-gradient-to-br from-slate-950/98 via-slate-950/96 to-slate-900/92 backdrop-blur-xl";
 
   const mobileSearchWrapper =
     "flex items-center h-9 rounded-2xl px-3 border " +
-    "bg-white/95 border-border shadow-soft-sm " +
-    "dark:bg-slate-900/92 dark:border-slate-700";
+    "bg-slate-950/90 border-slate-800 shadow-inner";
 
   const mobileSearchInput =
     "w-full bg-transparent text-[11px] outline-none " +
-    "text-slate-800 placeholder:text-slate-400 " +
-    "dark:text-slate-100 dark:placeholder:text-slate-500";
+    "text-slate-100 placeholder:text-slate-500";
 
   const suggestionListMobile =
-    "absolute left-0 right-0 top-[105%] z-30 max-h-56 overflow-y-auto rounded-2xl border shadow-2xl backdrop-blur-md text-[9px] " +
-    "bg-white border-slate-200 " +
-    "dark:bg-slate-950/98 dark:border-slate-800";
+    "absolute left-0 right-0 top-[105%] z-50 max-h-56 overflow-y-auto rounded-2xl border shadow-2xl backdrop-blur-xl text-[9px] " +
+    "bg-slate-950/98 border-slate-800";
 
   const suggestionButton =
-    "flex w-full items-center justify-between px-3 py-1.5 transition-all hover:bg-emerald-500/8";
+    "flex w-full items-center justify-between px-3 py-1.5 transition-all hover:bg-emerald-500/10";
 
   // ---------- RENDER ----------
   return (
     <>
       {/* DESKTOP / TABLET */}
       <div className={desktopWrapper}>
-        {/* Search */}
-        <form
-          onSubmit={handleSubmit}
-          className={searchWrapperDesktop}
-        >
-          <Search className="w-4 h-4 text-slate-500 mr-2" />
-          <input
-            value={q}
-            onChange={(e) => setQ(e.target.value)}
-            placeholder="Search market & hit Enter"
-            className={searchInputText}
-            onFocus={() => suggestions.length && setOpen(true)}
-            onBlur={() => {
-              setTimeout(() => setOpen(false), 120);
-            }}
-          />
-          {open && suggestions.length > 0 && (
-            <div className={suggestionListDesktop}>
-              {suggestions.map((s) => {
-                const iconSrc = getIconSrcForSymbol(s);
-                const price =
-                  prices[s] !== undefined
-                    ? prices[s].toLocaleString("en-US", {
+        {/* LEFT CLUSTER: NOWA + AI Pulse + SEARCH */}
+        <div className="flex items-center gap-3 flex-[2] justify-end min-w-0">
+
+          {/* NOWA logo + AI Pulse */}
+          <div className="flex items-center gap-4 rounded-2xl px-5 py-3 bg-slate-950/95 border border-emerald-500/60 shadow-[0_0_42px_rgba(16,185,129,0.95)] select-none min-w-[220px]">
+
+            <div className="relative">
+              {/* pulse ring */}
+              <span className="absolute inset-0 rounded-full bg-emerald-500/40 blur-md opacity-70 animate-ping" />
+              <div className="relative flex items-center justify-center w-11 h-11 rounded-full bg-slate-950 border border-emerald-400/70 shadow-[0_0_22px_rgba(16,185,129,0.9)]">
+                <img
+                  src="/nowa.png"
+                  alt="Nowa"
+                  className="h-7 w-auto object-contain drop-shadow-[0_0_32px_rgba(16,185,129,1)]"
+                />
+              </div>
+
+            </div>
+            <div className="flex flex-col leading-tight">
+              <span className="text-[11px] font-semibold tracking-wide text-slate-100">
+                NOWA
+              </span>
+              <span className="flex items-center gap-1 text-[10px] text-emerald-300/95">
+                <span className="h-1.5 w-1.5 rounded-full bg-emerald-400 shadow-[0_0_12px_rgba(16,185,129,0.9)]" />
+                AI Pulse • Live
+              </span>
+            </div>
+          </div>
+
+          {/* Search */}
+          <form
+            onSubmit={handleSubmit}
+            className={searchWrapperDesktop}
+          >
+            <Search className="w-4 h-4 text-slate-500 mr-2" />
+            <input
+              value={q}
+              onChange={(e) => setQ(e.target.value)}
+              placeholder="Type cryptocurrency"
+              className={searchInputText}
+              onFocus={() => suggestions.length && setOpen(true)}
+              onBlur={() => {
+                setTimeout(() => setOpen(false), 120);
+              }}
+            />
+            {open && suggestions.length > 0 && (
+              <div className={suggestionListDesktop}>
+                {suggestions.map((s) => {
+                  const iconSrc = getIconSrcForSymbol(s);
+                  const price =
+                    prices[s] !== undefined
+                      ? prices[s].toLocaleString("en-US", {
                         style: "currency",
                         currency: "USD",
                         maximumFractionDigits: 2,
                       })
-                    : "--";
-                return (
-                  <button
-                    key={s}
-                    onMouseDown={(e) => e.preventDefault()}
-                    onClick={() => pick(s)}
-                    className={suggestionButton}
-                  >
-                    <div className="flex items-center gap-2">
-                      {iconSrc ? (
-                        <img
-                          src={iconSrc}
-                          alt={s}
-                          className="w-4 h-4 rounded-full"
-                        />
-                      ) : (
-                        <div className="w-4 h-4 rounded-full bg-slate-800 text-[8px] flex items-center justify-center text-white">
-                          {s[0]}
-                        </div>
-                      )}
-                      <span>{s}</span>
-                    </div>
-                    <span className="text-slate-500">
-                      {price}
-                    </span>
-                  </button>
-                );
-              })}
-            </div>
-          )}
-        </form>
+                      : "--";
+                  return (
+                    <button
+                      key={s}
+                      onMouseDown={(e) => e.preventDefault()}
+                      onClick={() => pick(s)}
+                      className={suggestionButton}
+                    >
+                      <div className="flex items-center gap-2">
+                        {iconSrc ? (
+                          <img
+                            src={iconSrc}
+                            alt={s}
+                            className="w-4 h-4 rounded-full"
+                          />
+                        ) : (
+                          <div className="w-4 h-4 rounded-full bg-slate-800 text-[8px] flex items-center justify-center text-white">
+                            {s[0]}
+                          </div>
+                        )}
+                        <span className="text-slate-100">
+                          {s}
+                        </span>
+                      </div>
+                      <span className="text-slate-500">
+                        {price}
+                      </span>
+                    </button>
+                  );
+                })}
+              </div>
+            )}
+                  {/* AI Pulse line under search bar */}
+      <div className="pointer-events-none absolute left-3 right-3 -bottom-[2px] h-[2px] overflow-hidden">
+        <div className="pulse-line w-[140%] h-full bg-gradient-to-r from-emerald-400/0 via-emerald-400/80 to-emerald-400/0" />
+      </div>
 
-        {/* Mode toggle */}
-        <div className={modesWrapper}>
-          {(["futures", "options", "spot"] as MarketMode[]).map(
-            (m) => {
-              const active = m === mode;
+          </form>
+        </div>
+
+        {/* RIGHT CLUSTER: NAV + TICKER */}
+        <div className="flex items-center gap-3 flex-[2] justify-end min-w-0">
+          {/* Tabs */}
+          <nav className="flex items-center gap-1.5 rounded-2xl px-1.5 py-0.5 bg-slate-950/70 border border-slate-800/80 shadow-inner">
+            {navItems.map((item) => {
+              const isActive = activeTab === item.id;
               return (
                 <button
-                  key={m}
-                  onClick={() => onSetMode(m)}
+                  key={item.id}
+                  onClick={() => onTabChange(item.id)}
                   className={
-                    "mx-1 rounded-2xl px-3 py-1.5 text-sm font-medium capitalize transition-all " +
-                    (active
-                      ? isDark
-                        ? "bg-emerald-500/25 text-white border border-emerald-400/60 shadow-inner"
-                        : "bg-[var(--primary)] text-[var(--primary-foreground)] shadow-soft-sm"
-                      : isDark
-                      ? "text-slate-100/80 hover:bg-white/8"
-                      : "text-slate-700 hover:bg-white/90 hover:text-slate-900")
+                    "px-3 py-1.5 rounded-2xl text-xs md:text-[13px] font-medium transition " +
+                    (isActive
+                      ? "bg-emerald-500 text-slate-950 shadow-[0_0_22px_rgba(16,185,129,0.85)]"
+                      : "text-slate-200 hover:text-slate-50 hover:bg-slate-800/80")
                   }
                 >
-                  {m}
+                  {item.label}
                 </button>
               );
-            }
-          )}
-        </div>
+            })}
+          </nav>
 
-        {/* Exchange (filtered by onboarding) */}
-        <div className={exchangeWrapper}>
-          <Store className="w-4 h-4 text-slate-500" />
-          <select
-            value={
-              allowedExchanges.includes(exchange)
-                ? exchange
-                : allowedExchanges[0] || EXCHANGES[0]
+          {/* Price + sparkline */}
+          <div
+            className={
+              priceBlock +
+              (flash === "up"
+                ? " ring-1 ring-emerald-400 shadow-[0_0_30px_rgba(16,185,129,0.9)]"
+                : flash === "down"
+                  ? " ring-1 ring-red-400 shadow-[0_0_30px_rgba(248,113,113,0.9)]"
+                  : "")
             }
-            onChange={(e) => onSetExchange(e.target.value)}
-            className="bg-transparent text-sm outline-none text-slate-800 dark:text-slate-100"
           >
-            {allowedExchanges.map((ex) => (
-              <option key={ex} value={ex}>
-                {ex}
-              </option>
-            ))}
-          </select>
-          <span className="text-[9px] text-slate-500">
-            venues from client onboarding
-          </span>
-        </div>
-
-        {/* Price + sparkline */}
-        <div
-          className={
-            priceBlock +
-            (flash === "up"
-              ? " ring-2 ring-emerald-500/40"
-              : flash === "down"
-              ? " ring-2 ring-rose-500/40"
-              : "")
-          }
-        >
-          <div className="flex flex-col leading-tight">
-            <div className="text-[10px] text-slate-500">
-              {symbol}
+            {/* soft gradient glow */}
+            <div className="pointer-events-none absolute inset-0 opacity-40">
+              <div className="w-full h-full bg-gradient-to-r from-emerald-500/15 via-transparent to-rose-500/15" />
             </div>
-            <div className="text-sm font-semibold text-slate-900 dark:text-slate-50">
-              {ticker.price
-                ? ticker.price.toLocaleString("en-US", {
+
+            <div className="relative flex flex-col leading-tight">
+              <div className="text-[10px] text-slate-400">
+                {symbol}
+              </div>
+              <div className="text-sm font-semibold text-slate-50">
+                {ticker.price
+                  ? ticker.price.toLocaleString("en-US", {
                     style: "currency",
                     currency: "USD",
                     maximumFractionDigits: 2,
                   })
-                : "--"}
+                  : "--"}
+              </div>
             </div>
-          </div>
-          <div
-            className={
-              "flex items-center gap-1 text-[10px] " +
-              priceColor
-            }
-          >
-            {ticker.change > 0 && (
-              <TrendingUp className="w-3 h-3" />
-            )}
-            {ticker.change < 0 && (
-              <TrendingDown className="w-3 h-3" />
-            )}
-            {ticker.change === 0 && (
-              <Minus className="w-3 h-3" />
-            )}
-            <span>
-              {ticker.change > 0 ? "+" : ""}
-              {ticker.change.toFixed(2)}%
-            </span>
-          </div>
-          <div className="w-20 h-8">
-            <ResponsiveContainer>
-              <LineChart data={miniPrices}>
-                <Line
-                  type="monotone"
-                  dataKey="p"
-                  stroke={sparkColor}
-                  strokeWidth={2}
-                  dot={false}
-                />
-              </LineChart>
-            </ResponsiveContainer>
+            <div
+              className={
+                "relative flex items-center gap-1 text-[10px] font-medium " +
+                priceColor
+              }
+            >
+              {ticker.change > 0 && (
+                <TrendingUp className="w-3 h-3" />
+              )}
+              {ticker.change < 0 && (
+                <TrendingDown className="w-3 h-3" />
+              )}
+              {ticker.change === 0 && (
+                <Minus className="w-3 h-3" />
+              )}
+              <span>
+                {ticker.change > 0 ? "+" : ""}
+                {ticker.change.toFixed(2)}%
+              </span>
+            </div>
+            <div className="relative w-20 h-8">
+              <ResponsiveContainer>
+                <LineChart data={miniPrices}>
+                  <Line
+                    type="monotone"
+                    dataKey="p"
+                    stroke={sparkColor}
+                    strokeWidth={2}
+                    dot={false}
+                  />
+                </LineChart>
+              </ResponsiveContainer>
+            </div>
           </div>
         </div>
-
-        {/* Workspace badge */}
-        {workspace && (
-          <div className="ml-auto flex flex-col items-end text-[9px]">
-            <div className="inline-flex items-center gap-1 px-2 py-1 rounded-2xl bg-slate-900/90 text-slate-100 border border-indigo-500/40">
-              <Shield className="w-3 h-3 text-indigo-400" />
-              <span className="font-semibold">
-                {workspace.name}
-              </span>
-            </div>
-            <div className="text-slate-500 mt-0.5">
-              {workspace.riskText}
-            </div>
-            <div className="flex items-center gap-2 text-slate-500">
-              <span>
-                Venues: {allowedExchanges.length}
-              </span>
-              <span className="flex items-center gap-1">
-                <Send className="w-3 h-3" />
-                {workspace.hasTelegram
-                  ? "Telegram linked"
-                  : "Telegram pending"}
-              </span>
-            </div>
-          </div>
-        )}
       </div>
 
       {/* MOBILE */}
       <div className={mobileWrapper}>
         <div className={mobileInner}>
+          {/* row 1: menu + logo + search */}
           <div className="flex items-center gap-2">
             {isMobile && onToggleSidebar && (
               <button
                 onClick={onToggleSidebar}
-                className="p-1.5 rounded-xl bg-slate-900/90 border border-slate-700 text-slate-100"
+                className="p-1.5 rounded-xl bg-slate-950/90 border border-slate-800 text-slate-100"
               >
                 <Menu className="w-4 h-4" />
               </button>
             )}
+            <div className="flex items-center gap-2 rounded-2xl px-3 py-1.5 bg-slate-950/95 border border-emerald-500/60">
+              <div className="relative">
+                <span className="absolute inset-0 rounded-full bg-emerald-500/40 blur-md opacity-70 animate-ping" />
+                <div className="relative flex items-center justify-center w-7 h-7 rounded-full bg-slate-950 border border-emerald-400/70">
+                  <img
+                    src="/nowa.png"
+                    alt="Nowa"
+                    className="h-4 w-auto object-contain"
+                  />
+                </div>
+              </div>
+              <span className="text-[11px] font-semibold text-slate-100">
+                NOWA
+              </span>
+            </div>
             <form
               onSubmit={handleSubmit}
               className={mobileSearchWrapper}
@@ -515,8 +489,8 @@ const NeonHeader: React.FC<Props> = ({
                     const price =
                       prices[s] !== undefined
                         ? prices[s].toLocaleString("en-US", {
-                            maximumFractionDigits: 2,
-                          })
+                          maximumFractionDigits: 2,
+                        })
                         : "--";
                     return (
                       <button
@@ -537,7 +511,9 @@ const NeonHeader: React.FC<Props> = ({
                               {s[0]}
                             </div>
                           )}
-                          <span>{s}</span>
+                          <span className="text-slate-100">
+                            {s}
+                          </span>
                         </div>
                         <span className="text-slate-500">
                           {price}
@@ -550,100 +526,61 @@ const NeonHeader: React.FC<Props> = ({
             </form>
           </div>
 
-          {/* Modes */}
-          <div className="flex gap-1 mt-1">
-            {(["futures", "options", "spot"] as MarketMode[]).map(
-              (m) => {
-                const active = m === mode;
-                return (
-                  <button
-                    key={m}
-                    onClick={() => onSetMode(m)}
-                    className={
-                      "whitespace-nowrap rounded-2xl px-3 py-1 text-[10px] font-medium capitalize border transition-all " +
-                      (active
-                        ? "bg-[var(--primary)] text-[var(--primary-foreground)] border-[var(--primary)] dark:bg-emerald-500/25 dark:text-white dark:border-emerald-400/60"
-                        : "bg-white text-slate-800 border-border shadow-soft-sm dark:bg-slate-900/95 dark:text-slate-200 dark:border-slate-700")
-                    }
-                  >
-                    {m}
-                  </button>
-                );
-              }
-            )}
+          {/* row 2: tabs */}
+          <div className="flex flex-wrap gap-1 mt-1">
+            {navItems.map((item) => {
+              const isActive = activeTab === item.id;
+              return (
+                <button
+                  key={item.id}
+                  onClick={() => onTabChange(item.id)}
+                  className={
+                    "whitespace-nowrap rounded-2xl px-3 py-1 text-[10px] font-medium border transition-all " +
+                    (isActive
+                      ? "bg-emerald-500 text-slate-950 border-emerald-500 shadow-[0_0_16px_rgba(16,185,129,0.85)]"
+                      : "bg-slate-950/80 text-slate-200 border-slate-800 hover:bg-slate-900/90")
+                  }
+                >
+                  {item.label}
+                </button>
+              );
+            })}
           </div>
 
-          {/* Exchange + price */}
-          <div className="mt-1 flex items-center gap-2">
-            <select
-              value={
-                allowedExchanges.includes(exchange)
-                  ? exchange
-                  : allowedExchanges[0] || EXCHANGES[0]
-              }
-              onChange={(e) => onSetExchange(e.target.value)}
+          {/* row 3: compact price */}
+          <div className="mt-1 flex items-center justify-between text-[9px]">
+            <div className="flex flex-col">
+              <span className="text-slate-500">
+                {symbol}
+              </span>
+              <span className="font-semibold text-slate-100">
+                {ticker.price
+                  ? ticker.price.toLocaleString("en-US", {
+                    maximumFractionDigits: 2,
+                  })
+                  : "--"}
+              </span>
+            </div>
+            <div
               className={
-                "rounded-xl px-2 py-1 text-[9px] outline-none border " +
-                "bg-white text-slate-800 border-border shadow-soft-sm " +
-                "dark:bg-slate-900/95 dark:text-slate-100 dark:border-slate-700"
+                priceColor + " flex items-center gap-1"
               }
             >
-              {allowedExchanges.map((ex) => (
-                <option key={ex} value={ex}>
-                  {ex}
-                </option>
-              ))}
-            </select>
-            <div className="flex-1 flex items-center justify-between text-[9px]">
-              <div className="flex flex-col">
-                <span className="text-slate-500">
-                  {symbol}
-                </span>
-                <span className="font-semibold text-slate-900 dark:text-slate-50">
-                  {ticker.price
-                    ? ticker.price.toLocaleString(
-                        "en-US",
-                        { maximumFractionDigits: 2 }
-                      )
-                    : "--"}
-                </span>
-              </div>
-              <div className={priceColor + " flex items-center gap-1"}>
-                {ticker.change > 0 && (
-                  <TrendingUp className="w-3 h-3" />
-                )}
-                {ticker.change < 0 && (
-                  <TrendingDown className="w-3 h-3" />
-                )}
-                {ticker.change === 0 && (
-                  <Minus className="w-3 h-3" />
-                )}
-                <span>
-                  {ticker.change > 0 ? "+" : ""}
-                  {ticker.change.toFixed(2)}%
-                </span>
-              </div>
+              {ticker.change > 0 && (
+                <TrendingUp className="w-3 h-3" />
+              )}
+              {ticker.change < 0 && (
+                <TrendingDown className="w-3 h-3" />
+              )}
+              {ticker.change === 0 && (
+                <Minus className="w-3 h-3" />
+              )}
+              <span>
+                {ticker.change > 0 ? "+" : ""}
+                {ticker.change.toFixed(2)}%
+              </span>
             </div>
           </div>
-
-          {/* Workspace pill */}
-          {workspace && (
-            <div className="mt-1 flex items-center justify-between text-[8px] text-slate-500">
-              <div className="flex items-center gap-1">
-                <Shield className="w-3 h-3 text-indigo-400" />
-                <span>{workspace.name}</span>
-              </div>
-              <div className="flex items-center gap-2">
-                <span>{workspace.riskText}</span>
-                <span className="flex items-center gap-1">
-                  <Send className="w-3 h-3" />
-                  {workspace.hasTelegram
-                    ? "TG linked"
-                    : "TG pending"}
-                </span>
-              </div>
-            </div>
-          )}
         </div>
       </div>
     </>

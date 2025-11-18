@@ -1,23 +1,11 @@
 // src/lib/cryptoIcons.ts
-// Dynamically resolves icons from `cryptocurrency-icons` if they exist.
-// Works for BTC, ETH, etc. Missing tokens fall back to undefined.
+// Dynamically resolves icons from unpkg CDN.
+// No local SVG files required.
 
-export function getIconSrcForSymbol(symbol: string): string | undefined {
-  // Normalize: "BTC/USDT", "btc-perp" -> "btc"
+export function getIconSrcForSymbol(symbol: string): string {
+  // 1. Normalize: "BTC-PERP" -> "btc"
   const base = symbol.split(/[-/]/)[0].toLowerCase();
 
-  try {
-    // Prefer color icons
-    // eslint-disable-next-line @typescript-eslint/no-var-requires
-    return require(`cryptocurrency-icons/svg/color/${base}.svg`).default as string;
-  } catch {
-    try {
-      // Fallback to black icon variant if color missing
-      // eslint-disable-next-line @typescript-eslint/no-var-requires
-      return require(`cryptocurrency-icons/svg/black/${base}.svg`).default as string;
-    } catch {
-      // No icon found in the package
-      return undefined;
-    }
-  }
+  // 2. Return the remote URL for the icon
+  return `https://unpkg.com/cryptocurrency-icons@0.18.1/svg/color/${base}.svg`;
 }

@@ -1,4 +1,3 @@
-// src/components/NeonHeader.tsx
 "use client";
 
 import React, {
@@ -21,7 +20,6 @@ import {
   Line,
   ResponsiveContainer,
 } from "recharts";
-import { getIconSrcForSymbol } from "@/lib/cryptoIcons";
 
 type Props = {
   symbol: SymbolCode;
@@ -40,6 +38,80 @@ const navItems = [
   { id: "intel", label: "Market Intel" },
   { id: "system", label: "System" },
 ] as const;
+
+// --- Smart Price Formatter ---
+const formatPrice = (price: number) => {
+  if (!price && price !== 0) return "--";
+  return price.toLocaleString("en-US", {
+    style: "currency",
+    currency: "USD",
+    minimumFractionDigits: price < 1 ? 4 : 2,
+    maximumFractionDigits: price < 1 ? 8 : 2,
+  });
+};
+
+// --- Advanced TokenIcon with Fallback Strategy ---
+const TokenIcon = ({
+  symbol,
+  className,
+}: {
+  symbol: string;
+  className?: string;
+}) => {
+  // List of CDN sources to try in order
+  const sources = useMemo(() => {
+    const s = symbol.toLowerCase();
+    return [
+      // 1. Standard Library (High Quality SVG)
+      `https://unpkg.com/cryptocurrency-icons@0.18.1/svg/color/${s}.svg`,
+      // 2. CoinCap CDN (High Coverage for PEPE, BONK, WIF, etc.)
+      `https://assets.coincap.io/assets/icons/${s}@2x.png`,
+      // 3. Fallback to generic generic icon service
+      `https://icons.llamao.fi/icons/tokens/0/${s}?h=60&w=60` 
+    ];
+  }, [symbol]);
+
+  const [srcIndex, setSrcIndex] = useState(0);
+  const [hasError, setHasError] = useState(false);
+
+  // Reset state when symbol changes
+  useEffect(() => {
+    setSrcIndex(0);
+    setHasError(false);
+  }, [symbol]);
+
+  const handleError = () => {
+    // If we have more sources to try, move to the next one
+    if (srcIndex < sources.length - 1) {
+      setSrcIndex((prev) => prev + 1);
+    } else {
+      // All sources failed
+      setHasError(true);
+    }
+  };
+
+  // If all images fail, show the letter fallback
+  if (hasError) {
+    return (
+      <div
+        className={`flex items-center justify-center bg-slate-800 text-slate-200 font-bold rounded-full border border-slate-700 ${className}`}
+        style={{ fontSize: "calc(1em - 2px)" }}
+      >
+        {symbol[0]?.toUpperCase()}
+      </div>
+    );
+  }
+
+  return (
+    <img
+      key={sources[srcIndex]} // Force re-render on source change
+      src={sources[srcIndex]}
+      alt={symbol}
+      className={`${className} rounded-full bg-slate-900`}
+      onError={handleError}
+    />
+  );
+};
 
 const NeonHeader: React.FC<Props> = ({
   symbol,
@@ -73,8 +145,7 @@ const NeonHeader: React.FC<Props> = ({
     const stop = API.streamTicker(symbol, (d: any) => {
       if (!alive || !d) return;
       const price = Number(d.price) || 0;
-      const change =
-        typeof d.change === "number" ? d.change : ticker.change;
+      const change = typeof d.change === "number" ? d.change : ticker.change;
       setTicker({ price, change });
     });
 
@@ -122,7 +193,7 @@ const NeonHeader: React.FC<Props> = ({
 
   const assets = useMemo(
     () =>
-      API.TOP_ASSETS.map((a: any) =>
+      API.ALL_ASSETS.map((a: any) =>
         API.formatSymbol(a, DEFAULT_MODE)
       ) as SymbolCode[],
     []
@@ -200,8 +271,7 @@ const NeonHeader: React.FC<Props> = ({
         ? "text-rose-400"
         : "text-slate-400";
 
-  const sparkColor =
-    ticker.change >= 0 ? "#22c55e" : "#fb7185";
+  const sparkColor = ticker.change >= 0 ? "#22c55e" : "#fb7185";
 
   const desktopWrapper =
     "hidden md:flex w-full items-center gap-4 rounded-[26px] px-5 py-2.5 " +
@@ -211,7 +281,6 @@ const NeonHeader: React.FC<Props> = ({
   const searchWrapperDesktop =
     "relative w-[80%] min-w-[340px] h-10 rounded-2xl flex items-center px-4 border transition-all " +
     "bg-slate-950/80 border-slate-800/80 hover:bg-slate-900/80 shadow-inner";
-
 
   const searchInputText =
     "w-full bg-transparent text-xs md:text-sm outline-none " +
@@ -246,33 +315,24 @@ const NeonHeader: React.FC<Props> = ({
   const suggestionButton =
     "flex w-full items-center justify-between px-3 py-1.5 transition-all hover:bg-emerald-500/10";
 
-  // ---------- RENDER ----------
+  const activeAsset = API.toAsset(symbol);
+
   return (
     <>
       {/* DESKTOP / TABLET */}
       <div className={desktopWrapper}>
-        {/* LEFT CLUSTER: NOWA + AI Pulse + SEARCH */}
+        {/* LEFT CLUSTER */}
         <div className="flex items-center gap-3 flex-[2] justify-end min-w-0">
-
-          {/* NOWA logo + AI Pulse */}
+          {/* NOWA logo */}
           <div className="flex items-center gap-4 rounded-2xl px-5 py-3 bg-slate-950/95 border border-emerald-500/60 shadow-[0_0_42px_rgba(16,185,129,0.95)] select-none min-w-[220px]">
-
             <div className="relative">
-              {/* pulse ring */}
               <span className="absolute inset-0 rounded-full bg-emerald-500/40 blur-md opacity-70 animate-ping" />
               <div className="relative flex items-center justify-center w-11 h-11 rounded-full bg-slate-950 border border-emerald-400/70 shadow-[0_0_22px_rgba(16,185,129,0.9)]">
-                <img
-                  src="/nowa.png"
-                  alt="Nowa"
-                  className="h-7 w-auto object-contain drop-shadow-[0_0_32px_rgba(16,185,129,1)]"
-                />
+                <img src="/nowa.png" alt="Nowa" className="h-7 w-auto object-contain drop-shadow-[0_0_32px_rgba(16,185,129,1)]" />
               </div>
-
             </div>
             <div className="flex flex-col leading-tight">
-              <span className="text-[11px] font-semibold tracking-wide text-slate-100">
-                NOWA
-              </span>
+              <span className="text-[11px] font-semibold tracking-wide text-slate-100">NOWA</span>
               <span className="flex items-center gap-1 text-[10px] text-emerald-300/95">
                 <span className="h-1.5 w-1.5 rounded-full bg-emerald-400 shadow-[0_0_12px_rgba(16,185,129,0.9)]" />
                 AI Pulse • Live
@@ -281,33 +341,21 @@ const NeonHeader: React.FC<Props> = ({
           </div>
 
           {/* Search */}
-          <form
-            onSubmit={handleSubmit}
-            className={searchWrapperDesktop}
-          >
+          <form onSubmit={handleSubmit} className={searchWrapperDesktop}>
             <Search className="w-4 h-4 text-slate-500 mr-2" />
             <input
               value={q}
               onChange={(e) => setQ(e.target.value)}
-              placeholder="Type cryptocurrency"
+              placeholder="Type cryptocurrency (e.g. SHIB, PEPE)"
               className={searchInputText}
               onFocus={() => suggestions.length && setOpen(true)}
-              onBlur={() => {
-                setTimeout(() => setOpen(false), 120);
-              }}
+              onBlur={() => setTimeout(() => setOpen(false), 120)}
             />
             {open && suggestions.length > 0 && (
               <div className={suggestionListDesktop}>
                 {suggestions.map((s) => {
-                  const iconSrc = getIconSrcForSymbol(s);
-                  const price =
-                    prices[s] !== undefined
-                      ? prices[s].toLocaleString("en-US", {
-                        style: "currency",
-                        currency: "USD",
-                        maximumFractionDigits: 2,
-                      })
-                      : "--";
+                  const cleanAsset = API.toAsset(s);
+                  const priceStr = prices[s] !== undefined ? formatPrice(prices[s]) : "--";
                   return (
                     <button
                       key={s}
@@ -316,38 +364,22 @@ const NeonHeader: React.FC<Props> = ({
                       className={suggestionButton}
                     >
                       <div className="flex items-center gap-2">
-                        {iconSrc ? (
-                          <img
-                            src={iconSrc}
-                            alt={s}
-                            className="w-4 h-4 rounded-full"
-                          />
-                        ) : (
-                          <div className="w-4 h-4 rounded-full bg-slate-800 text-[8px] flex items-center justify-center text-white">
-                            {s[0]}
-                          </div>
-                        )}
-                        <span className="text-slate-100">
-                          {s}
-                        </span>
+                        <TokenIcon symbol={cleanAsset} className="w-4 h-4" />
+                        <span className="text-slate-100">{cleanAsset}</span>
                       </div>
-                      <span className="text-slate-500">
-                        {price}
-                      </span>
+                      <span className="text-slate-500">{priceStr}</span>
                     </button>
                   );
                 })}
               </div>
             )}
-                  {/* AI Pulse line under search bar */}
-      <div className="pointer-events-none absolute left-3 right-3 -bottom-[2px] h-[2px] overflow-hidden">
-        <div className="pulse-line w-[140%] h-full bg-gradient-to-r from-emerald-400/0 via-emerald-400/80 to-emerald-400/0" />
-      </div>
-
+            <div className="pointer-events-none absolute left-3 right-3 -bottom-[2px] h-[2px] overflow-hidden">
+              <div className="pulse-line w-[140%] h-full bg-gradient-to-r from-emerald-400/0 via-emerald-400/80 to-emerald-400/0" />
+            </div>
           </form>
         </div>
 
-        {/* RIGHT CLUSTER: NAV + TICKER */}
+        {/* RIGHT CLUSTER */}
         <div className="flex items-center gap-3 flex-[2] justify-end min-w-0">
           {/* Tabs */}
           <nav className="flex items-center gap-1.5 rounded-2xl px-1.5 py-0.5 bg-slate-950/70 border border-slate-800/80 shadow-inner">
@@ -370,66 +402,29 @@ const NeonHeader: React.FC<Props> = ({
             })}
           </nav>
 
-          {/* Price + sparkline */}
-          <div
-            className={
-              priceBlock +
-              (flash === "up"
-                ? " ring-1 ring-emerald-400 shadow-[0_0_30px_rgba(16,185,129,0.9)]"
-                : flash === "down"
-                  ? " ring-1 ring-red-400 shadow-[0_0_30px_rgba(248,113,113,0.9)]"
-                  : "")
-            }
-          >
-            {/* soft gradient glow */}
+          {/* Price + sparkline + LOGO */}
+          <div className={priceBlock + (flash === "up" ? " ring-1 ring-emerald-400 shadow-[0_0_30px_rgba(16,185,129,0.9)]" : flash === "down" ? " ring-1 ring-red-400 shadow-[0_0_30px_rgba(248,113,113,0.9)]" : "")}>
             <div className="pointer-events-none absolute inset-0 opacity-40">
               <div className="w-full h-full bg-gradient-to-r from-emerald-500/15 via-transparent to-rose-500/15" />
             </div>
 
+            {/* Active Ticker Logo */}
+            <TokenIcon symbol={activeAsset} className="w-6 h-6 shadow-sm" />
+
             <div className="relative flex flex-col leading-tight">
-              <div className="text-[10px] text-slate-400">
-                {symbol}
-              </div>
-              <div className="text-sm font-semibold text-slate-50">
-                {ticker.price
-                  ? ticker.price.toLocaleString("en-US", {
-                    style: "currency",
-                    currency: "USD",
-                    maximumFractionDigits: 2,
-                  })
-                  : "--"}
-              </div>
+              <div className="text-[10px] text-slate-400">{activeAsset}</div>
+              <div className="text-sm font-semibold text-slate-50">{formatPrice(ticker.price)}</div>
             </div>
-            <div
-              className={
-                "relative flex items-center gap-1 text-[10px] font-medium " +
-                priceColor
-              }
-            >
-              {ticker.change > 0 && (
-                <TrendingUp className="w-3 h-3" />
-              )}
-              {ticker.change < 0 && (
-                <TrendingDown className="w-3 h-3" />
-              )}
-              {ticker.change === 0 && (
-                <Minus className="w-3 h-3" />
-              )}
-              <span>
-                {ticker.change > 0 ? "+" : ""}
-                {ticker.change.toFixed(2)}%
-              </span>
+            <div className={"relative flex items-center gap-1 text-[10px] font-medium " + priceColor}>
+              {ticker.change > 0 && <TrendingUp className="w-3 h-3" />}
+              {ticker.change < 0 && <TrendingDown className="w-3 h-3" />}
+              {ticker.change === 0 && <Minus className="w-3 h-3" />}
+              <span>{ticker.change > 0 ? "+" : ""}{ticker.change.toFixed(2)}%</span>
             </div>
             <div className="relative w-20 h-8">
               <ResponsiveContainer>
                 <LineChart data={miniPrices}>
-                  <Line
-                    type="monotone"
-                    dataKey="p"
-                    stroke={sparkColor}
-                    strokeWidth={2}
-                    dot={false}
-                  />
+                  <Line type="monotone" dataKey="p" stroke={sparkColor} strokeWidth={2} dot={false} />
                 </LineChart>
               </ResponsiveContainer>
             </div>
@@ -440,13 +435,10 @@ const NeonHeader: React.FC<Props> = ({
       {/* MOBILE */}
       <div className={mobileWrapper}>
         <div className={mobileInner}>
-          {/* row 1: menu + logo + search */}
+          {/* row 1 */}
           <div className="flex items-center gap-2">
             {isMobile && onToggleSidebar && (
-              <button
-                onClick={onToggleSidebar}
-                className="p-1.5 rounded-xl bg-slate-950/90 border border-slate-800 text-slate-100"
-              >
+              <button onClick={onToggleSidebar} className="p-1.5 rounded-xl bg-slate-950/90 border border-slate-800 text-slate-100">
                 <Menu className="w-4 h-4" />
               </button>
             )}
@@ -454,70 +446,33 @@ const NeonHeader: React.FC<Props> = ({
               <div className="relative">
                 <span className="absolute inset-0 rounded-full bg-emerald-500/40 blur-md opacity-70 animate-ping" />
                 <div className="relative flex items-center justify-center w-7 h-7 rounded-full bg-slate-950 border border-emerald-400/70">
-                  <img
-                    src="/nowa.png"
-                    alt="Nowa"
-                    className="h-4 w-auto object-contain"
-                  />
+                  <img src="/nowa.png" alt="Nowa" className="h-4 w-auto object-contain" />
                 </div>
               </div>
-              <span className="text-[11px] font-semibold text-slate-100">
-                NOWA
-              </span>
+              <span className="text-[11px] font-semibold text-slate-100">NOWA</span>
             </div>
-            <form
-              onSubmit={handleSubmit}
-              className={mobileSearchWrapper}
-            >
+            <form onSubmit={handleSubmit} className={mobileSearchWrapper}>
               <Search className="w-3 h-3 text-slate-500 mr-1.5" />
               <input
                 value={q}
                 onChange={(e) => setQ(e.target.value)}
-                placeholder="Search market"
+                placeholder="Search"
                 className={mobileSearchInput}
-                onFocus={() =>
-                  suggestions.length && setOpen(true)
-                }
-                onBlur={() => {
-                  setTimeout(() => setOpen(false), 120);
-                }}
+                onFocus={() => suggestions.length && setOpen(true)}
+                onBlur={() => setTimeout(() => setOpen(false), 120)}
               />
               {open && suggestions.length > 0 && (
                 <div className={suggestionListMobile}>
                   {suggestions.map((s) => {
-                    const iconSrc = getIconSrcForSymbol(s);
-                    const price =
-                      prices[s] !== undefined
-                        ? prices[s].toLocaleString("en-US", {
-                          maximumFractionDigits: 2,
-                        })
-                        : "--";
+                    const cleanAsset = API.toAsset(s);
+                    const priceStr = prices[s] !== undefined ? formatPrice(prices[s]) : "--";
                     return (
-                      <button
-                        key={s}
-                        onMouseDown={(e) => e.preventDefault()}
-                        onClick={() => pick(s)}
-                        className={suggestionButton}
-                      >
+                      <button key={s} onMouseDown={(e) => e.preventDefault()} onClick={() => pick(s)} className={suggestionButton}>
                         <div className="flex items-center gap-2">
-                          {iconSrc ? (
-                            <img
-                              src={iconSrc}
-                              alt={s}
-                              className="w-3.5 h-3.5 rounded-full"
-                            />
-                          ) : (
-                            <div className="w-3.5 h-3.5 rounded-full bg-slate-800 text-[7px] flex items-center justify-center text-white">
-                              {s[0]}
-                            </div>
-                          )}
-                          <span className="text-slate-100">
-                            {s}
-                          </span>
+                          <TokenIcon symbol={cleanAsset} className="w-3.5 h-3.5" />
+                          <span className="text-slate-100">{cleanAsset}</span>
                         </div>
-                        <span className="text-slate-500">
-                          {price}
-                        </span>
+                        <span className="text-slate-500">{priceStr}</span>
                       </button>
                     );
                   })}
@@ -526,7 +481,7 @@ const NeonHeader: React.FC<Props> = ({
             </form>
           </div>
 
-          {/* row 2: tabs */}
+          {/* row 2 */}
           <div className="flex flex-wrap gap-1 mt-1">
             {navItems.map((item) => {
               const isActive = activeTab === item.id;
@@ -547,38 +502,20 @@ const NeonHeader: React.FC<Props> = ({
             })}
           </div>
 
-          {/* row 3: compact price */}
+          {/* row 3 */}
           <div className="mt-1 flex items-center justify-between text-[9px]">
-            <div className="flex flex-col">
-              <span className="text-slate-500">
-                {symbol}
-              </span>
-              <span className="font-semibold text-slate-100">
-                {ticker.price
-                  ? ticker.price.toLocaleString("en-US", {
-                    maximumFractionDigits: 2,
-                  })
-                  : "--"}
-              </span>
+            <div className="flex items-center gap-2">
+              <TokenIcon symbol={activeAsset} className="w-5 h-5" />
+              <div className="flex flex-col">
+                <span className="text-slate-500">{activeAsset}</span>
+                <span className="font-semibold text-slate-100">{formatPrice(ticker.price)}</span>
+              </div>
             </div>
-            <div
-              className={
-                priceColor + " flex items-center gap-1"
-              }
-            >
-              {ticker.change > 0 && (
-                <TrendingUp className="w-3 h-3" />
-              )}
-              {ticker.change < 0 && (
-                <TrendingDown className="w-3 h-3" />
-              )}
-              {ticker.change === 0 && (
-                <Minus className="w-3 h-3" />
-              )}
-              <span>
-                {ticker.change > 0 ? "+" : ""}
-                {ticker.change.toFixed(2)}%
-              </span>
+            <div className={priceColor + " flex items-center gap-1"}>
+              {ticker.change > 0 && <TrendingUp className="w-3 h-3" />}
+              {ticker.change < 0 && <TrendingDown className="w-3 h-3" />}
+              {ticker.change === 0 && <Minus className="w-3 h-3" />}
+              <span>{ticker.change > 0 ? "+" : ""}{ticker.change.toFixed(2)}%</span>
             </div>
           </div>
         </div>

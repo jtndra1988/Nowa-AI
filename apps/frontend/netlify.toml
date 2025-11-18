@@ -1,7 +1,7 @@
 [build]
-  base = "apps/frontend"
+  # 'base' is not needed here because the UI config sets the root context
   command = "npm run build"
-  publish = "apps/frontend/.next"
+  publish = ".next" 
 
 [[plugins]]
   package = "@netlify/plugin-nextjs"

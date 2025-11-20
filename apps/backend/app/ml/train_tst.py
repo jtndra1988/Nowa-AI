@@ -1,13 +1,9 @@
 import logging
 import torch
-import pandas as pd
-import numpy as np
 from torch.utils.data import DataLoader
 from torch.optim import AdamW
-from pathlib import Path
-from app.ml.adv.models_tcn import TemporalConvNet
-# Reuse logic from train_tft
-from app.ml.train_tft import load_training_data 
+from app.ml.adv.models_tst import TSTLite
+from app.ml.train_tft import load_training_data
 from app.ml.adv.feature_engineering import FEATURE_CONFIG, process_market_data
 from app.ml.dataset import MultiModalTS
 from app.ml.losses import multitask_transformer_loss
@@ -16,7 +12,6 @@ logger = logging.getLogger(__name__)
 logging.basicConfig(level=logging.INFO)
 
 DEVICE = 'cuda' if torch.cuda.is_available() else 'cpu'
-SEQ_LEN = 60
 
 def train():
     df = load_training_data(days=90)
@@ -33,36 +28,36 @@ def train():
         vol_label_col="target_vol",
         tabular_feature_cols=[],
         roll_windows=[],
-        seq_len=SEQ_LEN
+        seq_len=60
     )
     
     loader = DataLoader(ds, batch_size=64, shuffle=True)
+    in_feat = sum(ds.get_feature_dims().values())
     
-    # Calculate total input features (TCN takes concat of all blocks)
-    in_feat = sum(ds.get_feature_dims().values()) # e.g., 7
-    
-    model = TemporalConvNet(in_feat=in_feat).to(DEVICE)
+    model = TSTLite(in_feat=in_feat, seq_len=60).to(DEVICE)
     optimizer = AdamW(model.parameters(), lr=1e-4)
     
     model.train()
     for epoch in range(10):
         total_loss = 0
         for x_blocks, _, y_dict in loader:
-            x_blocks = {k: v.to(DEVICE) for k, v in x_blocks.items()}
+            # Manual Concatenation for TST (mimicking wrapper logic)
+            tensors = [v.to(DEVICE) for k, v in x_blocks.items()]
+            x_input = torch.cat(tensors, dim=-1)
             y_dict = {k: v.to(DEVICE) for k, v in y_dict.items()}
             
             optimizer.zero_grad()
-            pred = model(x_blocks) # TCN Wrapper handles dict->concat
+            pred = model(x_input)
             
             loss = multitask_transformer_loss(pred, y_dict)["total_loss"]
             loss.backward()
             optimizer.step()
             total_loss += loss.item()
             
-        logger.info(f"[TCN] Epoch {epoch+1} Loss: {total_loss/len(loader):.4f}")
+        logger.info(f"[TST] Epoch {epoch+1} Loss: {total_loss/len(loader):.4f}")
 
-    torch.save(model, "model_artifacts/tcn_model.pth")
-    logger.info("Saved TCN model.")
+    torch.save(model, "model_artifacts/tst_model.pth")
+    logger.info("Saved TST model.")
 
 if __name__ == "__main__":
     train()

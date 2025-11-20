@@ -116,7 +116,38 @@ class RiskEngine:
         self.symbol = symbol.upper()
         self.cfg = cfg or RiskConfig()
         self.state = self._load_state()
+    def _fetch_ohlcv_for_atr(self, symbol: str, limit: int = 200) -> pd.DataFrame:
+        """
+        Helper to fetch simple OHLCV for ATR calculation.
+        Connects to DB to ensure consistency with what the models saw.
+        """
+        from app.db.database import SessionLocal
+        from app.db.models import MarketData
+        from sqlalchemy import desc
+        import pandas as pd
 
+        with SessionLocal() as db:
+            rows = (
+                db.query(MarketData)
+                .filter(MarketData.symbol == symbol)
+                .order_by(desc(MarketData.timestamp))
+                .limit(limit)
+                .all()
+            )
+            if not rows:
+                return pd.DataFrame()
+            
+            data = [{
+                "timestamp": r.timestamp,
+                "open": float(r.open),
+                "high": float(r.high),
+                "low": float(r.low),
+                "close": float(r.close),
+                "volume": float(r.volume)
+            } for r in rows]
+            
+            df = pd.DataFrame(data).sort_values("timestamp")
+            return df
     # -------- persistence (local JSON for redundancy) --------
     def _load_state(self) -> RiskState:
         p = _state_path(self.symbol)

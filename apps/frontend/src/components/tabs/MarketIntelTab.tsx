@@ -1,22 +1,17 @@
 "use client";
 
-import React, { useMemo } from "react";
+import React from "react";
 import {
   Card,
   CardHeader,
   CardTitle,
   CardDescription,
   CardContent,
-  KpiTile,
   Badge,
-  glassPanel,
-  faintText,
 } from "../layout/AppShell";
-import { useMarketIntel } from "../layout/AppShell";
+
 import {
   ResponsiveContainer,
-  LineChart,
-  Line,
   AreaChart,
   Area,
   BarChart,
@@ -25,12 +20,35 @@ import {
   XAxis,
   YAxis,
   Tooltip,
+  RadarChart,
+  PolarGrid,
+  PolarAngleAxis,
+  PolarRadiusAxis,
+  Radar,
+  ReferenceLine,
+  Cell,
 } from "recharts";
+import {
+  TrendingUp,
+  TrendingDown,
+  Activity,
+  Anchor,
+  Zap,
+  Info,
+  Gauge,
+  Target,
+  Coins,
+  ArrowRightLeft,
+  BarChart3,
+} from "lucide-react";
 import type {
   SymbolCode,
   MarketMode,
+  MarketIntel as MarketIntelResponse,
 } from "@/lib/api";
+import { getMarketIntel } from "@/lib/api";
 
+// --- Types ---
 type IntelSeriesPoint = {
   t?: any;
   time?: any;
@@ -39,250 +57,222 @@ type IntelSeriesPoint = {
   v?: number;
   value?: number;
   active?: number;
-  iv?: number;
-  funding?: number;
 };
 
 type CorItem = { name: string; val: number };
 
+// --- Helpers ---
 const safeNum = (v: any, d = 0) => {
   const n = Number(v);
   return Number.isFinite(n) ? n : d;
 };
 
-const last = <T,>(
-  arr?: T[]
-): T | undefined =>
-  arr && arr.length
-    ? arr[arr.length - 1]
-    : undefined;
+const last = <T,>(arr?: T[]): T | undefined =>
+  arr && arr.length ? arr[arr.length - 1] : undefined;
 
-const Spark: React.FC<{
-  pts?: { v: number }[];
-}> = ({ pts }) => {
-  if (!pts || pts.length < 2)
-    return null;
-  const min = Math.min(
-    ...pts.map((p) => p.v)
-  );
-  const max = Math.max(
-    ...pts.map((p) => p.v)
-  );
-  const rng = max - min || 1;
-  const d = pts
-    .map((p, i) => {
-      const x =
-        (i / (pts.length - 1)) *
-        100;
-      const y =
-        100 -
-        ((p.v - min) / rng) * 100;
-      return `${
-        i === 0 ? "M" : "L"
-      }${x},${y}`;
-    })
-    .join(" ");
+// --- Sub-Components ---
+
+const CustomTooltip = ({ active, payload, label }: any) => {
+  if (active && payload && payload.length) {
+    return (
+      <div className="bg-slate-900/90 border border-slate-700 p-3 rounded-lg shadow-xl backdrop-blur-md z-50">
+        <p className="text-xs text-slate-400 mb-1">{label ?? "Data Point"}</p>
+        {payload.map((p: any, i: number) => (
+          <div key={i} className="flex items-center gap-2 text-sm font-medium">
+            <span
+              className="w-2 h-2 rounded-full"
+              style={{ backgroundColor: p.color }}
+            />
+            <span className="text-slate-200">
+              {p.name}: {p.value}
+            </span>
+          </div>
+        ))}
+      </div>
+    );
+  }
+  return null;
+};
+
+const InsightBadge = ({
+  type,
+}: {
+  type: "positive" | "negative" | "neutral" | "warning";
+}) => {
+  if (type === "positive")
+    return (
+      <Badge className="bg-green-500/20 text-green-400 border-green-500/50">
+        FAVORABLE
+      </Badge>
+    );
+  if (type === "negative")
+    return (
+      <Badge className="bg-red-500/20 text-red-400 border-red-500/50">
+        NEGATIVE
+      </Badge>
+    );
+  if (type === "warning")
+    return (
+      <Badge className="bg-orange-500/20 text-orange-400 border-orange-500/50">
+        CAUTION
+      </Badge>
+    );
   return (
-    <svg
-      viewBox="0 0 100 100"
-      className="w-full h-6"
-      preserveAspectRatio="none"
-    >
-      <path
-        d={d}
-        fill="none"
-        stroke="currentColor"
-        strokeWidth={1}
-      />
-    </svg>
+    <Badge className="bg-slate-500/20 text-slate-400 border-slate-500/50">
+      STABLE
+    </Badge>
   );
 };
 
-const PlaybookCard: React.FC<{
+const InsightCard: React.FC<{
   title: string;
+  icon: React.ReactNode;
   bullets: string[];
-}> = ({ title, bullets }) => (
-  <Card>
-    <CardHeader className="pb-2">
-      <CardTitle className="text-sm">
-        {title}
-      </CardTitle>
+  signal: "positive" | "negative" | "neutral" | "warning";
+  colorClass?: string;
+}> = ({
+  title,
+  icon,
+  bullets,
+  signal,
+  colorClass = "border-l-blue-500/50",
+}) => (
+  <Card className={`h-full border-l-4 ${colorClass} bg-slate-900/40`}>
+    <CardHeader className="pb-3">
+      <div className="flex items-center justify-between">
+        <div className="flex items-center gap-2">
+          <div className="p-2 bg-slate-800/50 rounded-md text-slate-200">
+            {icon}
+          </div>
+          <CardTitle className="text-base">{title}</CardTitle>
+        </div>
+        <InsightBadge type={signal} />
+      </div>
     </CardHeader>
-    <CardContent className="text-xs space-y-1">
+    <CardContent className="text-sm space-y-2">
       {bullets.map((b, i) => (
-        <div
-          key={i}
-          className={faintText}
-        >
-          • {b}
+        <div key={i} className="flex items-start gap-2 text-slate-300">
+          <span className="mt-1.5 w-1 h-1 rounded-full bg-slate-500 shrink-0" />
+          <span>{b}</span>
         </div>
       ))}
     </CardContent>
   </Card>
 );
 
-const ExplainCard: React.FC = () => (
-  <Card>
-    <CardHeader>
-      <CardTitle>
-        What it means
-      </CardTitle>
-      <CardDescription>
-        Human-readable explainer
-      </CardDescription>
-    </CardHeader>
-    <CardContent className="text-xs space-y-1">
-      <p>
-        <b>Funding Skew</b> shows
-        who pays whom on
-        perpetuals. Positive =
-        longs paying (crowded
-        longs); negative =
-        shorts paying.
-      </p>
-      <p>
-        <b>30d IV</b> is options’
-        view of future vol. High:
-        favor credit; Low: favor
-        debit.
-      </p>
-      <p>
-        <b>Open Interest</b>{" "}
-        tracks outstanding
-        futures/options; rising
-        with price = trend
-        confirmation.
-      </p>
-      <p>
-        <b>CVD</b> tracks net buy
-        vs sell pressure; big
-        divergences matter.
-      </p>
-      <p>
-        <b>Regime</b> (momentum vs
-        mean-revert) guides
-        breakout vs fade.
-      </p>
-    </CardContent>
-  </Card>
+const KpiCard = ({
+  label,
+  value,
+  subValue,
+  trend,
+  color = "text-slate-100",
+}: {
+  label: string;
+  value: string;
+  subValue?: string;
+  trend?: "up" | "down" | "neutral";
+  color?: string;
+}) => (
+  <div className="bg-slate-900/50 border border-white/5 rounded-xl p-4 flex flex-col justify-between relative overflow-hidden group transition-all hover:border-white/10">
+    <div className="absolute inset-0 bg-gradient-to-br from-blue-500/5 to-purple-500/5 opacity-0 group-hover:opacity-100 transition-opacity duration-500" />
+    <div className="z-10">
+      <span className="text-xs uppercase tracking-wider text-slate-500 font-semibold">
+        {label}
+      </span>
+      <div className={`text-2xl font-bold mt-1 ${color}`}>{value}</div>
+      {subValue && (
+        <div className="text-xs text-slate-400 mt-1">{subValue}</div>
+      )}
+    </div>
+    {trend && (
+      <div className="absolute top-4 right-4">
+        {trend === "up" ? (
+          <TrendingUp className="w-5 h-5 text-green-500" />
+        ) : trend === "down" ? (
+          <TrendingDown className="w-5 h-5 text-red-500" />
+        ) : (
+          <Activity className="w-5 h-5 text-slate-500" />
+        )}
+      </div>
+    )}
+  </div>
 );
 
-const RiskRadar: React.FC<{
-  regime: string;
-  trend: string;
-  liquidity: string;
-  warning: string;
-}> = ({
-  regime,
-  trend,
-  liquidity,
-  warning,
-}) => (
-  <Card>
-    <CardHeader>
-      <CardTitle>
-        Risk Radar
-      </CardTitle>
-    </CardHeader>
-    <CardContent className="grid grid-cols-2 gap-2 text-xs">
-      <div>
-        <div
-          className={
-            faintText
-          }
-        >
-          Trend
-        </div>
-        <div>{trend}</div>
-      </div>
-      <div>
-        <div
-          className={
-            faintText
-          }
-        >
-          Liquidity
-        </div>
-        <div>{liquidity}</div>
-      </div>
-      <div>
-        <div
-          className={
-            faintText
-          }
-        >
-          Regime
-        </div>
-        <div>{regime}</div>
-      </div>
-      <div>
-        <div
-          className={
-            faintText
-          }
-        >
-          Warning
-        </div>
-        <div>{warning}</div>
-      </div>
-    </CardContent>
-  </Card>
-);
+// --- Main Component ---
 
 export const MarketIntelTab: React.FC<{
   symbol: SymbolCode;
   mode: MarketMode;
-  exchange: string;
-}> = ({ symbol, mode }) => {
-  const { intel } = useMarketIntel(symbol);
+  exchange?: string;
+}> = ({ symbol, mode, exchange = "Binance" }) => {
+  const [intel, setIntel] = React.useState<MarketIntelResponse | null>(null);
+  const [loading, setLoading] = React.useState(true);
+  const [error, setError] = React.useState<string | null>(null);
+
+  React.useEffect(() => {
+    let alive = true;
+    setLoading(true);
+    setError(null);
+
+    // If your getMarketIntel signature is different, adjust here
+    getMarketIntel(symbol, mode)
+      .then((data) => {
+        if (!alive) return;
+        setIntel(data);
+      })
+      .catch((err) => {
+        console.error("Failed to load market intel", err);
+        if (!alive) return;
+        setIntel(null);
+        setError(err?.message || "Failed to load intel");
+      })
+      .finally(() => {
+        if (!alive) return;
+        setLoading(false);
+      });
+
+    return () => {
+      alive = false;
+    };
+  }, [symbol, mode]);
+
   const pro: any = intel || {};
 
-  const sentimentArr: IntelSeriesPoint[] =
-    pro.sentimentHistory ?? [];
-  const chainArr: IntelSeriesPoint[] =
-    pro.onChainHistory ??
-    pro.onchainHistory ??
-    [];
-  const ivArr: IntelSeriesPoint[] =
-    pro.ivHistory ?? [];
-  const fundArr: IntelSeriesPoint[] =
-    pro.fundingHistory ??
-    pro.fundingSkew ??
-    [];
-  const oiArr: IntelSeriesPoint[] =
-    pro.oiHistory ??
-    pro.openInterest ??
-    [];
-  const cvdArr: IntelSeriesPoint[] =
-    pro.cvdHistory ??
-    pro.cvd ??
-    [];
+  // Clean the symbol for display (remove -PERP, -USD etc)
+  const displaySymbol = symbol.split("-")[0];
 
-  const fundingSkew = safeNum(
-    last(fundArr)?.v ??
-      last(fundArr)?.funding,
-    0
-  );
-  const iv30 = safeNum(
-    last(ivArr)?.iv ??
-      last(ivArr)?.v ??
-      last(ivArr)?.value,
-    0.55
-  );
-  const oi = safeNum(
-    last(oiArr)?.v ?? last(oiArr),
+  // Data Extraction
+  const sentimentArr: IntelSeriesPoint[] = pro.sentimentHistory ?? [];
+  const chainArr: IntelSeriesPoint[] =
+    pro.onChainHistory ?? pro.onchainHistory ?? [];
+  const cvdArr: IntelSeriesPoint[] = pro.cvdHistory ?? pro.cvd ?? [];
+
+  // Latest Values & Safe Defaults
+  const activeAddr = safeNum(
+    chainArr.length
+      ? chainArr[chainArr.length - 1].active ??
+          chainArr[chainArr.length - 1].v
+      : 0,
     0
   );
   const cvdDelta = safeNum(
-    last(cvdArr)?.v ?? last(cvdArr),
+    cvdArr.length
+      ? cvdArr[cvdArr.length - 1].v ?? cvdArr[cvdArr.length - 1]
+      : 0,
     0
   );
   const latestScore = safeNum(
-    last(sentimentArr)?.score ??
-      last(sentimentArr)?.s,
+    sentimentArr.length
+      ? sentimentArr[sentimentArr.length - 1].score ??
+          sentimentArr[sentimentArr.length - 1].s
+      : 0,
     0
   );
 
+  // Mock RSI Calculation (or extraction if API provided it later)
+  const derivedRsi = 50 + latestScore * 20;
+
+  // Logic & Derived State
   const regimeText =
     pro.radar?.regime ??
     (latestScore > 0.25
@@ -291,323 +281,437 @@ export const MarketIntelTab: React.FC<{
       ? "MEAN-REVERT"
       : "BALANCED");
 
-  const crowdingLabel =
-    pro.radar?.crowding ??
-    (fundingSkew > 0.0001
-      ? "Longs crowded"
-      : "Normal");
+  const correlations: CorItem[] = Array.isArray(pro.correlations)
+    ? pro.correlations
+    : [
+        { name: "BTC.D", val: 0.42 },
+        { name: "ETH.D", val: 0.35 },
+        { name: "SPX", val: 0.18 },
+        { name: "DXY", val: -0.27 },
+        { name: "VIX", val: -0.31 },
+      ];
 
-  const correlations: CorItem[] =
-    Array.isArray(pro.correlations)
-      ? pro.correlations
-      : [
-          { name: "BTC.D", val: 0.42 },
-          { name: "ETH.D", val: 0.35 },
-          { name: "SPX", val: 0.18 },
-          { name: "DXY", val: -0.27 },
-          { name: "VIX", val: -0.31 },
-        ];
+  // Radar Chart Logic normalization (Spot centric)
+  const trendScore =
+    latestScore > 0 ? 75 + latestScore * 25 : 25 + latestScore * 25;
+  const volumeScore = Math.min(Math.abs(cvdDelta / 1000), 100); // Mock normalization
+  const onChainScore = chainArr.length > 0 ? 80 : 40;
 
-  const sparkFunding = (fundArr ?? [])
-    .slice(-30)
-    .map((x: any) => ({
-      v: safeNum(
-        x.v ?? x.funding,
-        0
-      ),
-    }));
-  const sparkIv = (ivArr ?? [])
-    .slice(-30)
-    .map((x: any) => ({
-      v: safeNum(
-        x.iv ??
-          x.v ??
-          x.value,
-        0
-      ),
-    }));
-  const sparkOi = (oiArr ?? [])
-    .slice(-30)
-    .map((x: any) => ({
-      v: safeNum(
-        x.v ?? x,
-        0
-      ),
-    }));
-  const sparkCvd = (cvdArr ?? [])
-    .slice(-30)
-    .map((x: any) => ({
-      v: safeNum(
-        x.v ?? x,
-        0
-      ),
-    }));
-
-  const futuresBullets = [
-    regimeText === "MOMENTUM"
-      ? "Favor trend-following entries; trail stops below swing lows."
-      : regimeText ===
-        "MEAN-REVERT"
-      ? "Fade extremes; quick exits; mean-revert focus."
-      : "Trade light until clearer bias.",
-    fundingSkew > 0
-      ? "Funding positive: watch long crowding; reduce leverage."
-      : fundingSkew < 0
-      ? "Funding negative: watch short squeezes; partial TP."
-      : "Funding neutral: normal sizing.",
+  const radarData = [
+    { subject: "Sentiment", A: trendScore, fullMark: 100 },
+    { subject: "Volume", A: volumeScore, fullMark: 100 },
+    { subject: "On-Chain", A: onChainScore, fullMark: 100 },
+    { subject: "Correlations", A: 60, fullMark: 100 }, // Static baseline
+    {
+      subject: "Momentum",
+      A: regimeText === "MOMENTUM" ? 90 : 40,
+      fullMark: 100,
+    },
   ];
 
-  const ivPct = iv30 * 100;
+  // --- Prediction Insights Generation ---
 
-  const optionsBullets = [
-    ivPct > 80
-      ? "IV high: favor credit strategies / iron condors."
-      : ivPct < 40
-      ? "IV low: favor debit structures / calendars."
-      : "IV mid: balance between credit and debit spreads.",
+  // 1. Hourly Trend Outlook
+  const trendBullets = [
     regimeText === "MOMENTUM"
-      ? "Directional call/put spreads with trailing exits."
-      : regimeText ===
-        "MEAN-REVERT"
-      ? "Broken wings or calendars around mean."
-      : "Neutral flies/condors near expected range.",
+      ? `${displaySymbol} is showing strong directional momentum.`
+      : `${displaySymbol} is in a choppy/ranging zone.`,
+    latestScore > 0.2
+      ? "Social Sentiment is Bullish."
+      : latestScore < -0.2
+      ? "Social Sentiment is Bearish."
+      : "Social Sentiment is Neutral.",
   ];
+  let trendSignal: "positive" | "negative" | "neutral" | "warning" = "neutral";
+  if (regimeText === "MOMENTUM") trendSignal = "positive";
+  else if (regimeText === "BALANCED") trendSignal = "neutral";
+  else trendSignal = "warning";
 
-  const spotBullets = [
-    regimeText === "MOMENTUM"
-      ? "DCA on dips, avoid late chasing."
-      : regimeText ===
-        "MEAN-REVERT"
-      ? "Add at support, trim into rips."
-      : "Modest DCA until clarity.",
-    chainArr.length
-      ? "Scale if on-chain activity confirms trend."
-      : "Size conservatively until on-chain confirms.",
+  // 2. Spot Market Condition
+  const conditionBullets = [
+    derivedRsi > 70
+      ? `Market is Overbought (High RSI). Risk of pullback.`
+      : derivedRsi < 30
+      ? `Market is Oversold (Low RSI). Potential bounce.`
+      : `RSI is neutral. Room for movement.`,
+    cvdDelta > 0
+      ? "Spot buyers are aggressive (Net Buy Volume)."
+      : "Spot sellers are aggressive (Net Sell Volume).",
   ];
+  let volSignal: "positive" | "negative" | "neutral" | "warning" = "neutral";
+  if (derivedRsi > 75 || derivedRsi < 25) volSignal = "warning";
+  else volSignal = "positive";
 
-  const trend =
-    pro.radar?.trend ??
-    (latestScore > 0
-      ? "UP"
-      : "DOWN");
-  const liquidity =
-    pro.radar?.liquidity ??
-    (chainArr.length
-      ? "NORMAL"
-      : "LOW");
-  const warning =
-    pro.radar?.warning ??
-    (crowdingLabel !==
-    "Normal"
-      ? crowdingLabel
-      : "—");
+  // 3. Signal Confluence
+  const confluenceBullets = [
+    cvdDelta > 0 && latestScore > 0
+      ? "Volume and Sentiment align Bullish (Strong Signal)."
+      : cvdDelta < 0 && latestScore < 0
+      ? "Volume and Sentiment align Bearish (Strong Signal)."
+      : "Divergence: Volume and Sentiment disagree.",
+    chainArr.length > 0
+      ? `On-chain activity confirms trend strength.`
+      : "Low on-chain activity; weak conviction.",
+  ];
+  let confSignal: "positive" | "negative" | "neutral" | "warning" = "neutral";
+  const directionMatch =
+    (cvdDelta > 0 && latestScore > 0) ||
+    (cvdDelta < 0 && latestScore < 0);
+  if (directionMatch) confSignal = "positive";
+  else confSignal = "warning";
+
+  const hasAnyData =
+    sentimentArr.length || chainArr.length || cvdArr.length || intel;
 
   return (
-    <div className="flex flex-col gap-6">
-      {/* KPI GRID */}
+    <div className="flex flex-col gap-6 pb-10 animate-in fade-in duration-500">
+      {/* --- ASSET HEADER --- */}
+      <div className="flex flex-col sm:flex-row sm:items-center justify-between bg-slate-900/50 p-4 rounded-xl border border-white/5 gap-4">
+        <div className="flex items-center gap-4">
+          <div className="w-12 h-12 bg-blue-600/20 rounded-full flex items-center justify-center border border-blue-500/30 text-blue-400">
+            <Coins className="w-6 h-6" />
+          </div>
+          <div>
+            <h2 className="text-xl font-bold text-white flex items-center gap-2">
+              {displaySymbol} Market Intelligence
+            </h2>
+            <p className="text-sm text-slate-400 flex items-center gap-2">
+              <ArrowRightLeft className="w-3 h-3" /> {exchange} Spot Market ·{" "}
+              {mode.toUpperCase()}
+            </p>
+          </div>
+        </div>
+
+        {/* Quick Summary Text */}
+        <div className="text-right hidden sm:block">
+          <div className="text-xs text-slate-500 uppercase font-semibold">
+            Primary Regime
+          </div>
+          <div
+            className={`text-lg font-bold ${
+              regimeText === "MOMENTUM"
+                ? "text-green-400"
+                : regimeText === "MEAN-REVERT"
+                ? "text-amber-400"
+                : "text-purple-400"
+            }`}
+          >
+            {regimeText}
+          </div>
+        </div>
+      </div>
+
+      {/* Loading / Error State */}
+      {loading && (
+        <Card className="border border-dashed border-slate-700 bg-slate-900/40">
+          <CardHeader>
+            <CardTitle className="text-sm">Loading Market Intel…</CardTitle>
+            <CardDescription className="text-xs">
+              Pulling sentiment, volume and on-chain context from the backend.
+            </CardDescription>
+          </CardHeader>
+        </Card>
+      )}
+
+      {!loading && error && (
+        <Card className="border border-rose-500/40 bg-rose-950/40">
+          <CardHeader>
+            <CardTitle className="text-sm text-rose-200">
+              Failed to load intel
+            </CardTitle>
+            <CardDescription className="text-xs text-rose-300/80">
+              {error}
+            </CardDescription>
+          </CardHeader>
+        </Card>
+      )}
+
+      {/* --- KPI STATISTICS (SPOT ONLY) --- */}
       <div className="grid grid-cols-1 sm:grid-cols-2 lg:grid-cols-4 gap-4">
-        <KpiTile
-          label="Funding Skew"
-          value={`${(
-            fundingSkew *
-            1e4
-          ).toFixed(2)} bps`}
-         // spark={sparkFunding}
+        <KpiCard
+          label={`${displaySymbol} Sentiment`}
+          value={latestScore.toFixed(2)}
+          subValue="AI Social Score"
+          trend={latestScore > 0 ? "up" : latestScore < 0 ? "down" : "neutral"}
+          color={
+            latestScore > 0
+              ? "text-green-400"
+              : latestScore < 0
+              ? "text-red-400"
+              : "text-slate-100"
+          }
         />
-        <KpiTile
-          label="30d IV"
-          value={`${ivPct.toFixed(
-            1
-          )}%`}
-          //spark={sparkIv}
+        <KpiCard
+          label="Spot Buying Pressure"
+          value={cvdDelta.toFixed(0)}
+          subValue="Net CVD (24h)"
+          color={cvdDelta > 0 ? "text-green-400" : "text-red-400"}
+          trend={cvdDelta > 0 ? "up" : cvdDelta < 0 ? "down" : "neutral"}
         />
-        <KpiTile
-          label="Open Interest"
-          value={oi.toLocaleString()}
-          //spark={sparkOi}
+        <KpiCard
+          label="Relative Strength"
+          value={derivedRsi.toFixed(0)}
+          subValue={
+            derivedRsi > 70
+              ? "Overbought"
+              : derivedRsi < 30
+              ? "Oversold"
+              : "Neutral"
+          }
+          trend={derivedRsi > 50 ? "up" : "down"}
         />
-        <KpiTile
-          label="CVD Δ"
-          value={cvdDelta.toFixed(
-            0
-          )}
-         // spark={sparkCvd}
+        <KpiCard
+          label="Network Activity"
+          value={activeAddr > 0 ? activeAddr.toLocaleString() : "Normal"}
+          subValue="Active Addresses"
+          trend="neutral"
         />
       </div>
 
-      {/* NEON CHARTS */}
-      <div className="grid grid-cols-1 lg:grid-cols-2 gap-4">
-        <Card>
+      {/* --- MAIN CHARTS AREA --- */}
+      <div className="grid grid-cols-1 lg:grid-cols-3 gap-6">
+        {/* LEFT: Sentiment Chart */}
+        <Card className="lg:col-span-2 border-slate-800 bg-slate-900/40 backdrop-blur">
           <CardHeader>
-            <CardTitle>
-              Sentiment
+            <CardTitle className="flex items-center gap-2">
+              <Activity className="w-4 h-4 text-blue-500" />
+              {displaySymbol} Sentiment Flow
             </CardTitle>
+            <CardDescription>
+              Correlation between AI Sentiment and price movement.
+            </CardDescription>
           </CardHeader>
-          <CardContent className="h-56">
-            <ResponsiveContainer
-              width="100%"
-              height="100%"
-            >
-              <LineChart
-                data={sentimentArr.map(
-                  (d, i) => ({
-                    t:
-                      d.t ??
-                      d.time ??
-                      i,
-                    s: safeNum(
-                      d.score ??
-                        d.s,
-                      0
-                    ),
-                  })
-                )}
-              >
-                <CartesianGrid
-                  strokeDasharray="3 3"
-                  opacity={0.08}
-                />
-                <XAxis
-                  dataKey="t"
-                  hide
-                />
-                <YAxis
-                  domain={[
-                    -1,
-                    1,
-                  ]}
-                  hide
-                />
-                <Tooltip />
-                <Line
-                  type="monotone"
-                  dataKey="s"
-                  dot={false}
-                  strokeWidth={2}
-                />
-              </LineChart>
-            </ResponsiveContainer>
-          </CardContent>
-        </Card>
-
-        <Card>
-          <CardHeader>
-            <CardTitle>
-              On-Chain
-              Activity
-            </CardTitle>
-          </CardHeader>
-          <CardContent className="h-56">
-            <ResponsiveContainer
-              width="100%"
-              height="100%"
-            >
+          <CardContent className="h-[300px]">
+            <ResponsiveContainer width="100%" height="100%">
               <AreaChart
-                data={chainArr.map(
-                  (d, i) => ({
-                    t:
-                      d.t ??
-                      d.time ??
-                      i,
-                    v: safeNum(
-                      d.active ??
-                        d.v ??
-                        d.value,
-                      0
-                    ),
-                  })
-                )}
+                data={sentimentArr.map((d, i) => ({
+                  t: d.t ?? d.time ?? i,
+                  s: safeNum(d.score ?? d.s, 0),
+                }))}
               >
-                <CartesianGrid
-                  strokeDasharray="3 3"
-                  opacity={0.08}
-                />
-                <XAxis
-                  dataKey="t"
-                  hide
-                />
-                <YAxis hide />
-                <Tooltip />
+                <defs>
+                  <linearGradient id="colorScore" x1="0" y1="0" x2="0" y2="1">
+                    <stop
+                      offset="5%"
+                      stopColor="#3b82f6"
+                      stopOpacity={0.3}
+                    />
+                    <stop
+                      offset="95%"
+                      stopColor="#3b82f6"
+                      stopOpacity={0}
+                    />
+                  </linearGradient>
+                </defs>
+                <CartesianGrid strokeDasharray="3 3" stroke="#1e293b" />
+                <XAxis dataKey="t" hide />
+                <YAxis domain={[-1, 1]} hide />
+                <Tooltip content={<CustomTooltip />} />
+                <ReferenceLine y={0} stroke="#475569" strokeDasharray="3 3" />
                 <Area
                   type="monotone"
-                  dataKey="v"
-                  strokeWidth={1}
+                  dataKey="s"
+                  stroke="#3b82f6"
+                  strokeWidth={2}
+                  fillOpacity={1}
+                  fill="url(#colorScore)"
+                  name="Sentiment Score"
                 />
               </AreaChart>
             </ResponsiveContainer>
           </CardContent>
         </Card>
-      </div>
 
-      {/* Correlations + Radar */}
-      <div className="grid grid-cols-1 lg:grid-cols-3 gap-4">
-        <Card className="lg:col-span-2">
+        {/* RIGHT: Spot Radar */}
+        <Card className="border-slate-800 bg-slate-900/40 backdrop-blur">
           <CardHeader>
-            <CardTitle>
-              Cross-Market
-              Correlations
+            <CardTitle className="flex items-center gap-2">
+              <Target className="w-4 h-4 text-purple-500" />
+              Spot Dynamics
             </CardTitle>
           </CardHeader>
-          <CardContent className="h-40">
-            <ResponsiveContainer
-              width="100%"
-              height="100%"
-            >
-              <BarChart
-                data={correlations.map(
-                  (c) => ({
-                    name: c.name,
-                    v: safeNum(
-                      c.val,
-                      0
-                    ),
-                  })
-                )}
+          <CardContent className="h-[300px] flex items-center justify-center relative">
+            <ResponsiveContainer width="100%" height="100%">
+              <RadarChart
+                cx="50%"
+                cy="50%"
+                outerRadius="70%"
+                data={radarData}
               >
-                <CartesianGrid
-                  strokeDasharray="3 3"
-                  opacity={0.08}
+                <PolarGrid stroke="#334155" />
+                <PolarAngleAxis
+                  dataKey="subject"
+                  tick={{ fill: "#94a3b8", fontSize: 10 }}
                 />
-                <XAxis
-                  dataKey="name"
+                <PolarRadiusAxis
+                  angle={30}
+                  domain={[0, 100]}
+                  tick={false}
+                  axisLine={false}
                 />
-                <YAxis />
-                <Tooltip />
-                <Bar
+                <Radar
+                  name="Metric Score"
+                  dataKey="A"
+                  stroke="#8b5cf6"
+                  strokeWidth={2}
+                  fill="#8b5cf6"
+                  fillOpacity={0.3}
+                />
+                <Tooltip content={<CustomTooltip />} />
+              </RadarChart>
+            </ResponsiveContainer>
+          </CardContent>
+        </Card>
+      </div>
+
+      {/* --- SECONDARY ROW: CORRELATIONS & ON-CHAIN --- */}
+      <div className="grid grid-cols-1 lg:grid-cols-3 gap-6">
+        {/* On-Chain Activity */}
+        <Card className="lg:col-span-2 border-slate-800 bg-slate-900/40">
+          <CardHeader>
+            <CardTitle className="flex items-center gap-2">
+              <Anchor className="w-4 h-4 text-indigo-500" />
+              On-Chain Activity
+            </CardTitle>
+          </CardHeader>
+          <CardContent className="h-48">
+            <ResponsiveContainer width="100%" height="100%">
+              <AreaChart
+                data={chainArr.map((d, i) => ({
+                  t: d.t ?? d.time ?? i,
+                  v: safeNum(d.active ?? d.v ?? d.value, 0),
+                }))}
+              >
+                <defs>
+                  <linearGradient id="colorChain" x1="0" y1="0" x2="0" y2="1">
+                    <stop
+                      offset="5%"
+                      stopColor="#6366f1"
+                      stopOpacity={0.3}
+                    />
+                    <stop
+                      offset="95%"
+                      stopColor="#6366f1"
+                      stopOpacity={0}
+                    />
+                  </linearGradient>
+                </defs>
+                <CartesianGrid strokeDasharray="3 3" stroke="#1e293b" />
+                <XAxis dataKey="t" hide />
+                <YAxis hide />
+                <Tooltip content={<CustomTooltip />} />
+                <Area
+                  type="monotone"
                   dataKey="v"
-                  radius={6}
+                  stroke="#6366f1"
+                  fill="url(#colorChain)"
+                  strokeWidth={2}
+                  name="Active Addresses"
                 />
-              </BarChart>
+              </AreaChart>
             </ResponsiveContainer>
           </CardContent>
         </Card>
 
-        <RiskRadar
-          regime={regimeText}
-          trend={trend}
-          liquidity={`${liquidity}`}
-          warning={`${warning}`}
-        />
+        {/* Correlations */}
+        <Card className="border-slate-800 bg-slate-900/40">
+          <CardHeader>
+            <CardTitle className="flex items-center gap-2">
+              <Zap className="w-4 h-4 text-amber-500" />
+              Correlations
+            </CardTitle>
+          </CardHeader>
+          <CardContent className="h-48">
+            <ResponsiveContainer width="100%" height="100%">
+              <BarChart
+                layout="vertical"
+                data={correlations}
+                margin={{ top: 5, right: 30, left: 20, bottom: 5 }}
+              >
+                <CartesianGrid
+                  strokeDasharray="3 3"
+                  horizontal
+                  vertical={false}
+                  stroke="#1e293b"
+                />
+                <XAxis type="number" hide domain={[-1, 1]} />
+                <YAxis
+                  dataKey="name"
+                  type="category"
+                  width={40}
+                  tick={{ fill: "#94a3b8", fontSize: 11 }}
+                  axisLine={false}
+                  tickLine={false}
+                />
+                <Tooltip
+                  cursor={{ fill: "#1e293b" }}
+                  content={<CustomTooltip />}
+                />
+                <ReferenceLine x={0} stroke="#475569" />
+                <Bar dataKey="val" radius={[0, 4, 4, 0]} barSize={12}>
+                  {correlations.map((entry, index) => (
+                    <Cell
+                      key={`cell-${index}`}
+                      fill={entry.val > 0 ? "#10b981" : "#ef4444"}
+                    />
+                  ))}
+                </Bar>
+              </BarChart>
+            </ResponsiveContainer>
+          </CardContent>
+        </Card>
       </div>
 
-      {/* Playbooks */}
+      {/* --- PREDICTION INSIGHTS --- */}
       <div className="grid grid-cols-1 md:grid-cols-3 gap-6">
-        <PlaybookCard
-          title="Futures Playbook"
-          bullets={futuresBullets}
+        <InsightCard
+          title={`${displaySymbol} Trend (1H)`}
+          icon={<Gauge className="w-5 h-5" />}
+          bullets={trendBullets}
+          signal={trendSignal}
+          colorClass="border-l-indigo-500"
         />
-        <PlaybookCard
-          title="Options Playbook"
-          bullets={optionsBullets}
+        <InsightCard
+          title="Spot Conditions"
+          icon={<BarChart3 className="w-5 h-5" />}
+          bullets={conditionBullets}
+          signal={volSignal}
+          colorClass="border-l-amber-500"
         />
-        <PlaybookCard
-          title="Spot Playbook"
-          bullets={spotBullets}
+        <InsightCard
+          title="Signal Confluence"
+          icon={<Target className="w-5 h-5" />}
+          bullets={confluenceBullets}
+          signal={confSignal}
+          colorClass="border-l-teal-500"
         />
       </div>
 
-      {/* Explainer */}
-      <ExplainCard />
+      {/* --- FOOTER NOTE --- */}
+      <div className="flex items-start gap-2 p-4 bg-blue-900/20 border border-blue-800/50 rounded-lg text-xs text-blue-200">
+        <Info className="w-4 h-4 mt-0.5 shrink-0" />
+        <p>
+          This intelligence panel analyzes {displaySymbol} spot conditions to
+          provide context for the hourly price prediction model. Use it to
+          understand whether the environment is momentum, mean-reversion, or
+          mixed before acting on signals.
+        </p>
+      </div>
+
+      {!hasAnyData && !loading && !error && (
+        <Card className="border border-dashed border-slate-700 bg-slate-900/40">
+          <CardHeader>
+            <CardTitle className="text-sm">
+              Waiting for live intel…
+            </CardTitle>
+            <CardDescription className="text-xs">
+              No historical intel received yet for this symbol. As soon as
+              upstream collectors publish data, this panel will populate
+              automatically.
+            </CardDescription>
+          </CardHeader>
+        </Card>
+      )}
     </div>
   );
 };

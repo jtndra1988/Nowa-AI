@@ -1,4 +1,4 @@
-# app/ml/train_xgb.py
+# app/ml/train_tft.py
 
 import logging
 from datetime import timedelta
@@ -7,8 +7,8 @@ from pathlib import Path
 import numpy as np
 import pandas as pd
 from sqlalchemy import func
+from sklearn.ensemble import RandomForestRegressor
 from sklearn.metrics import mean_squared_error
-from sklearn.ensemble import GradientBoostingRegressor
 import joblib
 
 from app.db.database import SessionLocal
@@ -21,30 +21,29 @@ logging.basicConfig(level=logging.INFO)
 
 ARTIFACTS_DIR = Path(getattr(settings, "MODEL_ARTIFACTS_DIR", "model_artifacts"))
 ARTIFACTS_DIR.mkdir(parents=True, exist_ok=True)
-ARTIFACT_PATH = ARTIFACTS_DIR / "xgb_model.pkl"
-
-# Try real XGBoost if available
-try:
-    from xgboost import XGBRegressor  # type: ignore
-except Exception:  # noqa: BLE001
-    XGBRegressor = None
+ARTIFACT_PATH = ARTIFACTS_DIR / "tft_model.pkl"
 
 
 def _load_market_data(session, lookback_days: int = 60) -> pd.DataFrame:
-    logger.info("[XGB] Loading market data from DB...")
+    """
+    Load recent OHLCV data from MarketData for all symbols.
+    """
+    logger.info("[TFT] Loading market data from DB...")
     last_ts = session.query(func.max(models.MarketData.timestamp)).scalar()
     if not last_ts:
-        raise RuntimeError("[XGB] No MarketData available in DB")
+        raise RuntimeError("[TFT] No MarketData available in DB")
 
     start_ts = last_ts - timedelta(days=lookback_days)
+
     rows = (
         session.query(models.MarketData)
         .filter(models.MarketData.timestamp >= start_ts)
         .order_by(models.MarketData.symbol, models.MarketData.timestamp)
         .all()
     )
+
     if not rows:
-        raise RuntimeError("[XGB] No rows found in MarketData for given window")
+        raise RuntimeError("[TFT] No rows found in MarketData for given window")
 
     data = [
         {
@@ -59,13 +58,19 @@ def _load_market_data(session, lookback_days: int = 60) -> pd.DataFrame:
         for r in rows
     ]
 
-    df = pd.DataFrame(data).sort_values(["symbol", "timestamp"]).reset_index(drop=True)
-    logger.info("[XGB] Loaded %d OHLCV rows for %d symbols", len(df), df["symbol"].nunique())
+    df = pd.DataFrame(data)
+    df = df.sort_values(["symbol", "timestamp"]).reset_index(drop=True)
+    logger.info("[TFT] Loaded %d OHLCV rows for %d symbols", len(df), df["symbol"].nunique())
     return df
 
 
 def _build_features(df: pd.DataFrame, horizon: int = 1) -> tuple[np.ndarray, np.ndarray, list[str]]:
-    logger.info("[XGB] Building features...")
+    """
+    Build time-series features and target:
+      - features from past OHLCV stats
+      - target = next-period return (close_{t+1} / close_t - 1)
+    """
+    logger.info("[TFT] Building features...")
     df = df.copy()
     df["timestamp"] = pd.to_datetime(df["timestamp"], utc=True)
 
@@ -75,14 +80,17 @@ def _build_features(df: pd.DataFrame, horizon: int = 1) -> tuple[np.ndarray, np.
     for sym, g in groups:
         g = g.sort_values("timestamp").copy()
         g["ret_1h"] = g["close"].pct_change()
-        g["ret_4h"] = g["close"].pct_change(4)
-        g["ret_12h"] = g["close"].pct_change(12)
-
         g["log_ret"] = np.log(g["close"]).diff()
-        g["roll_vol_12h"] = g["log_ret"].rolling(12).std()
+
         g["roll_vol_24h"] = g["log_ret"].rolling(24).std()
-        g["roll_vol_12h"] = g["roll_vol_12h"].fillna(g["roll_vol_12h"].median())
+        g["roll_mean_24h"] = g["log_ret"].rolling(24).mean()
+        g["roll_vol_6h"] = g["log_ret"].rolling(6).std()
+        g["roll_vol_12h"] = g["log_ret"].rolling(12).std()
+
         g["roll_vol_24h"] = g["roll_vol_24h"].fillna(g["roll_vol_24h"].median())
+        g["roll_mean_24h"] = g["roll_mean_24h"].fillna(0.0)
+        g["roll_vol_6h"] = g["roll_vol_6h"].fillna(g["roll_vol_6h"].median())
+        g["roll_vol_12h"] = g["roll_vol_12h"].fillna(g["roll_vol_12h"].median())
 
         g["target_ret"] = g["close"].shift(-horizon) / g["close"] - 1.0
 
@@ -94,67 +102,56 @@ def _build_features(df: pd.DataFrame, horizon: int = 1) -> tuple[np.ndarray, np.
         "close",
         "volume",
         "ret_1h",
-        "ret_4h",
-        "ret_12h",
+        "roll_vol_6h",
         "roll_vol_12h",
         "roll_vol_24h",
+        "roll_mean_24h",
     ]
 
     df_feat = df_feat.dropna(subset=feature_cols + ["target_ret"])
     X = df_feat[feature_cols].values.astype(float)
     y = df_feat["target_ret"].values.astype(float)
 
-    logger.info("[XGB] Final training rows: %d", len(df_feat))
+    logger.info("[TFT] Final training rows: %d", len(df_feat))
     return X, y, feature_cols
 
 
-def _train_xgb_model(X: np.ndarray, y: np.ndarray):
+def _train_tft_like_model(X: np.ndarray, y: np.ndarray):
+    """
+    A TFT-like regressor: RandomForest on engineered features.
+    """
     if len(X) < 500:
-        raise RuntimeError(f"[XGB] Not enough rows to train (got {len(X)}, need >= 500)")
+        raise RuntimeError(f"[TFT] Not enough rows to train (got {len(X)}, need >= 500)")
 
     split = int(len(X) * 0.8)
     X_train, X_val = X[:split], X[split:]
     y_train, y_val = y[:split], y[split:]
 
-    if XGBRegressor is not None:
-        logger.info("[XGB] Training real XGBRegressor...")
-        model = XGBRegressor(
-            n_estimators=400,
-            max_depth=6,
-            learning_rate=0.05,
-            subsample=0.9,
-            colsample_bytree=0.9,
-            objective="reg:squarederror",
-            tree_method="hist",
-            n_jobs=-1,
-            random_state=42,
-        )
-    else:
-        logger.info("[XGB] xgboost not installed, falling back to GradientBoostingRegressor...")
-        model = GradientBoostingRegressor(
-            n_estimators=300,
-            max_depth=3,
-            learning_rate=0.05,
-            random_state=42,
-        )
+    logger.info("[TFT] Training RandomForestRegressor as TFT-like model...")
+    model = RandomForestRegressor(
+        n_estimators=300,
+        max_depth=8,
+        n_jobs=-1,
+        random_state=42,
+    )
 
     model.fit(X_train, y_train)
 
     y_pred = model.predict(X_val)
     rmse = mean_squared_error(y_val, y_pred, squared=False)
-    logger.info("[XGB] Validation RMSE: %.6f", rmse)
+    logger.info("[TFT] Validation RMSE: %.6f", rmse)
 
     return model, {"rmse": float(rmse)}
 
 
 def main():
-    logger.info("[XGB] ==== Training XGB core model ====")
+    logger.info("[TFT] ==== Training TFT core model ====")
     session = SessionLocal()
     try:
         df = _load_market_data(session, lookback_days=90)
         X, y, feature_cols = _build_features(df)
 
-        model, metrics = _train_xgb_model(X, y)
+        model, metrics = _train_tft_like_model(X, y)
 
         artifact = {
             "model": model,
@@ -162,10 +159,10 @@ def main():
             "metrics": metrics,
         }
         joblib.dump(artifact, ARTIFACT_PATH)
-        logger.info("[XGB] Saved model artifact to %s", ARTIFACT_PATH)
+        logger.info("[TFT] Saved model artifact to %s", ARTIFACT_PATH)
     finally:
         session.close()
-    logger.info("[XGB] Training complete.")
+    logger.info("[TFT] Training complete.")
 
 
 if __name__ == "__main__":

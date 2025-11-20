@@ -43,7 +43,11 @@ services:
       DATABASE_URL: postgresql+psycopg2://nowa:nowa@db:5432/nowa
       CELERY_BROKER_URL: redis://redis:6379/0
       CELERY_RESULT_BACKEND: redis://redis:6379/0
+      PROMETHEUS_ENABLED: "true"
+      PROMETHEUS_PORT: "9100"
       TZ: UTC
+    ports:
+      - "9100:9100"
     volumes:
       - ./backend/app:/app/app
     depends_on:

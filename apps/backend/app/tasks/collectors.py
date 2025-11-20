@@ -377,7 +377,8 @@ def collect_all_assets_task():
         adapter = BinanceDataAdapter() if getattr(settings, "USE_BINANCE_FOR_DATA", True) else BybitAdapter(paper_mode=PAPER_MODE)
 
         # Get base symbols (e.g., BTC, ETH)
-        assets_bases = adapter.get_top_symbols_by_volume(limit=30)
+        assets_bases = adapter.get_top_symbols_by_volume(limit=100)
+
         if not assets_bases:
             print("[!] Could not fetch top symbols. Aborting collection.")
             return
@@ -432,7 +433,7 @@ def collect_binance_historical_data():
     logger = logging.getLogger(__name__)
     logger.info("[*] Starting Binance historical data collection...")
     adapter = BinanceDataAdapter()
-    symbols_bases = adapter.get_top_symbols_by_volume(limit=30)
+    symbols_bases = adapter.get_top_symbols_by_volume(limit=100)
     if not symbols_bases:
         logger.warning("[!] No symbols returned from Binance. Aborting.")
         return

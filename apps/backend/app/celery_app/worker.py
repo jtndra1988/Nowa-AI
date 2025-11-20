@@ -16,6 +16,7 @@ from typing import List, Optional, Any, Dict
 
 import numpy as np
 import pandas as pd
+import logging
 
 from celery.schedules import crontab
 from celery.signals import (
@@ -24,18 +25,29 @@ from celery.signals import (
     task_prerun,
     task_postrun,
     task_failure,
+    after_setup_logger,
 )
+try:
+    import redis  # type: ignore
+except Exception:  # noqa: BLE001
+    redis = None
 
 from app.celery_app.app import celery_app
-from app.core.logging_setup import init_logging
+from app.core.logging_setup import init_logging  # noqa: F401 (side effect)
 from app.core.config import settings
-from app.infra.alerts import alert_task_failure, alert_worker_event
+from app.infra.alerts import (
+    alert_task_failure,
+    alert_worker_event,
+    setup_telegram_logging,
+    alert_info,
+)
 from app.infra.metrics import time_task, WORKER_HEARTBEAT, APP_RESTARTS
 from app.exchange.adapters import BybitAdapter
 from app.db import models
 from app.db.database import SessionLocal
 
 # --- Import Tasks that are known to exist ---
+
 from app.tasks.collectors import (
     collect_all_assets_task,
     collect_fear_and_greed_task,
@@ -43,7 +55,7 @@ from app.tasks.collectors import (
     collect_binance_historical_data,
 )
 
-# We keep only the fusion function import (this exists in your repo)
+# Sentiment fusion (L2 sentiment)
 from app.tasks.sentiment_fusion_collector import run_sentiment_fusion
 
 # ML training tasks (TFT/TCN/XGB/LLM/RL)
@@ -53,6 +65,22 @@ from app.tasks.training_tasks import (
     retrain_llm_narrative_model,
     retrain_rl_agent,
 )
+
+# Options derived metrics (per symbol)
+from app.tasks.options_metrics_collector import (
+    calculate_options_derived_metrics_task,
+)
+
+# --- Side-effect imports to ensure Celery registers ALL task names ---
+# (These modules define @celery_app.task(...) but are not otherwise imported.)
+import app.tasks.sentiment_collector          # defines tasks.collect_sentiment_all_sources & tasks.run_all_sentiment_collectors
+import app.tasks.sentiment_scorer            # defines tasks.score_headlines_task & app.tasks.sentiment_scorer.run_sentiment_scorer
+import app.tasks.orderbook_collector         # defines tasks.collect_orderbook_snapshot
+import app.tasks.onchain_collector           # defines tasks.collect_onchain_data
+import app.tasks.cross_asset_corre_collector # defines tasks.run_cross_asset_corre
+import app.tasks.github_collector            # defines tasks.collect_github_activity
+import app.tasks.funding_collector           # defines tasks.collect_funding_rates
+import app.tasks.options_metrics_collector   # defines tasks.calculate_options_derived_metrics
 
 # ---- Risk Settings service (safe import) ----
 try:
@@ -67,7 +95,7 @@ except ImportError:
             return []
 
 
-# Ensure we autodiscover only our app tasks
+# Ensure we autodiscover only our app tasks (kept for completeness)
 celery_app.autodiscover_tasks(["app.tasks"])
 
 # ---- Globals (populated by worker_ready) ----
@@ -76,10 +104,49 @@ LAST_RISK_REFRESH = 0
 LAST_TASK_TS = time.time()
 IS_READY = False
 
-import logging
+# Cross-process watchdog state in Redis
+REDIS_WATCHDOG_KEY = "mars:last_task_ts"
+REDIS_CLIENT = None  # type: ignore[var-annotated]
 
 logger = logging.getLogger(__name__)
+# Enable Telegram logging for all logs >= INFO
+setup_telegram_logging(level=logging.INFO)
+# Optional: one-time bootstrap marker
+alert_info(
+    "Worker module imported",
+    pid=os.getpid(),
+    file=__file__,
+)
 
+
+def _get_redis_watchdog_client():
+    """
+    Lazily initialize a Redis client for the watchdog.
+
+    Uses the same URL as the Celery broker (Redis) so we don't need extra config.
+    If redis-py is not installed or connection fails, returns None and the
+    watchdog falls back to process-local LAST_TASK_TS.
+    """
+    global REDIS_CLIENT
+
+    if redis is None:
+        # redis-py not installed; nothing to do
+        return None
+
+    if REDIS_CLIENT is not None:
+        return REDIS_CLIENT
+
+    try:
+        client = redis.from_url(settings.CELERY_BROKER_URL)  # type: ignore[arg-type]
+        REDIS_CLIENT = client
+        logger.info(
+            "[Watchdog] Redis client initialized for key %s",
+            REDIS_WATCHDOG_KEY,
+        )
+        return client
+    except Exception as e:  # noqa: BLE001
+        logger.error("[Watchdog] Failed to init Redis client: %s", e)
+        return None
 
 # ======================================================================
 # 1. Task Scheduling (Celery Beat)
@@ -94,9 +161,9 @@ def setup_periodic_tasks(sender, **kwargs):
     global RISK_SETTINGS
     logger.info("Configuring periodic tasks (Celery Beat)...")
 
-    # --- Data Collection ---
+    # --- Core market data collection ---
 
-    # Master task: kicks off options, futures, sentiment, orderbook, etc
+    # Master task: kicks off spot/futures/options collections etc.
     sender.add_periodic_task(
         crontab(minute="*/15"),  # Every 15 minutes
         collect_all_assets_task.s(),
@@ -124,66 +191,87 @@ def setup_periodic_tasks(sender, **kwargs):
         name="[Data] Collect Binance Historical Data",
     )
 
-    # --- Sentiment stack (use string task names to avoid import crashes) ---
+    # --- Sentiment stack ---
 
-    # Sentiment scorer
+    # Main multi-source sentiment collector (NewsAPI, CryptoPanic, Santiment, etc.)
+    sender.add_periodic_task(
+        60.0,  # every 60 seconds
+        "tasks.run_all_sentiment_collectors",
+        name="[Sentiment] Collect from all sources",
+    )
+
+    # Headline scorer (LLM/ML sentiment for raw headlines)
     sender.add_periodic_task(
         300.0,  # every 5 minutes
         "app.tasks.sentiment_scorer.run_sentiment_scorer",
-        name="sentiment_scorer",
+        name="[Sentiment] Score headlines",
     )
 
-    # Sentiment collector (whatever you named the main collector)
-    sender.add_periodic_task(
-        60.0,  # every 60 seconds
-        "app.tasks.sentiment_collector.run_sentiment_collector",
-        name="sentiment_collector",
-    )
-
-    # Sentiment fusion (we know run_sentiment_fusion exists)
+    # Sentiment fusion → SentimentFusion table
     sender.add_periodic_task(
         crontab(minute="*/30"),
         run_sentiment_fusion.s(),
-        name="[Data] Run Sentiment Fusion",
+        name="[Sentiment] Run Sentiment Fusion",
     )
 
-    # --- Other data collectors via string names (safe) ---
+    # --- Other data collectors via registered task names ---
 
+    # Cross-asset correlations vs ETH/DXY/NDX/GOLD
     sender.add_periodic_task(
         300.0,
-        "app.tasks.cross_asset_collector.run_cross_asset_collector",
-        name="cross_asset_correlation",
+        "tasks.run_cross_asset_corre",
+        name="[Data] Cross-asset correlation",
     )
 
-    sender.add_periodic_task(
-        300.0,
-        "app.tasks.funding_collector.run_funding_collector",
-        name="funding_collector",
-    )
-
-    sender.add_periodic_task(
-        900.0,
-        "app.tasks.github_collector.run_github_collector",
-        name="github_collector",
-    )
-
-    sender.add_periodic_task(
-        300.0,
-        "app.tasks.options_metric_collector.run_options_metric_collector",
-        name="options_metric_collector",
-    )
-
+    # Orderbook snapshots + CDV/imbalance for top symbols
     sender.add_periodic_task(
         10.0,
-        "app.tasks.orderbook_collector.run_orderbook_collector",
-        name="orderbook_collector",
+        "tasks.collect_orderbook_snapshot",
+        name="[Data] Orderbook snapshots",
     )
 
+    # On-chain metrics (CoinMetrics + WhaleAlert)
     sender.add_periodic_task(
         300.0,
-        "app.tasks.onchain_collector.run_onchain_collector",
-        name="onchain_collector",
+        "tasks.collect_onchain_data",
+        name="[Data] On-chain metrics",
     )
+
+    # Funding rates on perpetuals
+    sender.add_periodic_task(
+        300.0,
+        "tasks.collect_funding_rates",
+        name="[Data] Funding rates",
+    )
+
+    # GitHub / dev-activity metrics
+    sender.add_periodic_task(
+        900.0,
+        "tasks.collect_github_activity",
+        name="[Data] GitHub activity",
+    )
+
+    # --- Options-derived metrics per active symbol ---
+
+    # We drive this off RiskSettings so that when you mark the
+    # "top 100" symbols as active, they all get options metrics.
+    try:
+        active_symbols = _get_active_symbols_from_settings()
+    except Exception as e:
+        logger.error(f"Failed to load active symbols for options metrics: {e}")
+        # Safe fallback to at least BTC/ETH
+        active_symbols = ["BTC", "ETH"]
+
+    if not active_symbols:
+        active_symbols = ["BTC", "ETH"]
+
+    # Schedule a derived-metrics ETL per symbol, once per hour.
+    for sym in active_symbols:
+        sender.add_periodic_task(
+            crontab(minute=5, hour="*"),  # hh:05 every hour
+            calculate_options_derived_metrics_task.s(symbol=sym),
+            name=f"[Options] Derived metrics for {sym}",
+        )
 
     # --- ML training pipeline ---
 
@@ -210,6 +298,22 @@ def setup_periodic_tasks(sender, **kwargs):
 
     logger.info("Periodic tasks configured.")
 
+@after_setup_logger.connect
+def configure_celery_logger(logger, *args, **kwargs):
+    """
+    Called by Celery after it configures its own logging.
+    We attach our TelegramLogHandler here so it doesn't get wiped.
+    """
+    setup_telegram_logging(level=logging.INFO)
+    try:
+        alert_info(
+            "Telegram logging attached",
+            celery_logger=logger.name,
+            pid=os.getpid(),
+        )
+    except Exception:
+        # Never break worker startup if Telegram misbehaves
+        logger.debug("Failed to send Telegram logging attach notice", exc_info=True)
 
 # ======================================================================
 # 2. Worker Lifecycle & Monitoring
@@ -225,17 +329,23 @@ def on_worker_ready(sender, **kwargs):
     """
     global IS_READY
     logger.info(f"Worker ready (PID: {os.getpid()}). Initializing...")
-    alert_worker_event("Worker ready", "INFO")
+    alert_worker_event("Worker ready")
 
-    # Start Prometheus server in a background thread
-    prom_port = settings.PROMETHEUS_PORT
-    prom_thread = threading.Thread(
-        target=_start_prometheus, args=(prom_port,), daemon=True
-    )
-    prom_thread.start()
+    # ---- Prometheus startup (safe / optional) ----
+    prom_enabled = getattr(settings, "PROMETHEUS_ENABLED", False)
+    prom_port = int(getattr(settings, "PROMETHEUS_PORT", 9100))
+
+    if prom_enabled:
+        prom_thread = threading.Thread(
+            target=_start_prometheus, args=(prom_port,), daemon=True
+        )
+        prom_thread.start()
+        logger.info(f"Prometheus metrics server requested on port {prom_port}")
+    else:
+        logger.info("Prometheus metrics disabled via settings.")
 
     # Start Watchdog in a background thread
-    watchdog_thread = Watchdog(interval_min=15)  # Restarts if idle > 15 min
+    watchdog_thread = Watchdog(interval_min=15)
     watchdog_thread.start()
 
     # Load initial risk settings
@@ -244,11 +354,10 @@ def on_worker_ready(sender, **kwargs):
     IS_READY = True
     logger.info("Worker initialization complete.")
 
-
 @worker_shutdown.connect
 def on_worker_shutdown(sender, **kwargs):
     logger.warning("Worker shutting down...")
-    alert_worker_event("Worker shutdown", "WARNING")
+    alert_worker_event("Worker shutdown")
 
 
 @task_prerun.connect
@@ -300,11 +409,29 @@ def on_task_prerun(task_id, task, args, kwargs, **z):
 def on_task_postrun(task_id, task, args, kwargs, retval, state, **z):
     """
     After any task runs, update the LAST_TASK_TS for the watchdog.
+
+    IMPORTANT:
+    - We update the process-local LAST_TASK_TS (for metrics, logging).
+    - We ALSO write a timestamp into Redis so the Watchdog thread
+      in the main process can see activity from all forked workers.
     """
     global LAST_TASK_TS
-    LAST_TASK_TS = time.time()
-    WORKER_HEARTBEAT.set(int(LAST_TASK_TS))
 
+    ts = time.time()
+    LAST_TASK_TS = ts
+    ts_int = int(ts)
+
+    # existing Prometheus heartbeat
+    WORKER_HEARTBEAT.set(ts_int)
+
+    # cross-process heartbeat via Redis
+    client = _get_redis_watchdog_client()
+    if client is not None:
+        try:
+            # TTL is just a safety net; key will be constantly refreshed anyway.
+            client.set(REDIS_WATCHDOG_KEY, ts_int, ex=24 * 60 * 60)
+        except Exception as e:  # noqa: BLE001
+            logger.error("[Watchdog] Failed to update Redis heartbeat: %s", e)
 
 @task_failure.connect
 def on_task_failure(task_id, exception, args, kwargs, traceback, einfo, **z):
@@ -315,9 +442,25 @@ def on_task_failure(task_id, exception, args, kwargs, traceback, einfo, **z):
     LAST_TASK_TS = time.time()
     WORKER_HEARTBEAT.set(int(LAST_TASK_TS))
 
-    task_name = getattr(args[0], "name", "unknown_task")
-    logger.error(f"Task {task_name} (ID: {task_id}) failed: {exception}")
-    alert_task_failure(task_name, exception, traceback)
+    # Celery gives us the task object in args[0] for bound tasks
+    task_obj = args[0] if args else None
+    task_name = getattr(task_obj, "name", "unknown_task")
+
+    # Log with full traceback to standard logging (also goes to Telegram via handler)
+    logger.error(
+        "Task %s (ID: %s) failed: %s",
+        task_name,
+        task_id,
+        exception,
+        exc_info=einfo,
+    )
+
+    # Compose a compact error string for the alert helper
+    err_text = f"{exception}\n{traceback}"
+
+    # Pretty Telegram alert specific for failed tasks
+    alert_task_failure(str(task_name), str(task_id), err_text)
+
 
 
 # ======================================================================
@@ -361,19 +504,29 @@ def _refresh_risk_settings():
 
 def _get_active_symbols_from_settings() -> List[str]:
     """
-    Gets a list of symbols that are marked as active in the settings.
+    Gets a list of symbols that are marked as active in risk_settings_symbol.
+    This is what drives the “top-100 hourly prediction universe”.
     """
-    global RISK_SETTINGS
-    if not RISK_SETTINGS:
-        _refresh_risk_settings()
-
-    active_symbols = [
-        symbol for symbol, settings in RISK_SETTINGS.items() if settings.is_active
-    ]
-    logger.info(f"Found {len(active_symbols)} active symbols.")
-    return active_symbols
-
-
+    db = SessionLocal()
+    try:
+        rows = (
+            db.query(models.RiskSettingsSymbol)
+              .filter(models.RiskSettingsSymbol.is_active == True)  # noqa: E712
+              .order_by(models.RiskSettingsSymbol.symbol)
+              .all()
+        )
+        symbols = [r.symbol for r in rows]
+        logger.info(
+            "Found %d active symbols for periodic tasks. Sample: %s",
+            len(symbols),
+            symbols[:10],
+        )
+        return symbols
+    except Exception as e:
+        logger.error(f"Failed to load active symbols from risk_settings_symbol: {e}", exc_info=True)
+        return []
+    finally:
+        db.close()
 def _get_risk_settings(symbol: str) -> Optional[models.RiskSettingsSymbol]:
     """
     Safely get risk settings for a symbol from the cache.
@@ -384,37 +537,76 @@ def _get_risk_settings(symbol: str) -> Optional[models.RiskSettingsSymbol]:
 class Watchdog(threading.Thread):
     """
     Restarts the worker if it's been idle for too long.
-    This protects against silent freezes (e.g., deadlocks, lost DB connection).
+
+    Uses a Redis-backed heartbeat so that:
+    - Any forked worker process that finishes a task updates the timestamp.
+    - The main process Watchdog thread reads the same timestamp.
     """
 
-    def __init__(self, interval_min=15):
+    def __init__(self, interval_min: int = 15):
         super().__init__()
         self.interval_sec = interval_min * 60
         self.daemon = True
         self.name = "WatchdogThread"
         logger.info(
-            f"Watchdog initialized: will restart container if idle > {interval_min} min."
+            "Watchdog initialized: will restart container if idle > %s min.",
+            interval_min,
         )
 
-    def run(self):
-        global LAST_TASK_TS
+    def _get_last_task_ts(self) -> float:
+        """
+        Read the last-task timestamp, preferring Redis (cross-process)
+        but falling back to the local LAST_TASK_TS if Redis is not available.
+        """
+        # Start with local fallback
+        last_ts = LAST_TASK_TS
+
+        client = _get_redis_watchdog_client()
+        if client is not None:
+            try:
+                raw = client.get(REDIS_WATCHDOG_KEY)
+                if raw is not None:
+                    try:
+                        last_ts = float(raw)
+                    except (TypeError, ValueError):
+                        logger.warning(
+                            "[Watchdog] Invalid last_task_ts in Redis: %r", raw
+                        )
+            except Exception as e:  # noqa: BLE001
+                logger.error(
+                    "[Watchdog] Failed to read Redis key %s: %s",
+                    REDIS_WATCHDOG_KEY,
+                    e,
+                )
+
+        return last_ts
+
+    def run(self) -> None:
+        logger.info(
+            "[Watchdog] Thread started; checking idle time every %ss.",
+            self.interval_sec,
+        )
         while True:
             time.sleep(self.interval_sec)
-            idle_time = time.time() - LAST_TASK_TS
+
+            last_ts = self._get_last_task_ts()
+            idle_time = time.time() - last_ts
 
             if idle_time > self.interval_sec:
                 APP_RESTARTS.inc()
                 logger.critical(
-                    f"[WATCHDOG] No task completed in {idle_time:.0f}s. "
-                    f"Restarting container NOW."
+                    "[WATCHDOG] No task completed in %.0fs "
+                    "(threshold=%ss). Restarting container NOW.",
+                    idle_time,
+                    self.interval_sec,
                 )
                 alert_worker_event(
-                    f"Watchdog restart: idle for {idle_time:.0f}s", "CRITICAL"
+                    f"Watchdog restart: idle for {idle_time:.0f}s"
                 )
 
+                # give logs/alerts a moment to flush
                 time.sleep(5)
                 os._exit(1)
-
 
 def _start_prometheus(port: int):
     """Start a Prometheus metrics server in a background thread."""

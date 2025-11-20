@@ -333,7 +333,7 @@ class RiskSettingsSymbol(Base):
 
     id = Column(Integer, primary_key=True)
     symbol = Column(String, index=True, unique=True, nullable=False)
-
+    is_active = Column(Boolean, nullable=False, default=True)
     max_symbol_leverage = Column(Float, nullable=True)
     max_symbol_exposure_pct = Column(Float, nullable=True)
     atr_length = Column(Integer, nullable=True)

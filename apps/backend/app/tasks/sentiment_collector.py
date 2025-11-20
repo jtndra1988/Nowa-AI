@@ -6,7 +6,7 @@ from app.celery_app.app import celery_app
 from app.db.database import SessionLocal
 from app.db.models import SentimentData
 from app.core.config import settings
-from app.utils import _safe_float
+from app.utils import _safe_float , build_top100_slug_map
 
 
 def _commit_or_rollback(db_session, source_name: str):
@@ -16,6 +16,27 @@ def _commit_or_rollback(db_session, source_name: str):
     except Exception as commit_e:
         print(f"[!] Commit failed after {source_name}: {commit_e}")
         db_session.rollback()
+
+
+# Mapping for LunarCrush slugs (BTC -> bitcoin, etc.)
+LUNARCRUSH_SYMBOL_MAP = build_top100_slug_map()
+
+
+def _lunarcrush_slug(sym: str) -> str:
+    """
+    Normalize a trading symbol (BTC, BTCUSDT, BTC/USDT) into a LunarCrush slug.
+    """
+    base = sym.upper()
+    # Strip common suffixes & separators
+    base = base.replace("USDT", "").replace("USD", "")
+    base = base.replace("/", "")
+
+    slug = LUNARCRUSH_SYMBOL_MAP.get(base)
+    if slug:
+        return slug
+
+    # Fallback: just lowercase the base
+    return base.lower()
 
 
 @celery_app.task(name="tasks.collect_sentiment_all_sources")
@@ -52,19 +73,26 @@ def collect_sentiment_all_sources(
                     "language": "en",
                     "sortBy": "publishedAt",
                     "q": f'"{sym}" AND ("crypto" OR "bitcoin" OR "blockchain")',
-                    "pageSize": 50,
+                    "pageSize": 20,
                 }
                 r = requests.get(
                     "https://newsapi.org/v2/everything",
                     params=params,
-                    timeout=10,
+                    timeout=30,
                 )
                 r.raise_for_status()
-                for a in r.json().get("articles", []):
+                try:
+                    payload = r.json()
+                except ValueError:
+                    print(f"[!] NewsAPI: Non-JSON response for {sym}: {r.text[:200]}")
+                    continue
+
+                for a in payload.get("articles", []):
                     ts_str = a.get("publishedAt")
                     ts = (
                         datetime.fromisoformat(ts_str.replace("Z", "+00:00"))
-                        if ts_str else now
+                        if ts_str
+                        else now
                     )
                     db_session.merge(
                         SentimentData(
@@ -100,11 +128,18 @@ def collect_sentiment_all_sources(
                 timeout=10,
             )
             r.raise_for_status()
-            for post in r.json().get("results", []):
+            try:
+                payload = r.json()
+            except ValueError:
+                print(f"[!] CryptoPanic: Non-JSON response: {r.text[:200]}")
+                payload = {}
+
+            for post in payload.get("results", []):
                 ts_str = post.get("published_at")
                 ts = (
                     datetime.fromisoformat(ts_str.replace("Z", "+00:00"))
-                    if ts_str else now
+                    if ts_str
+                    else now
                 )
                 src = post.get("source", {}).get("title", "CryptoPanic")
                 headline = post.get("title", "") or ""
@@ -121,9 +156,7 @@ def collect_sentiment_all_sources(
                 elif s == "important":
                     score = 0.3
 
-                sym_code = (
-                    (post.get("currencies") or [{}])[0].get("code", "ALL")
-                )
+                sym_code = ((post.get("currencies") or [{}])[0].get("code", "ALL"))
 
                 db_session.merge(
                     SentimentData(
@@ -141,7 +174,7 @@ def collect_sentiment_all_sources(
             print(f"[!] CryptoPanic error: {e}")
             db_session.rollback()
 
-    # 3) Santiment Whale Tx
+    # 3) Santiment Whale Tx (HARDENED)
     if getattr(settings, "SANTIMENT_API_KEY", None):
         print("[Santiment] Fetching whale metrics...")
         try:
@@ -149,7 +182,7 @@ def collect_sentiment_all_sources(
                 q = {
                     "query": f"""
                     {{
-                      getMetric(metric: "whale_transactions_count") {{
+                      getMetric(metric: "whale_transaction_count_1m_usd_to_inf") {{
                         timeseriesData(
                           slug: "{sym.lower()}",
                           from: "utc_now-1h",
@@ -163,33 +196,62 @@ def collect_sentiment_all_sources(
                     }}
                     """
                 }
-                r = requests.post(
-                    "https://api.santiment.net/graphql",
-                    json=q,
-                    headers={"Authorization": f"Apikey {settings.SANTIMENT_API_KEY}"},
-                    timeout=10,
-                )
-                r.raise_for_status()
-                data = (
-                    r.json()
-                    .get("data", {})
-                    .get("getMetric", {})
-                    .get("timeseriesData", [])
-                )
-                for d in data:
+                try:
+                    r = requests.post(
+                        "https://api.santiment.net/graphql",
+                        json=q,
+                        headers={
+                            "Authorization": f"Apikey {settings.SANTIMENT_API_KEY}"
+                        },
+                        timeout=10,
+                    )
+                    r.raise_for_status()
+                except requests.RequestException as re:
+                    print(f"[!] Santiment HTTP error for {sym}: {re}")
+                    continue
+
+                try:
+                    resp_json = r.json()
+                except ValueError:
+                    print(
+                        f"[!] Santiment: Non-JSON response for {sym}: {r.text[:200]}"
+                    )
+                    continue
+
+                root = (resp_json or {}).get("data") or {}
+                metric = root.get("getMetric") or {}
+                series = metric.get("timeseriesData") or []
+
+                if not isinstance(series, list) or not series:
+                    print(
+                        f"[!] Santiment: No timeseriesData for {sym}. Raw={resp_json}"
+                    )
+                    continue
+
+                for d in series:
                     ts_str = d.get("datetime")
                     ts = (
                         datetime.fromisoformat(ts_str.replace("Z", "+00:00"))
-                        if ts_str else now
+                        if ts_str
+                        else now
                     )
-                    val = d.get("value", 0.0)
-                    score = min(float(val) / 50.0, 1.0)
+
+                    val = d.get("value")
+                    if val is None:
+                        # Skip rows without a value
+                        continue
+                    try:
+                        val_f = float(val)
+                    except (TypeError, ValueError):
+                        continue
+
+                    score = min(val_f / 50.0, 1.0)
                     db_session.merge(
                         SentimentData(
                             symbol=sym,
                             timestamp=ts,
                             source="Santiment",
-                            headline=f"Whale txn count {val:.0f} for {sym}",
+                            headline=f"Whale txn count {val_f:.0f} for {sym}",
                             sentiment_score=score,
                         )
                     )
@@ -200,43 +262,71 @@ def collect_sentiment_all_sources(
             print(f"[!] Santiment error: {e}")
             db_session.rollback()
 
-    # 4) LunarCrush
+    # 4) LunarCrush (V3, with slug mapping & safer JSON)
     if getattr(settings, "LUNARCRUSH_API_KEY", None):
         print("[LunarCrush] Fetching social sentiment...")
         try:
+            headers = {"Authorization": f"Bearer {settings.LUNARCRUSH_API_KEY}"}
             for sym in symbols:
-                url = "https://lunarcrush.com/api3/assets"
-                params = {
-                    "symbol": sym,
-                    "interval": "1h",
-                    "data": "assets",
-                    "time_series_indicators": "social_score,social_volume",
-                }
-                headers = {"Authorization": f"Bearer {settings.LUNARCRUSH_API_KEY}"}
-                r = requests.get(url, params=params, headers=headers, timeout=10)
-                r.raise_for_status()
-                data = r.json().get("data", [])
-                for d in data:
-                    ts_str = (
-                        (d.get("timeSeries") or [{}])[0].get("timestamp")
+                slug = _lunarcrush_slug(sym)
+                url = f"https://lunarcrush.com/api3/coins/{slug}"
+
+                r = requests.get(url, headers=headers, timeout=10)
+
+                if r.status_code == 404:
+                    print(f"[!] LunarCrush: Coin {sym} (slug={slug}) not found.")
+                    continue
+
+                try:
+                    r.raise_for_status()
+                except requests.RequestException as re:
+                    print(f"[!] LunarCrush HTTP error for {sym} (slug={slug}): {re}")
+                    continue
+
+                try:
+                    resp_json = r.json()
+                except ValueError:
+                    print(
+                        f"[!] LunarCrush: Non-JSON response for {sym} (slug={slug}): "
+                        f"{r.text[:200]}"
                     )
-                    ts = (
-                        datetime.fromisoformat(ts_str.replace("Z", "+00:00"))
-                        if ts_str else now
-                    )
-                    score_raw = (d.get("timeSeries") or [{}])[0].get(
-                        "social_score", 0
-                    )
-                    score = _safe_float(score_raw) or 0.0
-                    db_session.merge(
-                        SentimentData(
-                            symbol=sym,
-                            timestamp=ts,
-                            source="LunarCrush",
-                            headline=f"Social score={score}",
-                            sentiment_score=min(float(score) / 100.0, 1.0),
+                    continue
+
+                # V3 typical shape: {"data": { ...coin fields... }}
+                coin_data = resp_json.get("data", {})
+
+                # Some endpoints might return a list; handle that too
+                if isinstance(coin_data, list):
+                    if not coin_data:
+                        print(
+                            f"[!] LunarCrush: Empty data list for {sym} (slug={slug}): "
+                            f"{resp_json}"
                         )
+                        continue
+                    coin_data = coin_data[0]
+
+                if not isinstance(coin_data, dict) or not coin_data:
+                    print(
+                        f"[!] LunarCrush: No usable data for {sym} (slug={slug}): "
+                        f"{resp_json}"
                     )
+                    continue
+
+                score_raw = coin_data.get("social_score", 0)
+                vol_raw = coin_data.get("social_volume", 0)
+
+                score = _safe_float(score_raw) or 0.0
+                normalized_score = min(score / 100.0, 1.0)
+
+                db_session.merge(
+                    SentimentData(
+                        symbol=sym,
+                        timestamp=now,
+                        source="LunarCrush",
+                        headline=f"Social Score: {score:.0f}, Vol: {vol_raw}",
+                        sentiment_score=normalized_score,
+                    )
+                )
             print("[✔] LunarCrush done.")
             _commit_or_rollback(db_session, "LunarCrush")
             processed_sources += 1
@@ -285,7 +375,18 @@ def collect_sentiment_all_sources(
     try:
         r = requests.get("https://api.alternative.me/fng/", timeout=10)
         r.raise_for_status()
-        fg = _safe_float(r.json()["data"][0]["value"])
+        try:
+            fg_payload = r.json()
+        except ValueError:
+            print(f"[!] Fear & Greed: Non-JSON response: {r.text[:200]}")
+            fg_payload = {}
+
+        fg = None
+        try:
+            fg = _safe_float((fg_payload.get("data") or [{}])[0].get("value"))
+        except Exception:
+            pass
+
         score = ((fg - 50) / 50) if fg is not None else 0.0
         db_session.merge(
             SentimentData(

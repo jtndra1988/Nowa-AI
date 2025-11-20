@@ -55,9 +55,11 @@ class Settings(BaseSettings):
     LUNARCRUSH_API_KEY: str
     CRYPTOPANIC_API_KEY: str
     COINMARKETCAP_API_KEY: str
-    TG_BOT_TOKEN:str
-    TG_CHAT_ID:str
+    TELEGRAM_BOT_TOKEN:str
+    TELEGRAM_CHAT_ID:str
     GEMINI_API_KEY:str
+    PROMETHEUS_ENABLED: bool = False
+    PROMETHEUS_PORT: int = 9090
     class Config:
         env_file = ENV_PATH
         env_file_encoding = "utf-8"

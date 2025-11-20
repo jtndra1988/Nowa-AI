@@ -1,23 +1,35 @@
-# app/api/health.py
 from __future__ import annotations
 
-from datetime import datetime, timezone
-from typing import Literal
+import logging
 import socket
+from datetime import datetime, timezone
+from typing import Any, Dict
 
 from fastapi import APIRouter
-from app.db.database import engine  # reuse your sync engine
+from app.db.database import SessionLocal
+
+# psutil is optional – if missing, we still don't crash
+try:
+    import psutil
+except ImportError:  # pragma: no cover
+    psutil = None  # type: ignore
+
+logger = logging.getLogger(__name__)
 
 router = APIRouter()
+
 
 def _utcnow_iso() -> str:
     return datetime.now(timezone.utc).isoformat()
 
+
+# ---------------------------------------------------------------------------
+# Basic health endpoints
+# ---------------------------------------------------------------------------
+
+
 @router.get("/healthz")
-def healthz():
-    """
-    Lightweight liveness probe.
-    """
+def healthz() -> Dict[str, Any]:
     return {
         "status": "ok",
         "time": _utcnow_iso(),
@@ -25,29 +37,78 @@ def healthz():
         "service": "ml-trading-api",
     }
 
+
 @router.get("/livez")
-def livez():
-    """
-    Synonym for healthz (some platforms use /livez).
-    """
-    return healthz()
+def livez() -> Dict[str, Any]:
+    return {"status": "alive", "time": _utcnow_iso()}
+
 
 @router.get("/readyz")
-def readyz():
+def readyz() -> Dict[str, Any]:
     """
-    Readiness probe: simple DB connectivity check.
-    If you want deeper checks (e.g., model files on disk), add them here.
+    Readiness check: confirms DB connectivity.
     """
+    ok = False
+    error: str | None = None
     try:
-        with engine.begin() as conn:
-            conn.exec_driver_sql("SELECT 1")
-        db_ok: Literal["ok"] = "ok"
+        db = SessionLocal()
+        try:
+            db.execute("SELECT 1")
+            ok = True
+        finally:
+            db.close()
     except Exception as e:
-        db_ok = f"error: {e.__class__.__name__}"
+        error = str(e)
+        logger.warning("readyz DB check failed: %s", e)
 
     return {
-        "status": "ok" if db_ok == "ok" else "degraded",
-        "db": db_ok,
+        "status": "ok" if ok else "error",
+        "db_ready": ok,
+        "error": error,
         "time": _utcnow_iso(),
-        "host": socket.gethostname(),
     }
+
+
+# ---------------------------------------------------------------------------
+# System resources (shared helper + endpoint)
+# ---------------------------------------------------------------------------
+
+
+def get_system_resources() -> Dict[str, float]:
+    """
+    Helper used by other modules (system.py, system_stream.py).
+    Safe: never raises.
+    """
+    cpu_load = 0.0
+    ram_usage = 0.0
+    gpu_util = 0.0
+
+    if psutil is None:
+        # psutil not installed – return zeros instead of crashing
+        return {
+            "cpu_load": cpu_load,
+            "ram_usage": ram_usage,
+            "gpu_util": gpu_util,
+        }
+
+    try:
+        cpu_load = float(psutil.cpu_percent(interval=None))
+        mem = psutil.virtual_memory()
+        ram_usage = float(mem.percent)
+    except Exception as e:
+        logger.exception("get_system_resources failed: %s", e)
+
+    return {
+        "cpu_load": cpu_load,
+        "ram_usage": ram_usage,
+        "gpu_util": gpu_util,
+    }
+
+
+@router.get("/system-resources")
+def system_resources() -> Dict[str, float]:
+    """
+    API endpoint – just wraps get_system_resources().
+    Full URL (with main.py prefix): /api/v1/system-resources
+    """
+    return get_system_resources()

@@ -1,7 +1,8 @@
 # app/ml/train_ensemble.py
 
+import json
 import logging
-from datetime import timedelta
+from datetime import timedelta, datetime
 from pathlib import Path
 
 import numpy as np
@@ -18,15 +19,30 @@ from app.core.config import settings
 logger = logging.getLogger(__name__)
 logging.basicConfig(level=logging.INFO)
 
+# ---------------------------------------------------------------------
+# Paths and versioning
+# ---------------------------------------------------------------------
 
 ARTIFACTS_DIR = Path(getattr(settings, "MODEL_ARTIFACTS_DIR", "model_artifacts"))
 ARTIFACTS_DIR.mkdir(parents=True, exist_ok=True)
 
+# Base models (TFT / TCN / XGB) are expected as joblib artifacts with:
+#   {'model': <estimator>, 'feature_cols': [...], ...}
 TFT_PATH = ARTIFACTS_DIR / "tft_model.pkl"
 TCN_PATH = ARTIFACTS_DIR / "tcn_model.pkl"
 XGB_PATH = ARTIFACTS_DIR / "xgb_model.pkl"
+
+# "Current production" ensemble artifact
 ENSEMBLE_PATH = ARTIFACTS_DIR / "ensemble_model.pkl"
 
+# Versioned ensemble artifacts
+ENSEMBLE_VERSION = "v1.0"
+ENSEMBLE_MODEL_ROOT = Path("models") / "ensemble"
+
+
+# ---------------------------------------------------------------------
+# Data loading & feature building
+# ---------------------------------------------------------------------
 
 def _load_market_data(session, lookback_days: int = 60) -> pd.DataFrame:
     logger.info("[ENSEMBLE] Loading market data from DB...")
@@ -58,11 +74,27 @@ def _load_market_data(session, lookback_days: int = 60) -> pd.DataFrame:
     ]
 
     df = pd.DataFrame(data).sort_values(["symbol", "timestamp"]).reset_index(drop=True)
-    logger.info("[ENSEMBLE] Loaded %d OHLCV rows for %d symbols", len(df), df["symbol"].nunique())
+    logger.info(
+        "[ENSEMBLE] Loaded %d OHLCV rows for %d symbols",
+        len(df),
+        df["symbol"].nunique(),
+    )
     return df
 
 
 def _build_base_features(df: pd.DataFrame, horizon: int = 1) -> pd.DataFrame:
+    """
+    Build simple tabular features for ensemble training.
+
+    For each symbol:
+      - ret_1h         = 1-bar return
+      - log_ret        = log return
+      - roll_vol_24h   = 24-bar rolling volatility of log_ret
+      - target_ret     = next-bar return (horizon=1 by default)
+
+    Returns:
+        df_feat: DataFrame with 'target_ret' and base features.
+    """
     df = df.copy()
     df["timestamp"] = pd.to_datetime(df["timestamp"], utc=True)
 
@@ -77,18 +109,28 @@ def _build_base_features(df: pd.DataFrame, horizon: int = 1) -> pd.DataFrame:
         feats.append(g)
 
     df_feat = pd.concat(feats, axis=0).reset_index(drop=True)
-    df_feat = df_feat.dropna(subset=["close", "volume", "ret_1h", "roll_vol_24h", "target_ret"])
+    df_feat = df_feat.dropna(
+        subset=["close", "volume", "ret_1h", "roll_vol_24h", "target_ret"]
+    )
     return df_feat
 
 
+# ---------------------------------------------------------------------
+# Training entrypoint
+# ---------------------------------------------------------------------
+
 def main():
-    logger.info("[ENSEMBLE] ==== Training ensemble model ====")
-    # Ensure base models exist
-    if not TFT_PATH.exists() or not TCN_PATH.exists() or not XGB_PATH.exists():
+    logger.info("[ENSEMBLE] ==== Training ensemble stacker (LinearRegression) ====")
+
+    # Ensure base model artifacts exist
+    missing = [p for p in [TFT_PATH, TCN_PATH, XGB_PATH] if not p.exists()]
+    if missing:
         raise RuntimeError(
-            "[ENSEMBLE] Base model artifacts missing. Train TFT/TCN/XGB first."
+            f"[ENSEMBLE] Base model artifacts missing: {missing}. "
+            "Train TFT/TCN/XGB first."
         )
 
+    # Load base model artifacts (joblib)
     tft_art = joblib.load(TFT_PATH)
     tcn_art = joblib.load(TCN_PATH)
     xgb_art = joblib.load(XGB_PATH)
@@ -99,8 +141,10 @@ def main():
 
     tft_cols = tft_art["feature_cols"]
     xgb_cols = xgb_art["feature_cols"]
-    # TCN uses sequence features; here we'll reuse tft/xgb style features for predictions
+    # TCN uses sequence features; for ensemble we reuse TFT-style features for TCN predictions
+    base_models_order = ["tft", "tcn", "xgb"]
 
+    # Load market data and build base features
     session = SessionLocal()
     try:
         df = _load_market_data(session, lookback_days=90)
@@ -120,7 +164,7 @@ def main():
         p_tcn = tcn_model.predict(X_tcn)
         p_xgb = xgb_model.predict(X_xgb)
 
-        # Stack predictions as ensemble features
+        # Stack predictions as ensemble features (N rows x 3 base models)
         X_ens = np.vstack([p_tft, p_tcn, p_xgb]).T
 
         if len(X_ens) < 500:
@@ -128,6 +172,7 @@ def main():
                 f"[ENSEMBLE] Not enough rows to train (got {len(X_ens)}, need >= 500)"
             )
 
+        # Train/val split
         split = int(len(X_ens) * 0.8)
         X_train, X_val = X_ens[:split], X_ens[split:]
         y_train, y_val = y[:split], y[split:]
@@ -140,13 +185,45 @@ def main():
         rmse = mean_squared_error(y_val, y_pred, squared=False)
         logger.info("[ENSEMBLE] Validation RMSE: %.6f", rmse)
 
+        # Build artifact
         artifact = {
             "model": model,
-            "base_models": ["tft", "tcn", "xgb"],
+            "base_models": base_models_order,
             "metrics": {"rmse": float(rmse)},
         }
+
+        # Save "current production" artifact
         joblib.dump(artifact, ENSEMBLE_PATH)
         logger.info("[ENSEMBLE] Saved ensemble artifact to %s", ENSEMBLE_PATH)
+
+        # -------------------------------
+        # Versioned artifacts + metadata
+        # -------------------------------
+        timestamp = datetime.utcnow().strftime("%Y%m%dT%H%M%SZ")
+        version_dir = ENSEMBLE_MODEL_ROOT / f"{ENSEMBLE_VERSION}_{timestamp}"
+        version_dir.mkdir(parents=True, exist_ok=True)
+
+        versioned_path = version_dir / f"ensemble_{ENSEMBLE_VERSION}_{timestamp}.pkl"
+        joblib.dump(artifact, versioned_path)
+
+        metadata = {
+            "model_name": "ensemble_stacker",
+            "version": ENSEMBLE_VERSION,
+            "train_date_utc": timestamp,
+            "base_models": base_models_order,
+            "stacker_type": "LinearRegression",
+            "lookback_days": 90,
+            "train_val_split": 0.8,
+            "metrics": {"rmse": float(rmse)},
+        }
+
+        metadata_path = version_dir / "metadata.json"
+        with open(metadata_path, "w") as f:
+            json.dump(metadata, f, indent=4)
+
+        logger.info("[ENSEMBLE] Saved versioned ensemble to %s", versioned_path)
+        logger.info("[ENSEMBLE] Saved metadata to %s", metadata_path)
+
     finally:
         session.close()
 

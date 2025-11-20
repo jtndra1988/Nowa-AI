@@ -1,6 +1,7 @@
 # app/ml/adv/train_llm_narrative_model.py
 
 import logging
+from datetime import datetime
 from pathlib import Path
 from typing import List, Tuple
 
@@ -20,6 +21,8 @@ logging.basicConfig(level=logging.INFO)
 ARTIFACTS_DIR = Path(getattr(settings, "MODEL_ARTIFACTS_DIR", "model_artifacts"))
 ARTIFACTS_DIR.mkdir(parents=True, exist_ok=True)
 ARTIFACT_PATH = ARTIFACTS_DIR / "llm_narrative_model.pkl"
+
+MODEL_VERSION = "v1.0"
 
 
 # ---------------------------------------------------------------------------
@@ -142,16 +145,18 @@ def _train_narrative_model(texts: List[str], labels: List[int]):
     )
     clf.fit(X_train, y_train)
 
+    metrics_report = ""
     if X_val.shape[0] > 0:
         y_pred = clf.predict(X_val)
-        report = classification_report(
-            y_val, y_pred,
+        metrics_report = classification_report(
+            y_val,
+            y_pred,
             target_names=["bearish (-1)", "neutral (0)", "bullish (1)"],
             zero_division=0,
         )
-        logger.info("[LLM-NARR] Validation report:\n%s", report)
+        logger.info("[LLM-NARR] Validation report:\n%s", metrics_report)
 
-    return vectorizer, clf
+    return vectorizer, clf, metrics_report
 
 
 def main():
@@ -164,21 +169,44 @@ def main():
         logger.warning("[LLM-NARR] DB load failed: %s", e)
         texts, labels = _synthetic_training_data()
 
-    vectorizer, clf = _train_narrative_model(texts, labels)
+    vectorizer, clf, metrics_report = _train_narrative_model(texts, labels)
+
+    timestamp = datetime.utcnow().strftime("%Y%m%dT%H%M%SZ")
 
     artifact = {
+        # Metadata for versioning and audit
+        "model_name": "llm_narrative_offline",
+        "version": MODEL_VERSION,
+        "trained_at_utc": timestamp,
+        # Core model objects
         "vectorizer": vectorizer,
         "classifier": clf,
+        # Labels
         "label_mapping": {
             -1: "bearish",
              0: "neutral",
              1: "bullish",
         },
+        # Optional metrics / diagnostics
+        "metrics": {
+            "classification_report": metrics_report,
+            "num_samples": len(texts),
+        },
+        # Prompt config for reference (kept conceptually in sync with llm_narrative_model)
+        "prompt_config": {
+            "live_model_name": "gemini-1.5-flash",
+            "live_prompt_version": "v1.0",
+            "offline_inference_template": "sentiment analysis for {asset}",
+        },
     }
 
     joblib.dump(artifact, ARTIFACT_PATH)
     logger.info("[LLM-NARR] Saved narrative model artifact to %s", ARTIFACT_PATH)
-    logger.info("[LLM-NARR] Training complete.")
+    logger.info(
+        "[LLM-NARR] Training complete. version=%s, trained_at=%s",
+        MODEL_VERSION,
+        timestamp,
+    )
 
 
 if __name__ == "__main__":

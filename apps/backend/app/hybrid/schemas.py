@@ -67,17 +67,26 @@ class Layer2Prediction(BaseModel):
       - HybridInferenceService final decision logic
     """
 
-    asset: str = Field(..., description="Symbol/asset this prediction refers to.")
-    direction: DirectionLiteral = Field(..., description="'up', 'down', or 'flat'")
-    price_confidence: float = Field(..., ge=0.0, le=1.0)
+    asset: str
 
-    unified_vote: float = 0.0
     tft_vote: float = 0.0
     tcn_vote: float = 0.0
     tst_vote: float = 0.0
-    xgb_price_vote: float = 0.0  # HybridService looks for this
-    xgb_vol_vote: float = 0.0    # HybridService looks for this
+
+    xgb_price_vote: float = 0.0
+    xgb_vol_vote: float = 0.0
+
     decision_score: float = 0.0
+
+    options_features: Dict[str, Any] = {}
+    macro_onchain_features: Dict[str, Any] = {}
+
+    # NEW: scalar scores for RL & UI
+    options_score: float = 0.0
+    macro_score: float = 0.0
+    llm_narrative_vote: float = 0.0
+
+    unified_vote: float = 0.0
     
     # Keep these as flexible dicts or define sub-models
     options_features: Dict[str, Any] = Field(default_factory=dict)

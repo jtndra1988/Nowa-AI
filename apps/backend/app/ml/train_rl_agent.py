@@ -1,7 +1,8 @@
 # app/ml/adv/train_rl_agent.py
 
+import json
 import logging
-from datetime import timedelta
+from datetime import datetime, timedelta
 from pathlib import Path
 from typing import List, Tuple
 
@@ -18,7 +19,15 @@ logging.basicConfig(level=logging.INFO)
 
 ARTIFACTS_DIR = Path(getattr(settings, "MODEL_ARTIFACTS_DIR", "model_artifacts"))
 ARTIFACTS_DIR.mkdir(parents=True, exist_ok=True)
+
+# Runtime artifact used by RLAgent
 ARTIFACT_PATH = ARTIFACTS_DIR / "rl_agent_ppo.zip"
+# Metadata file that RLAgent will read
+METADATA_PATH = ARTIFACT_PATH.with_name(ARTIFACT_PATH.stem + "_metadata.json")
+
+# Versioned artifacts root
+RL_POLICY_VERSION = "v1.0"
+RL_POLICY_ROOT = Path("models") / "rl_agent"
 
 
 # Try to import stable-baselines3 + gym
@@ -243,8 +252,49 @@ def _train_ppo_agent(df: pd.DataFrame):
     logger.info("[RL] Starting PPO training for %d timesteps...", total_timesteps)
     model.learn(total_timesteps=total_timesteps)
 
+    # ---------------- Versioned artifact + metadata ----------------
+    timestamp = datetime.utcnow().strftime("%Y%m%dT%H%M%SZ")
+
+    metadata = {
+        "model_name": "rl_agent_ppo",
+        "version": RL_POLICY_VERSION,
+        "trained_at_utc": timestamp,
+        "algo": "PPO",
+        "env_name": "SimpleTradingEnv",
+        "obs_space_shape": getattr(model.observation_space, "shape", None),
+        "action_space_n": getattr(model.action_space, "n", None),
+        "hyperparameters": {
+            "learning_rate": 3e-4,
+            "n_steps": 256,
+            "batch_size": 256,
+            "gamma": 0.99,
+            "gae_lambda": 0.95,
+            "n_epochs": 10,
+            "ent_coef": 0.01,
+            "clip_range": 0.2,
+            "total_timesteps": total_timesteps,
+        },
+    }
+
+    # Runtime artifact for RLAgent
     logger.info("[RL] Saving PPO policy to %s", ARTIFACT_PATH)
     model.save(str(ARTIFACT_PATH))
+
+    # Runtime metadata
+    with open(METADATA_PATH, "w", encoding="utf-8") as f:
+        json.dump(metadata, f, indent=4)
+
+    # Versioned artifacts
+    version_dir = RL_POLICY_ROOT / f"{RL_POLICY_VERSION}_{timestamp}"
+    version_dir.mkdir(parents=True, exist_ok=True)
+
+    versioned_zip = version_dir / f"rl_agent_ppo_{RL_POLICY_VERSION}_{timestamp}.zip"
+    logger.info("[RL] Saving versioned PPO policy to %s", versioned_zip)
+    model.save(str(versioned_zip))
+
+    versioned_meta = version_dir / "metadata.json"
+    with open(versioned_meta, "w", encoding="utf-8") as f:
+        json.dump(metadata, f, indent=4)
 
 
 def main():

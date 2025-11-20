@@ -15,7 +15,7 @@ from app.ml.adv.llm_narrative_model import llm_engine
 
 # RL execution agent (loads model_artifacts/rl_agent_ppo.zip internally)
 from app.ml.adv.rl_execution_agent import rl_agent
-
+from app.hybrid.schemas import MarketContext, HybridDecision
 # Options & Macro/On-chain specialists
 from app.ml.adv.options_vol_model import options_vol_edge
 from app.ml.adv.macro_onchain_model import macro_onchain_bias
@@ -69,39 +69,34 @@ class HybridInferenceService:
     # ------------------------------------------------------------------
 
     async def build_decision(self, ctx: MarketContext) -> HybridDecision:
-        """
-        High-level orchestrator used by /hybrid-signal (and similar):
+        # 1) Get Layer-2 prediction (the “brain votes”)
+        layer2 = await self.model_engine.predict(ctx)
 
-          1. Get L2 prediction from ModelEngine
-          2. Get LLM narrative signal
-          3. Build model_votes (for RL)
-          4. Ask RLAgent for optimal action
-          5. Wrap everything into HybridDecision
-        """
-        symbol = getattr(ctx, "symbol", "BTC")
-        logger.info("[HybridInferenceService] Building decision for %s", symbol)
+        # 2) Build model_votes dict for RLAgent from Layer2Prediction
+        model_votes = {
+            "tft_visionary": layer2.tft_vote,
+            "tcn_reflex": layer2.tcn_vote,
+            "xgb_analyst": layer2.xgb_price_vote,
+            "xgb_vol_analyst": layer2.xgb_vol_vote,
+            "options_psychologist": layer2.options_score,
+            "macro_economist": layer2.macro_score,
+            "llm_narrative": layer2.llm_narrative_vote,
+        }
 
-        # 1) Core ensemble
-        layer2_pred = await self._get_layer2_prediction(ctx)
-
-        # 2) Narrative LLM signal
-        narrative = await self._get_narrative_signal(symbol)
-
-        # 3) Model votes for RL state
-        model_votes = self._build_model_votes(layer2_pred, narrative)
-
-        # 4) RL optimal action (may return None if policy missing)
-        rl_action = self._get_rl_action(layer2_pred, ctx, model_votes)
-
-        # 5) Final HybridDecision object
-        decision = self._build_hybrid_decision(
-            ctx=ctx,
-            layer2_pred=layer2_pred,
-            narrative=narrative,
+        # 3) Ask RLAgent for optimal action
+        rl_action = self.rl_agent.get_optimal_action(
+            prediction=layer2,
+            context=ctx,
             model_votes=model_votes,
-            rl_action=rl_action,
         )
 
+        # 4) Build your final HybridDecision object however you’ve defined it
+        decision = HybridDecision(
+            asset=layer2.asset,
+            unified_vote=layer2.unified_vote,
+            rl_action=rl_action,
+            layer2=layer2,
+        )
         return decision
 
     # ------------------------------------------------------------------

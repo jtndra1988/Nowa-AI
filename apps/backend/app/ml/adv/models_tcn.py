@@ -168,3 +168,168 @@ class TCNPredictor:
             # Log the error safely without crashing the whole engine
             print(f"[TCNPredictor] Prediction error: {e}")
             return 0.0
+
+class TemporalConvolutionalNetwork(nn.Module):
+    """
+    Temporal Convolutional Network architecture for short-term pattern detection.
+
+    Input:
+        x: Tensor of shape (batch_size, seq_len, num_inputs)
+
+    Output:
+        dict:
+            {
+                "price": Tensor[batch_size],
+                "vol":   Tensor[batch_size]  # non-negative via softplus
+            }
+
+    Versioning and artifact loading supported via `load_from_artifact`.
+    """
+
+    def __init__(
+        self,
+        num_inputs: int,
+        num_channels: list,
+        kernel_size: int = 3,
+        dropout: float = 0.2,
+    ):
+        super().__init__()
+        self.num_inputs = num_inputs
+        self.num_channels = num_channels
+        self.kernel_size = kernel_size
+        self.dropout = dropout
+
+        layers = []
+        in_channels = num_inputs
+
+        # Build a stack of dilated Conv1d layers
+        for i, out_channels in enumerate(num_channels):
+            dilation = 2 ** i
+            padding = (kernel_size - 1) * dilation
+
+            conv = nn.Conv1d(
+                in_channels,
+                out_channels,
+                kernel_size,
+                padding=padding,
+                dilation=dilation,
+            )
+            chomp = Chomp1d(padding)
+            relu = nn.ReLU()
+            drop = nn.Dropout(dropout)
+
+            layers += [conv, chomp, relu, drop]
+            in_channels = out_channels
+
+        self.tcn = nn.Sequential(*layers)
+
+        # Multi-task heads (price + volatility)
+        self.head_norm = nn.LayerNorm(num_channels[-1])
+        self.price_head = nn.Linear(num_channels[-1], 1)
+        self.vol_head = nn.Linear(num_channels[-1], 1)
+
+    def forward(self, x: torch.Tensor) -> Dict[str, torch.Tensor]:
+        """
+        Args:
+            x: Tensor of shape (batch_size, seq_len, num_inputs)
+        Returns:
+            dict with:
+                "price": Tensor[batch_size]
+                "vol":   Tensor[batch_size]
+        """
+        # (B, L, C_in) -> (B, C_in, L) for Conv1d
+        x = x.transpose(1, 2)  # [B, C_in, L]
+
+        # TCN stack
+        y = self.tcn(x)        # [B, C_out, L]
+
+        # Take representation from last time step
+        y_last = y[:, :, -1]   # [B, C_out]
+
+        y_last = self.head_norm(y_last)
+
+        price_pred = self.price_head(y_last).squeeze(-1)  # [B]
+        # enforces non-negative vol
+        vol_pred = torch.nn.functional.softplus(
+            self.vol_head(y_last).squeeze(-1)
+        )  # [B]
+
+        return {
+            "price": price_pred,
+            "vol": vol_pred,
+        }
+
+    @staticmethod
+    def load_from_artifact(artifact_dir: str, device: torch.device = None):
+        """
+        Loads a TCN model from the given artifact directory.
+
+        Expects:
+            - metadata file: metadata.json
+            - weight file:  tcn_<version>_<timestamp>.pt
+
+        The metadata must contain:
+            {
+                "model_name": "...",
+                "version": "v1.0",
+                "feature_list": [...],
+                "hyperparameters": {
+                    "num_inputs": <int>,
+                    "num_channels": [..],
+                    "kernel_size": <int>,
+                    "dropout": <float>,
+                    ...
+                },
+                ...
+            }
+        """
+        import os
+        import json
+        import glob
+        import torch
+
+        if device is None:
+            device = torch.device("cpu")
+
+        metadata_path = os.path.join(artifact_dir, "metadata.json")
+        if not os.path.exists(metadata_path):
+            raise FileNotFoundError(f"Metadata file not found at {metadata_path}")
+
+        with open(metadata_path, "r") as f:
+            metadata = json.load(f)
+
+        version = metadata.get("version")
+        if version is None:
+            raise KeyError("metadata.json must contain a 'version' field")
+
+        pattern = os.path.join(artifact_dir, f"tcn_{version}_*.pt")
+        weight_files = glob.glob(pattern)
+        if not weight_files:
+            raise FileNotFoundError(
+                f"No TCN weight file found for version {version} in {artifact_dir}"
+            )
+        weight_path = weight_files[0]
+
+        hp = metadata.get("hyperparameters", {})
+        num_inputs = hp["num_inputs"]
+        num_channels = hp["num_channels"]
+        kernel_size = hp.get("kernel_size", 3)
+        dropout = hp.get("dropout", 0.2)
+
+        model = TemporalConvolutionalNetwork(
+            num_inputs=num_inputs,
+            num_channels=num_channels,
+            kernel_size=kernel_size,
+            dropout=dropout,
+        )
+
+        state_dict = torch.load(weight_path, map_location=device)
+        model.load_state_dict(state_dict)
+        model.to(device)
+        model.eval()
+
+        print(
+            f"[INFO] Loaded TCN model {metadata.get('model_name', 'tcn')} "
+            f"version {version} from {artifact_dir} (hyperparams: {hp})"
+        )
+        return model, metadata

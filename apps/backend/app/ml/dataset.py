@@ -5,7 +5,7 @@ from torch.utils.data import Dataset
 from typing import Dict, List, Tuple
 
 # Import our new feature engineering function
-from .feature_engineering import create_tabular_features
+from app.ml.adv.feature_engineering import create_tabular_features
 
 class MultiModalTS(Dataset):
     """

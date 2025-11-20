@@ -22,6 +22,7 @@ type BrainHealth = {
   risk_ready: boolean;
 };
 
+// Updated to include ALL 10 Models
 type AiStrategySettings = {
   enabled: boolean;
   allow_autotrade: boolean;
@@ -31,11 +32,13 @@ type AiStrategySettings = {
   require_ai_decision_agreement: boolean;
   block_if_brain_degraded: boolean;
 
-  // Per-module toggles
+  // Per-module toggles (10 Models)
   use_tft: boolean;
   use_tcn: boolean;
+  use_tst: boolean;       // NEW
   use_xgb: boolean;
   use_decision_net: boolean;
+  use_ensemble: boolean;  // NEW
   use_options_expert: boolean;
   use_macro_onchain: boolean;
   use_llm: boolean;
@@ -45,8 +48,10 @@ type AiStrategySettings = {
   weights: {
     tft: number;
     tcn: number;
+    tst: number;          // NEW
     xgb: number;
     decision_net: number;
+    ensemble: number;     // NEW
     options_expert: number;
     macro_onchain: number;
     llm: number;
@@ -88,24 +93,29 @@ const DEFAULT_SETTINGS: AiStrategySettings = {
   require_ai_decision_agreement: true,
   block_if_brain_degraded: true,
 
+  // All 10 models enabled by default
   use_tft: true,
   use_tcn: true,
+  use_tst: true,
   use_xgb: true,
   use_decision_net: true,
+  use_ensemble: true,
   use_options_expert: true,
   use_macro_onchain: true,
   use_llm: true,
   use_rl: true,
 
   weights: {
-    tft: 16,
-    tcn: 14,
+    tft: 15,
+    tcn: 15,
+    tst: 10,
     xgb: 10,
-    decision_net: 16,
-    options_expert: 10,
-    macro_onchain: 12,
-    llm: 12,
-    rl: 10,
+    decision_net: 15,
+    ensemble: 10,
+    options_expert: 5,
+    macro_onchain: 5,
+    llm: 10,
+    rl: 5,
   },
 
   risk_mode: "balanced",
@@ -123,15 +133,7 @@ const DEFAULT_STATS: AiStats = {
   avg_latency_ms: 18,
 };
 
-type ModelKey =
-  | "tft"
-  | "tcn"
-  | "xgb"
-  | "decision_net"
-  | "options_expert"
-  | "macro_onchain"
-  | "llm"
-  | "rl";
+type ModelKey = keyof AiStrategySettings["weights"];
 
 type LayerName =
   | "Data Layer"
@@ -162,191 +164,152 @@ interface ModelConfig {
   features?: { name: string; weight: number }[];
 }
 
-// Clear mapping of each model into the 5-layer mental model.
+// --- 10 MODELS DEFINITION ---
 const MODELS: ModelConfig[] = [
-  // AI Layer (raw predictive specialists)
+  // --- AI Layer (Predictors) ---
   {
     key: "tft",
     name: "TFT",
-    label: "Macro Trend & Carry",
+    label: "Temporal Fusion Transformer",
     layer: "AI Layer",
-    role: "Learns slow regimes, structural trend & carry. Sets core directional bias.",
-    horizon: "5m–2h",
+    role: "Visionary: Interpretable multi-horizon forecasting.",
+    horizon: "1h–4h",
     window: "120d",
-    notes: "Used for macro bias and medium horizon positioning.",
+    notes: "Captures long-term dependencies & seasonalities.",
     defaultLatencyMs: 11,
-    regimes: ["trend", "range", "low-vol"],
-    metrics: {
-      precision: 0.67,
-      recall: 0.64,
-      f1: 0.65,
-      auc: 0.79,
-      sharpe: 2.01,
-      maxdd: -13.0,
-    },
-    features: [
-      { name: "Trend / Regime score", weight: 24 },
-      { name: "Carry & basis", weight: 21 },
-      { name: "On-chain flows", weight: 18 },
-      { name: "Global risk basket", weight: 20 },
-      { name: "Realized vol", weight: 17 },
-    ],
+    regimes: ["trend", "range"],
+    metrics: { precision: 0.67, recall: 0.64, f1: 0.65, sharpe: 2.01, maxdd: -13.0 },
+    features: [{ name: "Trend score", weight: 24 }, { name: "Vol 24h", weight: 21 }],
   },
   {
     key: "tcn",
     name: "TCN",
-    label: "Short-term Flow & Reversion",
+    label: "Temporal ConvNet",
     layer: "AI Layer",
-    role: "Reads orderflow & liquidity for timing and micro reversals.",
-    horizon: "1m–45m",
+    role: "Reflex: Fast shock detection & short-term patterns.",
+    horizon: "5m–30m",
     window: "90d",
-    notes: "Controls precise entries/exits around the macro view.",
+    notes: "Reacts quickly to volatility spikes.",
     defaultLatencyMs: 7,
-    regimes: ["trend", "range", "high-vol", "low-vol"],
-    metrics: {
-      precision: 0.64,
-      recall: 0.62,
-      f1: 0.63,
-      auc: 0.75,
-      sharpe: 1.81,
-      maxdd: -16.0,
-    },
-    features: [
-      { name: "CVD / Aggression", weight: 24 },
-      { name: "Depth imbalance", weight: 22 },
-      { name: "Sweeps & blocks", weight: 18 },
-      { name: "Short-term vol", weight: 19 },
-      { name: "Funding pulse", weight: 17 },
-    ],
+    regimes: ["high-vol", "trend"],
+    metrics: { precision: 0.64, recall: 0.62, f1: 0.63, sharpe: 1.81, maxdd: -16.0 },
+    features: [{ name: "CVD", weight: 24 }, { name: "Depth Imb", weight: 22 }],
+  },
+  {
+    key: "tst",
+    name: "TST",
+    label: "Time Series Transformer",
+    layer: "AI Layer",
+    role: "Specialist: Pure sequence-to-sequence regression.",
+    horizon: "15m–1h",
+    window: "60d",
+    notes: "High-fidelity price path prediction.",
+    defaultLatencyMs: 9,
+    regimes: ["range", "trend"],
+    metrics: { precision: 0.65, recall: 0.63, f1: 0.64, sharpe: 1.90, maxdd: -14.0 },
+    features: [{ name: "Seq Attention", weight: 30 }],
   },
   {
     key: "xgb",
     name: "XGBoost",
-    label: "Microstructure & Skew",
+    label: "Gradient Booster",
     layer: "AI Layer",
-    role: "Checks basis, skew & structure. Flags broken markets.",
+    role: "Analyst: Tabular feature analysis (RSI, MA, VWAP).",
     horizon: "5m–1h",
     window: "60d",
-    notes: "Acts as structural sanity filter.",
+    notes: "Strong on technical indicators and regime classification.",
     defaultLatencyMs: 3,
     regimes: ["range", "low-vol"],
-    metrics: {
-      precision: 0.61,
-      recall: 0.59,
-      f1: 0.59,
-      auc: 0.73,
-      sharpe: 1.33,
-      maxdd: -17.0,
-    },
-    features: [
-      { name: "Term structure", weight: 26 },
-      { name: "VWAP distance", weight: 22 },
-      { name: "Roll correlation", weight: 19 },
-      { name: "Skew", weight: 18 },
-      { name: "Depth micro", weight: 15 },
-    ],
+    metrics: { precision: 0.61, recall: 0.59, f1: 0.59, sharpe: 1.33, maxdd: -17.0 },
+    features: [{ name: "VWAP Dist", weight: 22 }, { name: "RSI", weight: 19 }],
   },
 
-  // Decision Layer (turn model signals into trade intent)
+  // --- Decision Layer (Fusion) ---
   {
     key: "decision_net",
     name: "DecisionNet",
-    label: "Hybrid Policy",
+    label: "Neural Fusion",
     layer: "Decision Layer",
-    role: "Fuses AI Layer outputs into a single LONG/SHORT/FLAT decision.",
-    horizon: "execution horizon",
-    window: "rolling",
-    notes: "Primary decision-maker that must align with risk rules.",
+    role: "Orchestrator: Weighs expert inputs dynamically.",
+    horizon: "Execution",
+    window: "Rolling",
+    notes: "Deep learning based fusion of L1 signals.",
     defaultLatencyMs: 4,
     regimes: ["all"],
-    metrics: {
-      precision: 0.69,
-      recall: 0.66,
-      f1: 0.67,
-      sharpe: 2.15,
-      maxdd: -12.5,
-    },
+    metrics: { precision: 0.69, recall: 0.66, f1: 0.67, sharpe: 2.15, maxdd: -12.5 },
+  },
+  {
+    key: "ensemble",
+    name: "Ensemble",
+    label: "Linear Stacker",
+    layer: "Decision Layer",
+    role: "Stabilizer: Weighted average of L1 predictors.",
+    horizon: "Execution",
+    window: "Rolling",
+    notes: "Reduces variance of individual models.",
+    defaultLatencyMs: 2,
+    regimes: ["all"],
+    metrics: { precision: 0.65, recall: 0.65, f1: 0.65, sharpe: 1.8, maxdd: -11.0 },
   },
   {
     key: "options_expert",
     name: "Options Expert",
     label: "Gamma & Vol Surface",
     layer: "Decision Layer",
-    role: "Uses gamma walls, vol surface & flows to adjust conviction.",
-    horizon: "session–3d",
+    role: "Hedge: Gamma/Vanna exposure analysis.",
+    horizon: "Session",
     window: "90d",
-    notes: "Boosts/caps risk around key strikes & events.",
+    notes: "Identifies pinning and gamma squeeze risks.",
     defaultLatencyMs: 5,
-    regimes: ["trend", "high-vol"],
-    metrics: {
-      precision: 0.63,
-      recall: 0.6,
-      f1: 0.61,
-      auc: 0.72,
-      sharpe: 1.6,
-      maxdd: -15.0,
-    },
+    regimes: ["high-vol"],
+    metrics: { precision: 0.63, recall: 0.60, f1: 0.61, sharpe: 1.6, maxdd: -15.0 },
   },
   {
     key: "macro_onchain",
-    name: "Macro + On-chain",
-    label: "Regime & Liquidity Analyst",
+    name: "Macro/On-chain",
+    label: "Fundamental Bias",
     layer: "Decision Layer",
-    role: "Reads macro regime & on-chain flows to scale risk up/down.",
-    horizon: "4h–multi-day",
+    role: "Context: Netflow, active addresses, DXY.",
+    horizon: "4h+",
     window: "180d",
-    notes: "Environment gate: risk-off when liquidity is toxic.",
+    notes: "Filters trades against macro tides.",
     defaultLatencyMs: 8,
-    regimes: ["trend", "range"],
-    metrics: {
-      precision: 0.62,
-      recall: 0.61,
-      f1: 0.61,
-      sharpe: 1.7,
-      maxdd: -14.2,
-    },
+    regimes: ["trend"],
+    metrics: { precision: 0.62, recall: 0.61, f1: 0.61, sharpe: 1.7, maxdd: -14.2 },
   },
 
-  // Meta Layer (explanations, veto, overrides)
+  // --- Meta Layer ---
   {
     key: "llm",
-    name: "LLM",
-    label: "Narrative & News Sentinel",
+    name: "LLM Agent",
+    label: "Narrative Sentinel",
     layer: "Meta Layer",
-    role: "Scans news / social / anomalies; can veto or downweight trades.",
+    role: "Veto: News, sentiment, and market vibes.",
     horizon: "1h–24h",
-    window: "streaming",
-    notes: "Meta-guard: blocks trades into event risk or negative narratives.",
+    window: "Streaming",
+    notes: "Qualitative analysis to override quant signals.",
     defaultLatencyMs: 40,
     regimes: ["all"],
-    metrics: {
-      precision: 0.58,
-      recall: 0.65,
-      f1: 0.61,
-    },
+    metrics: { precision: 0.58, recall: 0.65, f1: 0.61 },
   },
 
-  // Execution Layer (turn approved intent into fills)
+  // --- Execution Layer ---
   {
     key: "rl",
-    name: "RL",
-    label: "Execution Policy",
+    name: "RL Agent",
+    label: "PPO Trader",
     layer: "Execution Layer",
-    role: "Transforms approved intent into orders: sizing, scaling, paths.",
-    horizon: "seconds–minutes",
-    window: "online",
-    notes: "Learns optimal micro-execution under strict risk caps.",
+    role: "Executor: Optimal sizing and timing policy.",
+    horizon: "Sec–Min",
+    window: "Online",
+    notes: "Reinforcement learning for final trade execution.",
     defaultLatencyMs: 3,
     regimes: ["all"],
-    metrics: {
-      precision: 0.0,
-      recall: 0.0,
-      f1: 0.0,
-    },
+    metrics: { precision: 0.0, recall: 0.0, f1: 0.0 },
   },
 ];
 
-// --- NEW COMPONENT: Strategy Pill ---
+// --- COMPONENT: Strategy Pill ---
 const StrategyPill: React.FC<{
   label: string;
   value: React.ReactNode;
@@ -391,7 +354,8 @@ const Switch: React.FC<{
   </button>
 );
 
-const StrategiesTab: React.FC<StrategiesTabProps> = ({
+// --- MAIN EXPORTED COMPONENT ---
+export const StrategiesTab: React.FC<StrategiesTabProps> = ({
   symbol,
   mode,
   exchange,
@@ -400,7 +364,6 @@ const StrategiesTab: React.FC<StrategiesTabProps> = ({
     () => makeSeeded(`mars-strategy-${symbol}-${mode}-${exchange}`),
     [symbol, mode, exchange]
   );
-  const rand = () => seeded(); // currently unused, but kept if you randomize demo stats
 
   const [brainHealth, setBrainHealth] = useState<BrainHealth | null>(null);
   const [bhLoading, setBhLoading] = useState(true);
@@ -416,7 +379,7 @@ const StrategiesTab: React.FC<StrategiesTabProps> = ({
   const [stats, setStats] = useState<AiStats | null>(null);
   const [decisions, setDecisions] = useState<AiDecision[]>([]);
 
-  // Brain health
+  // Brain health fetch
   useEffect(() => {
     let cancelled = false;
     const fetchHealth = async () => {
@@ -430,7 +393,6 @@ const StrategiesTab: React.FC<StrategiesTabProps> = ({
       } catch {
         if (!cancelled) {
           setBhError(true);
-          // safe dummy so UI looks alive
           setBrainHealth({
             is_ready: true,
             has_l2_models: true,
@@ -451,11 +413,10 @@ const StrategiesTab: React.FC<StrategiesTabProps> = ({
     };
   }, []);
 
-  // Settings + stats + decisions
+  // Settings load
   useEffect(() => {
     let cancelled = false;
     const load = async () => {
-      // strategy
       try {
         const res = await fetch("/api/v1/ai/strategy");
         if (res.ok) {
@@ -469,32 +430,26 @@ const StrategiesTab: React.FC<StrategiesTabProps> = ({
           }
         }
       } catch {
-        // fall back to defaults
+        // fallback
       } finally {
         if (!cancelled) setSettingsLoaded(true);
       }
 
-      // stats
       try {
         const res = await fetch("/api/v1/ai/stats");
         if (res.ok) {
           const data = (await res.json()) as AiStats;
           if (!cancelled) setStats(data);
-        } else if (!cancelled) setStats(DEFAULT_STATS);
-      } catch {
-        if (!cancelled) setStats(DEFAULT_STATS);
-      }
+        }
+      } catch {}
 
-      // decisions
       try {
         const res = await fetch("/api/v1/ai/decisions?limit=20");
         if (res.ok) {
           const data = (await res.json()) as AiDecision[];
           if (!cancelled) setDecisions(data || []);
         }
-      } catch {
-        // ignore
-      }
+      } catch {}
     };
     load();
     const id = setInterval(load, 45000);
@@ -504,8 +459,7 @@ const StrategiesTab: React.FC<StrategiesTabProps> = ({
     };
   }, []);
 
-  // Helpers
-
+  // Settings logic
   const updateSettings = (patch: Partial<AiStrategySettings>) => {
     setSettings((prev) => {
       const next = { ...prev, ...patch };
@@ -536,7 +490,7 @@ const StrategiesTab: React.FC<StrategiesTabProps> = ({
       if (!res.ok) throw new Error(`Save failed (${res.status})`);
       setSettingsDirty(false);
     } catch (e: any) {
-      setSettingsError(e.message || "Failed to save settings");
+      setSettingsError(e.message || "Failed to save");
     } finally {
       setSettingsSaving(false);
     }
@@ -551,22 +505,12 @@ const StrategiesTab: React.FC<StrategiesTabProps> = ({
   const normalizedWeights = useMemo(() => {
     const w = settings.weights;
     const activeKeys = (Object.keys(w) as ModelKey[]).filter((k) => {
-      if (k === "tft") return settings.use_tft;
-      if (k === "tcn") return settings.use_tcn;
-      if (k === "xgb") return settings.use_xgb;
-      if (k === "decision_net") return settings.use_decision_net;
-      if (k === "options_expert") return settings.use_options_expert;
-      if (k === "macro_onchain") return settings.use_macro_onchain;
-      if (k === "llm") return settings.use_llm;
-      if (k === "rl") return settings.use_rl;
-      return false;
+      // Dynamic check for toggles
+      const toggleKey = `use_${k}` as keyof AiStrategySettings;
+      return settings[toggleKey] === true;
     });
-    const sum =
-      activeKeys.reduce((acc, k) => acc + (w[k] || 0), 0) || 1;
+    const sum = activeKeys.reduce((acc, k) => acc + (w[k] || 0), 0) || 1;
     const out = {} as Record<ModelKey, number>;
-    (Object.keys(w) as ModelKey[]).forEach((k) => {
-      out[k] = 0;
-    });
     activeKeys.forEach((k) => {
       out[k] = (w[k] / sum) * 100;
     });
@@ -576,605 +520,184 @@ const StrategiesTab: React.FC<StrategiesTabProps> = ({
   const statsView = stats || DEFAULT_STATS;
   const isBrainOnline = brainHealth?.is_ready ?? true;
 
-  // Render
-
   return (
     <div className="relative w-full flex flex-col gap-4 text-slate-50">
-
-      {/* --- 0. NEW INFORMATIVE PILLS --- */}
-      <div className="flex flex-wrap gap-4">
+       {/* --- 0. Informative Pills --- */}
+       <div className="flex flex-wrap gap-4">
         <StrategyPill 
-          label="Current Regime" 
-          value="High Volatility"
-          accentColor="bg-amber-500"
+          label="System Mode" 
+          value={settings.allow_autotrade ? "AUTONOMOUS" : "ADVISORY"}
+          accentColor={settings.allow_autotrade ? "bg-emerald-500" : "bg-sky-500"}
+        />
+        <StrategyPill 
+          label="Active Models" 
+          value={`${Object.keys(normalizedWeights).length} / 10`}
+          accentColor="bg-indigo-500"
         />
         <StrategyPill 
           label="Risk Profile" 
-          value={settings.risk_mode.charAt(0).toUpperCase() + settings.risk_mode.slice(1)}
-          accentColor={
-            settings.risk_mode === 'aggressive' ? 'bg-rose-500' :
-            settings.risk_mode === 'defensive' ? 'bg-emerald-500' : 'bg-sky-500'
-          }
-        />
-        <StrategyPill 
-          label="Exposure" 
-          value="42% / $1.2M"
-          accentColor="bg-indigo-400"
+          value={settings.risk_mode.toUpperCase()}
+          accentColor={settings.risk_mode === 'aggressive' ? 'bg-rose-500' : 'bg-amber-500'}
         />
          <StrategyPill 
-          label="Next Rebalance" 
-          value="04:12"
+          label="Next Update" 
+          value="00:12s"
           accentColor="bg-slate-500"
         />
       </div>
 
-      {/* 1. Performance + Brain health */}
-
+      {/* 1. Dashboard & Health */}
       <div className="grid grid-cols-1 xl:grid-cols-[minmax(0,1.7fr)_minmax(0,1.3fr)] gap-4">
-        {/* AI Performance Snapshot */}
+        {/* Perf Card */}
         <Card className={`${glassPanel} bg-slate-900/95 border border-slate-800 rounded-3xl`}>
           <CardContent className="flex flex-col gap-3 pt-4 pb-4">
-            <div className="flex items-center justify-between gap-3">
+             <div className="flex items-center justify-between gap-3">
               <div>
                 <div className="text-xs uppercase tracking-[0.18em] text-emerald-400">
-                  MARS · AI PERFORMANCE SNAPSHOT
+                  MARS · UNIFIED BRAIN
                 </div>
                 <div className="mt-1 text-lg font-semibold">
-                  How the unified brain is performing
-                </div>
-                <div className="text-sm text-slate-400">
-                  {symbol} · {mode} · {exchange}
+                  AI Performance (Hybrid V2)
                 </div>
               </div>
               <div className="flex flex-col items-end gap-1 text-xs">
-                <div className={`flex items-center gap-1 ${isBrainOnline ? "text-emerald-400" : "text-amber-300"}`}>
-                  <span className="h-2 w-2 rounded-full bg-emerald-400 animate-pulse" />
+                 <div className={`flex items-center gap-1 ${isBrainOnline ? "text-emerald-400" : "text-amber-300"}`}>
+                  <span className={`h-2 w-2 rounded-full ${isBrainOnline ? "bg-emerald-400 animate-pulse" : "bg-amber-300"}`} />
                   {isBrainOnline ? "Brain Online" : "Degraded"}
-                </div>
-                <div className="text-[10px] text-slate-500">
-                  Avg latency: {statsView.avg_latency_ms} ms
-                </div>
+                 </div>
+                 <div className="text-[10px] text-slate-500">Lat: {statsView.avg_latency_ms}ms</div>
               </div>
-            </div>
-            <div className="grid grid-cols-2 md:grid-cols-3 xl:grid-cols-5 gap-3 mt-2 text-sm">
-              <PerfStat label="Decisions (24h)" value={statsView.decisions_24h.toString()} />
-              <PerfStat label="Win rate (30d)" value={`${statsView.winrate_30d.toFixed(1)}%`} />
-              <PerfStat label="Sharpe (30d)" value={statsView.sharpe_30d.toFixed(2)} />
-              <PerfStat label="Avg R:R" value={`${statsView.avg_rr.toFixed(2)} : 1`} />
-              <PerfStat label="Uptime (7d)" value={`${statsView.uptime_pct_7d.toFixed(2)}%`} />
-            </div>
-            <div className={`${faintText} text-xs mt-1`}>
-              Source: <code className="text-[10px]">/api/v1/ai/stats</code>. Your client sees objective numbers, not hype.
-            </div>
+             </div>
+             <div className="grid grid-cols-2 md:grid-cols-3 xl:grid-cols-5 gap-3 mt-2 text-sm">
+               <PerfStat label="Decisions (24h)" value={statsView.decisions_24h.toString()} />
+               <PerfStat label="Win Rate" value={`${statsView.winrate_30d.toFixed(1)}%`} />
+               <PerfStat label="Sharpe" value={statsView.sharpe_30d.toFixed(2)} />
+               <PerfStat label="Avg R:R" value={statsView.avg_rr.toFixed(2)} />
+               <PerfStat label="Uptime" value={`${statsView.uptime_pct_7d.toFixed(1)}%`} />
+             </div>
           </CardContent>
         </Card>
 
-        {/* Brain Health – dedicated sci-fi style */}
+        {/* Health Card */}
         <Card className={`${glassPanel} bg-slate-900/95 border border-emerald-500/40 rounded-3xl relative overflow-hidden`}>
-          <div className="pointer-events-none absolute -inset-12 bg-[radial-gradient(circle_at_top,_rgba(16,185,129,0.16),transparent_70%)]" />
-          <CardContent className="relative flex flex-col gap-3 pt-4 pb-4">
-            <div className="flex items-center justify-between gap-2">
-              <div>
-                <div className="text-xs uppercase tracking-[0.2em] text-emerald-400">
-                  BRAIN HEALTH
+           <div className="pointer-events-none absolute -inset-12 bg-[radial-gradient(circle_at_top,_rgba(16,185,129,0.16),transparent_70%)]" />
+           <CardContent className="relative flex flex-col gap-3 pt-4 pb-4">
+              <div className="flex items-center justify-between gap-2">
+                <div>
+                  <div className="text-xs uppercase tracking-[0.2em] text-emerald-400">SYSTEM HEALTH</div>
+                  <div className="mt-1 text-lg font-semibold">Components Status</div>
                 </div>
-                <div className="mt-1 text-lg font-semibold">
-                  System integrity across layers
-                </div>
-              </div>
-              <div className="relative h-16 w-16 flex items-center justify-center">
-                <div
-                  className="absolute inset-0 rounded-full animate-spin-slow opacity-80"
-                  style={{
-                    backgroundImage:
-                      "conic-gradient(from 230deg, rgba(16,185,129,0.22), rgba(56,189,248,0.35), transparent 70%)",
-                    maskImage: "radial-gradient(circle, transparent 58%, black 60%)",
-                    WebkitMaskImage: "radial-gradient(circle, transparent 58%, black 60%)",
-                  }}
-                />
-                <div className="relative h-9 w-9 rounded-full bg-slate-950/95 border border-slate-700 flex items-center justify-center">
-                  <span
-                    className={
-                      bhLoading
-                        ? "h-2 w-2 rounded-full bg-sky-300 animate-pulse"
-                        : bhError
-                        ? "h-2 w-2 rounded-full bg-rose-400 animate-ping"
-                        : isBrainOnline
-                        ? "h-2 w-2 rounded-full bg-emerald-400 animate-ping"
-                        : "h-2 w-2 rounded-full bg-amber-300 animate-ping"
-                    }
-                  />
+                {/* Sci-Fi Spinner */}
+                <div className="relative h-12 w-12 flex items-center justify-center">
+                  <div className="absolute inset-0 rounded-full border-2 border-slate-800 border-t-emerald-500 animate-spin" />
                 </div>
               </div>
-            </div>
-            <div className="grid grid-cols-2 gap-2 text-xs mt-1">
-              <HealthRow label="L2 model artifacts" ok={brainHealth?.has_l2_models} />
-              <HealthRow label="LLM online" ok={brainHealth?.llm_ready} />
-              <HealthRow label="RL policy" ok={brainHealth?.rl_ready} optional />
-              <HealthRow label="Risk engine" ok={brainHealth?.risk_ready} />
-            </div>
-            <div className="text-[11px] text-slate-400 mt-1">
-              When <span className="text-emerald-400 font-semibold">“Block if brain degraded”</span> is ON,
-              Execution Layer is disabled automatically on any red status here.
-            </div>
-          </CardContent>
+              <div className="grid grid-cols-2 gap-2 text-xs mt-1">
+                <HealthRow label="L2 Models (Torch)" ok={brainHealth?.has_l2_models} />
+                <HealthRow label="LLM (Gemini)" ok={brainHealth?.llm_ready} />
+                <HealthRow label="RL Agent (PPO)" ok={brainHealth?.rl_ready} optional />
+                <HealthRow label="Risk Engine" ok={brainHealth?.risk_ready} />
+              </div>
+           </CardContent>
         </Card>
       </div>
 
-      {/* 2. Global controls: Ensemble, Validation, Risk, Auto-trade */}
+      {/* 2. Global Settings */}
       <Card className={`${glassPanel} bg-slate-900/95 border border-slate-800 rounded-3xl`}>
-        <CardContent className="flex flex-col gap-3 pt-4 pb-4">
-          <div className="flex items-center justify-between gap-3">
-            <div>
-              <div className="text-xs uppercase tracking-[0.18em] text-sky-400">
-                ENSEMBLE · VALIDATION · RISK · AUTO-TRADE
-              </div>
-              <div className="mt-1 text-lg font-semibold">
-                How the five layers must agree before a trade
-              </div>
-            </div>
-            <div className="flex flex-col items-end gap-1 text-sm">
-              <div className="flex items-center gap-2">
-                <span className="text-slate-300">AI Engine</span>
-                <Switch
-                  checked={settings.enabled}
-                  onChange={(v) => updateSettings({ enabled: v })}
-                />
-              </div>
-              <div className="flex items-center gap-2 text-xs">
-                <span className="text-slate-400">Allow auto-trade</span>
-                <Switch
-                  checked={settings.allow_autotrade}
-                  onChange={(v) => updateSettings({ allow_autotrade: v })}
-                />
-              </div>
-            </div>
-          </div>
-
-          <div className="grid grid-cols-1 md:grid-cols-3 gap-4 text-sm mt-2">
-            {/* Ensemble & validation */}
-            <div className="flex flex-col gap-2">
-              <div className="text-xs text-slate-300 font-medium">
-                Ensemble mode
-              </div>
-              <select
-                value={settings.ensemble_mode}
-                onChange={(e) =>
-                  updateSettings({
-                    ensemble_mode: e.target.value as AiStrategySettings["ensemble_mode"],
-                  })
-                }
-                className="bg-slate-900 border border-slate-700 rounded-md px-2 py-1.5 text-sm text-slate-100"
-              >
-                <option value="weighted">Weighted (use sliders below)</option>
-                <option value="majority">Majority vote (layers vote)</option>
-                <option value="strict">Strict (AI + Decision + Meta + Exec align)</option>
-              </select>
-              <label className="flex items-center gap-2 text-xs text-slate-300">
-                <Switch
-                  checked={settings.require_ai_decision_agreement}
-                  onChange={(v) =>
-                    updateSettings({ require_ai_decision_agreement: v })
-                  }
-                />
-                Require agreement: AI Layer vs Decision Layer.
-              </label>
-              <label className="flex items-center gap-2 text-xs text-slate-300">
-                <Switch
-                  checked={settings.block_if_brain_degraded}
-                  onChange={(v) =>
-                    updateSettings({ block_if_brain_degraded: v })
-                  }
-                />
-                Block trades if Brain Health not green.
-              </label>
-            </div>
-
-            {/* Risk */}
-            <div className="flex flex-col gap-2">
-              <div className="text-xs text-slate-300 font-medium">
-                Risk profile
-              </div>
-              <div className="flex gap-2 text-xs">
-                {(["defensive", "balanced", "aggressive"] as const).map((rm) => (
-                  <button
-                    key={rm}
-                    type="button"
-                    onClick={() => updateSettings({ risk_mode: rm })}
-                    className={`px-2 py-1 rounded-md border text-xs ${
-                      settings.risk_mode === rm
-                        ? "border-emerald-400 text-emerald-300 bg-emerald-500/5"
-                        : "border-slate-700 text-slate-400 hover:border-slate-500"
-                    }`}
-                  >
-                    {rm[0].toUpperCase() + rm.slice(1)}
-                  </button>
-                ))}
-              </div>
-              <RangeField
-                label="Max leverage"
-                min={1}
-                max={25}
-                value={settings.max_leverage}
-                onChange={(v) => updateSettings({ max_leverage: v })}
-                display={(v) => `x${v.toFixed(0)}`}
-              />
-              <RangeField
-                label="Max position per signal (% equity)"
-                min={1}
-                max={25}
-                value={settings.max_position_pct}
-                onChange={(v) => updateSettings({ max_position_pct: v })}
-                display={(v) => `${v.toFixed(0)}%`}
-              />
-              <RangeField
-                label="Max daily loss before lockout"
-                min={1}
-                max={10}
-                step={0.5}
-                value={settings.max_daily_loss_pct}
-                onChange={(v) => updateSettings({ max_daily_loss_pct: v })}
-                display={(v) => `${v.toFixed(1)}%`}
-              />
-            </div>
-
-            {/* Save / status */}
-            <div className="flex flex-col gap-2 justify-between">
-              <div className="text-xs text-slate-300 font-medium">
-                Configuration state
-              </div>
-              <div className="text-xs text-slate-400">
-                Backend should treat <code>/api/v1/ai/strategy</code> as the single
-                source of truth for all knobs on this page.
-              </div>
-              <div className="mt-1 flex flex-col gap-1 text-xs">
+        <CardContent className="flex flex-col gap-4 pt-4 pb-4">
+           <div className="flex items-center justify-between">
+             <div className="text-lg font-semibold">Global Strategy Control</div>
+             <div className="flex gap-4">
                 <div className="flex items-center gap-2">
-                  <span
-                    className={
-                      settingsLoaded ? "text-emerald-300" : "text-slate-400"
-                    }
-                  >
-                    {settingsLoaded ? "Settings loaded" : "Loading settings…"}
-                  </span>
-                  {settingsDirty && (
-                    <span className="text-amber-300">Unsaved changes</span>
-                  )}
+                  <span className="text-xs text-slate-400">AI Engine</span>
+                  <Switch checked={settings.enabled} onChange={(v) => updateSettings({enabled: v})} />
                 </div>
-                {settingsError && (
-                  <div className="text-rose-400">{settingsError}</div>
-                )}
+                <div className="flex items-center gap-2">
+                  <span className="text-xs text-slate-400">Auto-Trade</span>
+                  <Switch checked={settings.allow_autotrade} onChange={(v) => updateSettings({allow_autotrade: v})} />
+                </div>
+             </div>
+           </div>
+           
+           <div className="grid grid-cols-1 md:grid-cols-3 gap-6">
+              {/* Column 1: Ensemble */}
+              <div className="flex flex-col gap-3">
+                 <div className="text-xs uppercase tracking-wider text-slate-500">Ensemble Logic</div>
+                 <select 
+                    value={settings.ensemble_mode}
+                    onChange={(e) => updateSettings({ ensemble_mode: e.target.value as any })}
+                    className="bg-slate-950 border border-slate-700 text-xs rounded px-2 py-1.5"
+                 >
+                    <option value="weighted">Weighted Average</option>
+                    <option value="majority">Majority Vote</option>
+                    <option value="strict">Strict Unanimity</option>
+                 </select>
+                 <label className="flex items-center gap-2 text-xs text-slate-400">
+                   <Switch checked={settings.require_ai_decision_agreement} onChange={(v) => updateSettings({require_ai_decision_agreement: v})} />
+                   Require AI & Decision Layer Match
+                 </label>
               </div>
-              <div className="mt-2 flex gap-2">
-                <button
-                  type="button"
-                  onClick={resetSettings}
-                  className="px-3 py-1.5 rounded-md text-xs border border-slate-600 text-slate-200 bg-slate-900 hover:bg-slate-800"
-                >
-                  Reset defaults
-                </button>
-                <button
-                  type="button"
-                  onClick={saveSettings}
-                  disabled={!settingsDirty || settingsSaving}
-                  className={`px-4 py-1.5 rounded-md text-xs font-semibold ${
-                    settingsDirty
-                      ? "bg-emerald-500 text-slate-900 hover:bg-emerald-400"
-                      : "bg-slate-700 text-slate-400 cursor-default"
-                  }`}
-                >
-                  {settingsSaving ? "Saving…" : "Save strategy"}
-                </button>
+
+              {/* Column 2: Risk */}
+              <div className="flex flex-col gap-3">
+                <div className="text-xs uppercase tracking-wider text-slate-500">Global Risk</div>
+                <RangeField 
+                  label="Max Leverage" min={1} max={20} value={settings.max_leverage} 
+                  onChange={(v) => updateSettings({max_leverage: v})}
+                  display={(v) => `${v}x`}
+                />
+                <RangeField 
+                  label="Max Daily Loss" min={1} max={10} step={0.5} value={settings.max_daily_loss_pct} 
+                  onChange={(v) => updateSettings({max_daily_loss_pct: v})}
+                  display={(v) => `${v}%`}
+                />
               </div>
-            </div>
-          </div>
+
+              {/* Column 3: Actions */}
+              <div className="flex flex-col gap-3 justify-end items-end">
+                {settingsDirty && <div className="text-xs text-amber-400">Unsaved Changes</div>}
+                <div className="flex gap-2">
+                   <button onClick={resetSettings} className="px-3 py-1.5 text-xs border border-slate-600 rounded hover:bg-slate-800">Reset</button>
+                   <button 
+                    onClick={saveSettings} 
+                    disabled={!settingsDirty}
+                    className={`px-3 py-1.5 text-xs rounded font-semibold ${settingsDirty ? "bg-emerald-500 text-slate-900 hover:bg-emerald-400" : "bg-slate-800 text-slate-500"}`}
+                   >
+                    Save Config
+                   </button>
+                </div>
+              </div>
+           </div>
         </CardContent>
       </Card>
 
-      {/* 3. Layered view */}
-
-      {/* Data Layer summary */}
-      <SectionHeader
-        title="Data Layer"
-        subtitle="Market data, derivatives, on-chain feeds and feature pipelines powering the AI."
-      />
-      <Card className={`${glassPanel} bg-slate-900/95 border border-slate-800 rounded-3xl`}>
-        <CardContent className="flex flex-col gap-2.5 pt-3.5 pb-3.5 text-sm">
-          <div className="grid grid-cols-2 md:grid-cols-4 gap-3 text-xs">
-            <DataStat label="Market feeds" value="OK" detail="Tick / L2 / funding / OI" ok />
-            <DataStat label="Options surface" value="OK" detail="Greeks & vol surfaces" ok />
-            <DataStat label="On-chain" value="OK" detail="Flows & labels" ok />
-            <DataStat label="Feature store" value="OK" detail="No stale features" ok />
-          </div>
-          <div className={`${faintText} text-xs`}>
-            If any core data source fails, Brain Health should turn amber/red and Execution Layer must halt.
-          </div>
-        </CardContent>
-      </Card>
-
-      {/* AI Layer */}
-      <SectionHeader
-        title="AI Layer"
-        subtitle="Specialist models that read the data and propose views."
-      />
-      <ModelGrid
-        models={MODELS.filter((m) => m.layer === "AI Layer")}
-        settings={settings}
-        normalizedWeights={normalizedWeights}
-        updateToggle={updateSettings}
-        updateWeight={updateWeight}
-      />
-
-      {/* Decision Layer */}
-      <SectionHeader
-        title="Decision Layer"
-        subtitle="Combines AI signals, options, macro & flows into a single trade intent."
-      />
-      <ModelGrid
-        models={MODELS.filter((m) => m.layer === "Decision Layer")}
-        settings={settings}
-        normalizedWeights={normalizedWeights}
-        updateToggle={updateSettings}
-        updateWeight={updateWeight}
-      />
-
-      {/* Meta Layer */}
-      <SectionHeader
-        title="Meta Layer"
-        subtitle="Oversight, narrative & veto logic on top of the decision."
-      />
-      <ModelGrid
-        models={MODELS.filter((m) => m.layer === "Meta Layer")}
-        settings={settings}
-        normalizedWeights={normalizedWeights}
-        updateToggle={updateSettings}
-        updateWeight={updateWeight}
-      />
-
-      {/* Execution Layer */}
-      <SectionHeader
-        title="Execution Layer"
-        subtitle="Turns approved decisions into orders under strict risk constraints."
-      />
-      <ModelGrid
-        models={MODELS.filter((m) => m.layer === "Execution Layer")}
-        settings={settings}
-        normalizedWeights={normalizedWeights}
-        updateToggle={updateSettings}
-        updateWeight={updateWeight}
-      />
-
-      {/* 4. Recent decisions + explanation */}
-
-      <div className="grid grid-cols-1 xl:grid-cols-[minmax(0,1.8fr)_minmax(0,1.2fr)] gap-4">
-        {/* Decisions table */}
-        <Card className={`${glassPanel} bg-slate-900/95 border border-slate-800 rounded-3xl`}>
-          <CardContent className="flex flex-col gap-3 pt-3.5 pb-3.5">
-            <div className="flex items-center justify-between">
-              <div className="text-base font-semibold">
-                Recent Hybrid Decisions
-              </div>
-              <div className="text-xs text-slate-500">
-                {decisions.length
-                  ? `Last ${decisions.length} decisions`
-                  : "Waiting for /api/v1/ai/decisions"}
-              </div>
-            </div>
-            <div className="w-full overflow-x-auto">
-              <table className="w-full text-xs text-slate-200">
-                <thead className="text-slate-500">
-                  <tr>
-                    <th className="px-2 py-1 text-left">Time</th>
-                    <th className="px-2 py-1 text-left">Symbol</th>
-                    <th className="px-2 py-1 text-left">Action</th>
-                    <th className="px-2 py-1 text-right">Conf%</th>
-                    <th className="px-2 py-1 text-right">Size%</th>
-                    <th className="px-2 py-1 text-right">PnL</th>
-                    <th className="px-2 py-1 text-left">Layer votes / Reason</th>
-                  </tr>
-                </thead>
-                <tbody>
-                  {decisions.length === 0 ? (
-                    <tr>
-                      <td colSpan={7} className="px-2 py-2 text-slate-500">
-                        Once wired, every HybridDecision from your backend will appear here
-                        with audit trail.
-                      </td>
-                    </tr>
-                  ) : (
-                    decisions.map((d, i) => {
-                      const pnlColor =
-                        d.pnl == null
-                          ? "text-slate-400"
-                          : d.pnl > 0
-                          ? "text-emerald-400"
-                          : "text-rose-400";
-                      return (
-                        <tr
-                          key={`${d.ts}-${i}`}
-                          className="border-t border-slate-800"
-                        >
-                          <td className="px-2 py-1 text-slate-400">{d.ts}</td>
-                          <td className="px-2 py-1">{d.symbol}</td>
-                          <td className="px-2 py-1">{d.action}</td>
-                          <td className="px-2 py-1 text-right">
-                            {(d.confidence * 100).toFixed(0)}
-                          </td>
-                          <td className="px-2 py-1 text-right">
-                            {(d.size_factor * 100).toFixed(1)}
-                          </td>
-                          <td className={`px-2 py-1 text-right ${pnlColor}`}>
-                            {d.pnl == null ? "—" : d.pnl.toFixed(3)}
-                          </td>
-                          <td className="px-2 py-1 text-slate-400">
-                            {d.layer_vote || d.reason || ""}
-                          </td>
-                        </tr>
-                      );
-                    })
-                  )}
-                </tbody>
-              </table>
-            </div>
-          </CardContent>
-        </Card>
-
-        {/* Explanation card */}
-        <Card className={`${glassPanel} bg-slate-900/95 border border-slate-800 rounded-3xl`}>
-          <CardContent className="flex flex-col gap-2.5 pt-3.5 pb-3.5 text-sm">
-            <div className="text-base font-semibold">
-              Pipeline overview (what your client sees)
-            </div>
-            <ul className="list-disc list-inside text-slate-400 space-y-1">
-              <li>
-                <span className="text-slate-200">Data Layer</span> feeds all models.
-              </li>
-              <li>
-                <span className="text-slate-200">AI Layer</span> (TFT / TCN / XGB) proposes views only.
-              </li>
-              <li>
-                <span className="text-slate-200">Decision Layer</span> (DecisionNet / Options / Macro+On-chain)
-                turns those views into a coherent trade thesis.
-              </li>
-              <li>
-                <span className="text-slate-200">Meta Layer</span> (LLM) watches news & narratives, can veto.
-              </li>
-              <li>
-                <span className="text-slate-200">Execution Layer</span> (RL) executes only if all rules & health
-                checks pass.
-              </li>
-              <li>
-                Ensemble + risk + auto-trade settings on this page define exactly what is allowed.
-              </li>
-              <li>
-                Every decision below is explainable in terms of these layers —
-                no black box.
-              </li>
-            </ul>
-          </CardContent>
-        </Card>
-      </div>
+      {/* 3. VISUALIZATION OF LAYERS */}
+      {["AI Layer", "Decision Layer", "Meta Layer", "Execution Layer"].map((layer) => (
+        <div key={layer} className="flex flex-col gap-2">
+          <SectionHeader title={layer} subtitle={getLayerSubtitle(layer as LayerName)} />
+          <ModelGrid 
+            models={MODELS.filter(m => m.layer === layer)}
+            settings={settings}
+            normalizedWeights={normalizedWeights}
+            updateToggle={updateSettings}
+            updateWeight={updateWeight}
+          />
+        </div>
+      ))}
     </div>
   );
 };
 
-/* ---- Small components ---- */
-
-const SectionHeader: React.FC<{ title: string; subtitle: string }> = ({
-  title,
-  subtitle,
-}) => (
-  <div className="mt-2 flex flex-col gap-0.5">
-    <div className="text-xs uppercase tracking-[0.18em] text-slate-500">
-      {title}
-    </div>
-    <div className="text-sm text-slate-300">{subtitle}</div>
-  </div>
-);
-
-const PerfStat: React.FC<{ label: string; value: string }> = ({
-  label,
-  value,
-}) => (
-  <div className="flex flex-col gap-0.5">
-    <div className={`${faintText} text-[11px]`}>{label}</div>
-    <div className="text-sky-300 text-base font-semibold">{value}</div>
-  </div>
-);
-
-const HealthRow: React.FC<{
-  label: string;
-  ok?: boolean;
-  optional?: boolean;
-}> = ({ label, ok, optional }) => {
-  const text =
-    ok === undefined
-      ? "Unknown"
-      : ok
-      ? "OK"
-      : optional
-      ? "Optional"
-      : "Issue";
-  const color =
-    ok === undefined
-      ? "text-slate-400"
-      : ok
-      ? "text-emerald-300"
-      : optional
-      ? "text-amber-300"
-      : "text-rose-400";
-  return (
-    <div className="flex items-center justify-between gap-2">
-      <div className="text-[11px] text-slate-300">{label}</div>
-      <div className={`text-[11px] ${color}`}>{text}</div>
-    </div>
-  );
-};
-
-const RangeField: React.FC<{
-  label: string;
-  min: number;
-  max: number;
-  value: number;
-  step?: number;
-  onChange: (v: number) => void;
-  display: (v: number) => string;
-}> = ({ label, min, max, value, step = 1, onChange, display }) => (
-  <div className="flex flex-col gap-0.5">
-    <div className="text-[11px] text-slate-300">{label}</div>
-    <input
-      type="range"
-      min={min}
-      max={max}
-      step={step}
-      value={value}
-      onChange={(e) => onChange(Number(e.target.value))}
-      className="w-full"
-    />
-    <div className="text-[11px] text-emerald-300">{display(value)}</div>
-  </div>
-);
-
-const Metric: React.FC<{
-  label: string;
-  value: number;
-  isPct?: boolean;
-  inverse?: boolean;
-}> = ({ label, value, isPct, inverse }) => {
-  const formatted = isPct
-    ? `${value.toFixed(1)}%`
-    : Math.abs(value) < 10
-    ? value.toFixed(2)
-    : value.toFixed(1);
-  const color =
-    inverse && value < 0 ? "text-emerald-300" : "text-sky-300";
-  return (
-    <div className="flex flex-col gap-0.25">
-      <div className={`${faintText} text-[10px]`}>{label}</div>
-      <div className={`${color} text-[12px] font-semibold`}>
-        {label === "MaxDD" ? `${value.toFixed(1)}%` : formatted}
-      </div>
-    </div>
-  );
-};
-
-const DataStat: React.FC<{
-  label: string;
-  value: string;
-  detail: string;
-  ok?: boolean;
-}> = ({ label, value, detail, ok = false }) => (
-  <div className="flex flex-col gap-0.25">
-    <div className="text-[11px] text-slate-300">{label}</div>
-    <div
-      className={`text-[12px] font-semibold ${
-        ok ? "text-emerald-300" : "text-slate-300"
-      }`}
-    >
-      {value}
-    </div>
-    <div className={`${faintText} text-[10px]`}>{detail}</div>
-  </div>
-);
+// --- Helpers ---
+function getLayerSubtitle(layer: LayerName) {
+  switch(layer) {
+    case "AI Layer": return "Core predictive models analysing raw price & volume data.";
+    case "Decision Layer": return "Fuses predictors with domain expertise (Options, Macro) for final intent.";
+    case "Meta Layer": return "High-level oversight using LLMs for narrative checks.";
+    case "Execution Layer": return "Reinforcement Learning agent for optimal order routing.";
+    default: return "";
+  }
+}
 
 type ModelGridProps = {
   models: ModelConfig[];
@@ -1193,150 +716,43 @@ const ModelGrid: React.FC<ModelGridProps> = ({
 }) => (
   <div className="grid grid-cols-1 md:grid-cols-2 xl:grid-cols-3 gap-4 mt-2">
     {models.map((m) => {
-      const enabledKey =
-        m.key === "tft"
-          ? "use_tft"
-          : m.key === "tcn"
-          ? "use_tcn"
-          : m.key === "xgb"
-          ? "use_xgb"
-          : m.key === "decision_net"
-          ? "use_decision_net"
-          : m.key === "options_expert"
-          ? "use_options_expert"
-          : m.key === "macro_onchain"
-          ? "use_macro_onchain"
-          : m.key === "llm"
-          ? "use_llm"
-          : "use_rl";
-
+      const enabledKey = `use_${m.key}` as keyof AiStrategySettings;
+      // Safe access
       const isEnabled = (settings as any)[enabledKey] && settings.enabled;
       const weight = settings.weights[m.key];
       const norm = normalizedWeights[m.key] || 0;
 
       return (
-        <Card
-          key={m.key}
-          className={`${glassPanel} bg-slate-900/95 border border-slate-800 rounded-3xl`}
-        >
+        <Card key={m.key} className={`${glassPanel} bg-slate-900/95 border border-slate-800 rounded-3xl opacity-${isEnabled ? '100' : '60'}`}>
           <CardContent className="flex flex-col gap-2.5 pt-3.5 pb-3.5">
-            <div className="flex items-center justify-between gap-2">
-              <div className="flex items-center gap-2 text-xs">
-                <span className="px-2 py-0.5 rounded-full bg-slate-800 text-emerald-300">
-                  {m.defaultLatencyMs}ms
-                </span>
-                <span
-                  className={
-                    isEnabled ? "text-emerald-400" : "text-slate-500"
-                  }
-                >
-                  {isEnabled ? "Enabled" : "Disabled"}
-                </span>
-                <span className="px-1.5 py-0.5 rounded-full bg-slate-800 text-[10px] text-sky-300">
-                  {m.layer}
-                </span>
+            <div className="flex items-center justify-between">
+               <div className="flex items-center gap-2">
+                 <div className={`h-2 w-2 rounded-full ${isEnabled ? 'bg-emerald-400 shadow-lg shadow-emerald-400/50' : 'bg-slate-600'}`} />
+                 <span className="text-sm font-bold text-slate-200">{m.name}</span>
+               </div>
+               <Switch checked={(settings as any)[enabledKey]} onChange={(v) => updateToggle({ [enabledKey]: v } as any)} />
+            </div>
+            
+            <div className="text-xs text-slate-400 min-h-[32px]">{m.role}</div>
+            
+            <div className="flex flex-col gap-1 mt-2 bg-slate-950/50 p-2 rounded-lg border border-white/5">
+              <div className="flex justify-between text-[10px] uppercase tracking-wider text-slate-500">
+                <span>Weight</span>
+                <span>{weight} ({norm.toFixed(0)}%)</span>
               </div>
-              <Switch
-                checked={(settings as any)[enabledKey]}
-                onChange={(v) =>
-                  updateToggle({ [enabledKey]: v } as any)
-                }
+              <input 
+                type="range" min={0} max={50} value={weight} 
+                onChange={(e) => updateWeight(m.key, Number(e.target.value))}
+                disabled={!isEnabled}
+                className="w-full h-1 bg-slate-700 rounded-lg appearance-none cursor-pointer"
               />
             </div>
 
-            <div>
-              <div className="text-sm font-semibold">
-                {m.name} · {m.label}
-              </div>
-              <div className="text-xs text-slate-400">{m.role}</div>
-              <div className="text-[10px] text-slate-500">
-                Horizon {m.horizon} · Window {m.window}
-              </div>
+            <div className="grid grid-cols-3 gap-2 mt-1">
+               <Metric label="Sharpe" value={m.metrics.sharpe || 0} />
+               <Metric label="Precision" value={m.metrics.precision} isPct />
+               <Metric label="Horizon" value={0} customText={m.horizon} />
             </div>
-
-            <div className="flex flex-col gap-1 mt-1">
-              <div className="flex items-center justify-between text-xs">
-                <span className="text-slate-300">Weight</span>
-                <span className="text-emerald-400 font-semibold">
-                  {weight.toFixed(0)} ({norm.toFixed(0)}% of ensemble)
-                </span>
-              </div>
-              <input
-                type="range"
-                min={0}
-                max={100}
-                value={weight}
-                onChange={(e) =>
-                  updateWeight(
-                    m.key,
-                    Number(e.target.value)
-                  )
-                }
-                className="w-full"
-              />
-              <div className="flex flex-wrap gap-1 text-[10px] text-slate-400">
-                <span>Use in regimes:</span>
-                {m.regimes.map((r) => (
-                  <span
-                    key={r}
-                    className="px-1.5 py-0.5 rounded-full bg-slate-800 text-slate-200"
-                  >
-                    {r}
-                  </span>
-                ))}
-              </div>
-            </div>
-
-            <div className="grid grid-cols-3 gap-2 mt-1 text-xs">
-              <Metric label="Precision" value={m.metrics.precision} />
-              <Metric label="Recall" value={m.metrics.recall} />
-              <Metric label="F1" value={m.metrics.f1} />
-              {m.metrics.auc !== undefined && (
-                <Metric label="AUC" value={m.metrics.auc} />
-              )}
-              {m.metrics.sharpe !== undefined && (
-                <Metric label="Sharpe" value={m.metrics.sharpe} />
-              )}
-              {m.metrics.maxdd !== undefined && (
-                <Metric
-                  label="MaxDD"
-                  value={m.metrics.maxdd}
-                  isPct
-                  inverse
-                />
-              )}
-            </div>
-
-            {m.features ? (
-              <div className="mt-1.5 flex flex-col gap-0.75">
-                <div className="text-[11px] text-slate-300">
-                  Top features / signals
-                </div>
-                {m.features.map((f) => (
-                  <div
-                    key={f.name}
-                    className="flex items-center gap-2 text-[10px]"
-                  >
-                    <span className="flex-1 text-slate-400">
-                      {f.name}
-                    </span>
-                    <div className="w-24 h-1.5 bg-slate-800 rounded-full overflow-hidden">
-                      <div
-                        className="h-full bg-indigo-400"
-                        style={{ width: `${f.weight}%` }}
-                      />
-                    </div>
-                    <span className="w-8 text-right text-slate-300">
-                      {f.weight}%
-                    </span>
-                  </div>
-                ))}
-              </div>
-            ) : (
-              <div className="mt-1.5 text-[10px] text-slate-400">
-                {m.notes}
-              </div>
-            )}
           </CardContent>
         </Card>
       );
@@ -1344,5 +760,81 @@ const ModelGrid: React.FC<ModelGridProps> = ({
   </div>
 );
 
-export { StrategiesTab };
+const Metric: React.FC<{
+  label: string;
+  value: number;
+  isPct?: boolean;
+  customText?: string;
+}> = ({ label, value, isPct, customText }) => (
+  <div className="flex flex-col">
+    <span className="text-[10px] text-slate-500">{label}</span>
+    <span className="text-xs font-mono text-slate-300">
+      {customText ? customText : isPct ? `${(value*100).toFixed(0)}%` : value.toFixed(2)}
+    </span>
+  </div>
+);
+
+const SectionHeader: React.FC<{ title: string; subtitle: string }> = ({
+  title,
+  subtitle,
+}) => (
+  <div className="mt-2 flex flex-col gap-0.5 px-1">
+    <div className="text-xs uppercase tracking-[0.18em] text-sky-400/80 font-bold">
+      {title}
+    </div>
+    <div className="text-xs text-slate-400">{subtitle}</div>
+  </div>
+);
+
+const PerfStat: React.FC<{ label: string; value: string }> = ({
+  label,
+  value,
+}) => (
+  <div className="flex flex-col gap-0.5">
+    <div className={`${faintText} text-[11px]`}>{label}</div>
+    <div className="text-sky-300 text-base font-semibold">{value}</div>
+  </div>
+);
+
+const HealthRow: React.FC<{
+  label: string;
+  ok?: boolean;
+  optional?: boolean;
+}> = ({ label, ok, optional }) => {
+  const text = ok === undefined ? "Unknown" : ok ? "Ready" : optional ? "Offline (Opt)" : "Critical";
+  const color = ok ? "text-emerald-400" : optional ? "text-amber-400" : "text-rose-500";
+  return (
+    <div className="flex items-center justify-between">
+       <span className="text-slate-400">{label}</span>
+       <span className={`font-mono ${color}`}>{text}</span>
+    </div>
+  );
+};
+
+const RangeField: React.FC<{
+  label: string;
+  min: number;
+  max: number;
+  value: number;
+  step?: number;
+  onChange: (v: number) => void;
+  display: (v: number) => string;
+}> = ({ label, min, max, value, step = 1, onChange, display }) => (
+  <div className="flex flex-col gap-1">
+    <div className="flex justify-between text-xs text-slate-400">
+       <span>{label}</span>
+       <span className="text-emerald-400">{display(value)}</span>
+    </div>
+    <input
+      type="range"
+      min={min}
+      max={max}
+      step={step}
+      value={value}
+      onChange={(e) => onChange(Number(e.target.value))}
+      className="w-full h-1.5 bg-slate-800 rounded-lg appearance-none cursor-pointer accent-emerald-500"
+    />
+  </div>
+);
+
 export default StrategiesTab;

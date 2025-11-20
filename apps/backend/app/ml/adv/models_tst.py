@@ -159,3 +159,139 @@ class TSTPredictor:
         except Exception as e:
             print(f"[TSTPredictor] Prediction error: {e}")
             return 0.0
+
+
+import torch
+import torch.nn as nn
+
+class TimeSeriesTransformer(nn.Module):
+    """
+    Time Series Transformer (TST) for sequence-to-sequence forecasting.
+    Input: tensor of shape (batch_size, context_length, num_features)
+    Output: tensor of shape (batch_size, prediction_length, target_size)
+    Versioning and artifact loading supported via `load_from_artifact`.
+    """
+
+    def __init__(
+        self,
+        context_length: int,
+        num_features: int,
+        prediction_length: int,
+        target_size: int,
+        d_model: int = 128,
+        nhead: int = 4,
+        num_layers: int = 3,
+        dim_feedforward: int = 512,
+        dropout: float = 0.1,
+    ):
+        super(TimeSeriesTransformer, self).__init__()
+        # --- architecture definitions ---
+        self.context_length = context_length
+        self.num_features = num_features
+        self.prediction_length = prediction_length
+        self.target_size = target_size
+        self.d_model = d_model
+
+        # Input projection
+        self.in_proj = nn.Linear(num_features, d_model)
+
+        # Positional encoding
+        self.pos_encoder = PositionalEncoding(d_model, dropout, max_len=context_length + prediction_length)
+
+        # Transformer Encoder
+        encoder_layer = nn.TransformerEncoderLayer(
+            d_model=d_model,
+            nhead=nhead,
+            dim_feedforward=dim_feedforward,
+            dropout=dropout,
+            batch_first=True
+        )
+        self.transformer_encoder = nn.TransformerEncoder(encoder_layer, num_layers=num_layers)
+
+        # Output projection for sequence output
+        self.out_proj = nn.Linear(d_model, target_size * prediction_length)
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        """
+        Args:
+            x: Tensor of shape (batch_size, context_length, num_features)
+        Returns:
+            Tensor of shape (batch_size, prediction_length, target_size)
+        """
+        # 1. Project input features
+        x = self.in_proj(x)  # [B, L, d_model]
+
+        # 2. Add positional encoding
+        x = self.pos_encoder(x)
+
+        # 3. Transformer encoding
+        x = self.transformer_encoder(x)  # [B, L, d_model]
+
+        # 4. Use the last time step's representation
+        #    (Alternatively, you could aggregate all time steps)
+        last_hidden = x[:, -1, :]  # [B, d_model]
+
+        # 5. Output projection
+        out = self.out_proj(last_hidden)  # [B, target_size * prediction_length]
+
+        # 6. Reshape to sequence form
+        out = out.view(-1, self.prediction_length, self.target_size)  # [B, pred_len, target_size]
+
+        return out
+
+    @staticmethod
+    def load_from_artifact(artifact_dir: str, device: torch.device = None):
+        """
+        Loads a TST model from the given artifact directory.
+        Expects:
+        - metadata file: metadata.json
+        - weight file: tst_<version>_<timestamp>.pt
+        """
+        import os, json, glob, torch
+
+        if device is None:
+            device = torch.device("cpu")
+
+        metadata_path = os.path.join(artifact_dir, "metadata.json")
+        if not os.path.exists(metadata_path):
+            raise FileNotFoundError(f"Metadata file not found at {metadata_path}")
+
+        with open(metadata_path, "r") as f:
+            metadata = json.load(f)
+
+        version = metadata.get("version")
+        if version is None:
+            raise KeyError("metadata.json must contain a 'version' field")
+
+        pattern = os.path.join(artifact_dir, f"tst_{version}_*.pt")
+        weight_files = glob.glob(pattern)
+        if not weight_files:
+            raise FileNotFoundError(f"No TST weight file found for version {version} in {artifact_dir}")
+
+        weight_path = weight_files[0]
+
+        hp = metadata.get("hyperparameters", {})
+        context_length = hp["context_length"]
+        num_features = hp["num_features"]
+        prediction_length = metadata["prediction_length"]
+        target_size = metadata["target_size"]
+
+        model = TimeSeriesTransformer(
+            context_length=context_length,
+            num_features=num_features,
+            prediction_length=prediction_length,
+            target_size=target_size,
+            d_model=hp.get("d_model", 128),
+            nhead=hp.get("nhead", 4),
+            num_layers=hp.get("num_layers", 3),
+            dim_feedforward=hp.get("dim_feedforward", 512),
+            dropout=hp.get("dropout", 0.1),
+        )
+
+        state_dict = torch.load(weight_path, map_location=device)
+        model.load_state_dict(state_dict)
+        model.to(device)
+        model.eval()
+
+        print(f"[INFO] Loaded TST model version {version} from {artifact_dir}. Hyperparams: {hp}")
+        return model, metadata

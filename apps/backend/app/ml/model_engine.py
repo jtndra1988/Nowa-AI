@@ -9,6 +9,7 @@ from sqlalchemy import desc
 from app.hybrid.schemas import Layer2Prediction, MarketContext
 from app.db.database import SessionLocal
 from app.db import models
+from app.ml.adv.model_registry import model_registry
 # Feature engineering
 from app.ml.adv.feature_engineering import FeatureBuilder  # user-provided file
 
@@ -53,57 +54,44 @@ class ModelEngine:
     def __init__(self):
         logger.info("[ModelEngine] Initializing...")
 
+        # Central registry (singleton)
+        self.registry = model_registry
+
         # XGB service (tabular analyst)
-        try:
-            self.xgb_service = XGBInferenceService()
-            self.xgb_ready = self.xgb_service.is_ready
-        except Exception as e:
-            logger.error("[ModelEngine] Failed to init XGBInferenceService: %s", e)
-            self.xgb_service = None
-            self.xgb_ready = False
+        self.xgb_service = self.registry.get_model("xgb")
+        self.xgb_ready = bool(
+            self.xgb_service and getattr(self.xgb_service, "is_ready", False)
+        )
 
-        # Load TFT
-        try:
-            self.tft = TFTPredictor()
-            self.tft_loaded = self.tft.is_model_loaded()
-        except Exception as e:
-            logger.error("[ModelEngine] Failed to load TFT: %s", e)
-            self.tft = None
-            self.tft_loaded = False
+        # TFT
+        self.tft = self.registry.get_model("tft")
+        self.tft_loaded = bool(
+            self.tft
+            and getattr(self.tft, "is_model_loaded", lambda: False)()
+        )
 
-        # Load TCN
-        try:
-            self.tcn = TCNPredictor()
-            self.tcn_loaded = self.tcn.is_model_loaded()
-        except Exception as e:
-            logger.error("[ModelEngine] Failed to load TCN: %s", e)
-            self.tcn = None
-            self.tcn_loaded = False
+        # TCN
+        self.tcn = self.registry.get_model("tcn")
+        self.tcn_loaded = bool(
+            self.tcn
+            and getattr(self.tcn, "is_model_loaded", lambda: False)()
+        )
 
-        # Load TST
-        try:
-            self.tst = TSTPredictor()
-            self.tst_loaded = self.tst.is_model_loaded()
-        except Exception as e:
-            logger.error("[ModelEngine] Failed to load TST: %s", e)
-            self.tst = None
-            self.tst_loaded = False
-        # Options feature ingestor (OptionsDerivedMetrics → iv_rank / skew / term_slope)
-        try:
-            self.options_ingestor = OptionsVolFeatureIngestion()
-        except Exception as e:
-            logger.error("[ModelEngine] Failed to init OptionsVolFeatureIngestion: %s", e)
-            self.options_ingestor = None
-        # Feature builder
-        self.feature_builder = FeatureBuilder()
+        # TST
+        self.tst = self.registry.get_model("tst")
+        self.tst_loaded = bool(
+            self.tst
+            and getattr(self.tst, "is_model_loaded", lambda: False)()
+        )
+
+        # Options feature ingestor
+        self.options_ingestor = self.registry.get_model("options_ingestor")
+
         # Macro + on-chain feature ingestor
-        try:
-            self.macro_ingestor = MacroOnchainFeatureIngestion()
-        except Exception as e:
-            logger.error(
-                "[ModelEngine] Failed to init MacroOnchainFeatureIngestion: %s", e
-            )
-            self.macro_ingestor = None
+        self.macro_ingestor = self.registry.get_model("macro_ingestor")
+
+        # Feature builder (data-side, not in registry)
+        self.feature_builder = FeatureBuilder()
 
     def _load_recent_ohlcv_for_symbol(
         self,

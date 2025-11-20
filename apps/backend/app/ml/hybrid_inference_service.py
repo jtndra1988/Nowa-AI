@@ -6,7 +6,7 @@ from app.hybrid.schemas import (
     Layer2Prediction,
     HybridDecision,
 )
-
+from app.ml.adv.model_registry import model_registry
 # L2 ensemble – you already have this in your backend
 from app.ml.model_engine import ModelEngine
 
@@ -34,9 +34,20 @@ class HybridInferenceService:
     """
 
     def __init__(self) -> None:
+        # L2 engine still does feature orchestration + ensemble
         self.model_engine = ModelEngine()
-        self.llm_engine = llm_engine
-        self.rl_agent = rl_agent
+
+        # Use central registry for LLM & RL where possible
+        self.registry = model_registry
+
+        # Prefer registry models; fall back to direct singletons
+        self.llm_engine = (
+            self.registry.get_model("llm") if self.registry else llm_engine
+        )
+        self.rl_agent = (
+            self.registry.get_model("rl") if self.registry else rl_agent
+        )
+
 
     # ------------------------------------------------------------------
     # Readiness

@@ -1,3 +1,4 @@
+from pathlib import Path
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
@@ -195,16 +196,58 @@ class TemporalFusionTransformer(nn.Module):
 class TFTPredictor:
     def __init__(self, model_path="model_artifacts/tft_model.pth"):
         self.model = None
-        # Logic to load self.model using torch.load(model_path) goes here
-        # self.model = TemporalFusionTransformer(...)
-        # self.model.load_state_dict(...)
-        pass
+        # PRODUCTION TODO: Uncomment these lines to actually load the weights
+        if Path(model_path).exists():
+             self.model = torch.load(model_path)
+             self.model.eval()
 
     def is_model_loaded(self) -> bool:
         return self.model is not None
 
     def predict(self, features: Dict[str, Any]) -> float:
-        # 1. Transform 'features' dict into tensors expected by TemporalFusionTransformer
-        # 2. Run self.model(x)
-        # 3. Return float(output['price'])
-        return 0.0 # Placeholder
+        """
+        Runs inference on the TFT model.
+        """
+        if not self.model:
+            return 0.0
+            
+        self.model.eval()
+        device = next(self.model.parameters()).device
+        
+        x_blocks = {}
+
+        try:
+            # 1. Convert features to tensors
+            for name, data in features.items():
+                if isinstance(data, (str, int, float, bool)) or data is None:
+                    continue
+
+                if isinstance(data, torch.Tensor):
+                    tensor = data.clone().detach()
+                else:
+                    tensor = torch.tensor(data, dtype=torch.float32)
+                
+                # TFT expects [Batch, Seq_Len, Features]
+                if tensor.ndim == 2:
+                    tensor = tensor.unsqueeze(0)
+                
+                x_blocks[name] = tensor.to(device)
+
+            if not x_blocks:
+                return 0.0
+
+            # 2. Run inference
+            with torch.no_grad():
+                # TFT returns {'price': ..., 'vol': ..., 'feature_weights': ...}
+                prediction = self.model(x_blocks)
+            
+            # 3. Extract price
+            price_val = prediction.get("price")
+            if price_val is not None:
+                return float(price_val.item())
+            
+            return 0.0
+
+        except Exception as e:
+            print(f"[TFTPredictor] Prediction error: {e}")
+            return 0.0

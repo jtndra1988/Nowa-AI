@@ -101,8 +101,8 @@ class TemporalConvNet(nn.Module):
 class TCNPredictor:
     def __init__(self, model_path="model_artifacts/tcn_model.pth"):
         self.model = None
-        # In real usage: self.model = torch.load(model_path)
-        # self.model.eval()
+        self.model = torch.load(model_path)
+        self.model.eval()
         pass
 
     def is_model_loaded(self) -> bool:

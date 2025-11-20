@@ -1,3 +1,4 @@
+from pathlib import Path
 from typing import Dict
 import torch
 import torch.nn as nn
@@ -93,9 +94,9 @@ class TSTPredictor:
     def __init__(self, model_path="model_artifacts/tst_model.pth"):
         self.model = None
         # In real usage: 
-        # if Path(model_path).exists():
-        #     self.model = torch.load(model_path)
-        #     self.model.eval()
+        if Path(model_path).exists():
+            self.model = torch.load(model_path)
+            self.model.eval()
         pass
 
     def is_model_loaded(self) -> bool:

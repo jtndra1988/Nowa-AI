@@ -1,3 +1,4 @@
+from typing import Dict
 import torch
 import torch.nn as nn
 import math
@@ -83,3 +84,77 @@ class TSTLite(nn.Module):
             'price': price_pred,
             'vol': vol_pred
         }
+
+# Add this to the bottom of apps/backend/app/ml/adv/models_tst.py
+
+from typing import Dict, Any
+
+class TSTPredictor:
+    def __init__(self, model_path="model_artifacts/tst_model.pth"):
+        self.model = None
+        # In real usage: 
+        # if Path(model_path).exists():
+        #     self.model = torch.load(model_path)
+        #     self.model.eval()
+        pass
+
+    def is_model_loaded(self) -> bool:
+        return self.model is not None
+
+    def predict(self, features: Dict[str, Any]) -> float:
+        """
+        Runs inference for TST.
+        CRITICAL: TSTLite.forward() expects a single tensor [B, L, F],
+        so we must concatenate the feature blocks from the dictionary.
+        """
+        if not self.model:
+            return 0.0
+            
+        self.model.eval()
+        
+        # Detect device
+        device = next(self.model.parameters()).device
+        
+        tensors = []
+
+        try:
+            # 1. Process and collect all feature blocks
+            for name, data in features.items():
+                # Skip metadata like strings or single numbers
+                if isinstance(data, (str, int, float, bool)) or data is None:
+                    continue
+
+                # Convert to Tensor
+                if isinstance(data, torch.Tensor):
+                    t = data.clone().detach()
+                else:
+                    t = torch.tensor(data, dtype=torch.float32)
+                
+                # Handle Dimensions: [L, F] -> [1, L, F]
+                if t.ndim == 2:
+                    t = t.unsqueeze(0)
+                
+                tensors.append(t)
+
+            if not tensors:
+                return 0.0
+
+            # 2. Concatenate all blocks along the feature dimension (dim=2)
+            # TST expects [Batch, Seq_Len, Total_Features]
+            x_input = torch.cat(tensors, dim=-1).to(device)
+
+            # 3. Run inference
+            with torch.no_grad():
+                prediction = self.model(x_input)
+            
+            # 4. Extract price prediction
+            price_val = prediction.get("price")
+            
+            if price_val is not None:
+                return float(price_val.item())
+            
+            return 0.0
+
+        except Exception as e:
+            print(f"[TSTPredictor] Prediction error: {e}")
+            return 0.0

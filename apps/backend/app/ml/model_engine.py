@@ -153,7 +153,7 @@ class ModelEngine:
         # STEP 4 → Create Layer2Prediction
         # -----------------------------------------
         layer2 = Layer2Prediction(
-            symbol=symbol,
+            asset=symbol,
             tft_vote=float(tft_pred or 0.0),
             tcn_vote=float(tcn_pred or 0.0),
             tst_vote=float(tst_pred or 0.0),

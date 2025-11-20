@@ -1,6 +1,6 @@
 import torch
 import torch.nn as nn
-from typing import Dict
+from typing import Any, Dict
 
 
 class Chomp1d(nn.Module):
@@ -97,3 +97,74 @@ class TemporalConvNet(nn.Module):
             "price": price_pred,
             "vol": vol_pred,
         }
+
+class TCNPredictor:
+    def __init__(self, model_path="model_artifacts/tcn_model.pth"):
+        self.model = None
+        # In real usage: self.model = torch.load(model_path)
+        # self.model.eval()
+        pass
+
+    def is_model_loaded(self) -> bool:
+        return self.model is not None
+
+    def predict(self, features: Dict[str, Any]) -> float:
+        """
+        Runs inference on the loaded TCN model.
+        Expects 'features' to be a dict of {block_name: array_like} corresponding
+        to the feature blocks the model was trained on.
+        """
+        if not self.model:
+            return 0.0
+            
+        # Ensure model is in eval mode
+        self.model.eval()
+        
+        # Detect device (CPU vs CUDA) from the model parameters
+        device = next(self.model.parameters()).device
+        
+        x_blocks = {}
+
+        # 1. Prepare tensors from features
+        try:
+            for name, data in features.items():
+                # Skip metadata or non-array features if any exist in the dict
+                if isinstance(data, (str, int, float, bool)) or data is None:
+                    continue
+
+                # Convert to Tensor
+                # We assume data is compatible with numpy/torch (List or np.ndarray)
+                if isinstance(data, torch.Tensor):
+                    tensor = data.clone().detach()
+                else:
+                    tensor = torch.tensor(data, dtype=torch.float32)
+                
+                # Handle Dimensions:
+                # Model expects [Batch, Seq_Len, Features]
+                # If input is just [Seq_Len, Features], we add a Batch dim at index 0
+                if tensor.ndim == 2:
+                    tensor = tensor.unsqueeze(0)
+                
+                x_blocks[name] = tensor.to(device)
+
+            if not x_blocks:
+                # If no valid feature blocks were found, return neutral
+                return 0.0
+
+            # 2. Run inference
+            with torch.no_grad():
+                # forward() returns {'price': ..., 'vol': ...}
+                prediction = self.model(x_blocks)
+            
+            # 3. Return float(pred['price'])
+            price_val = prediction.get("price")
+            
+            if price_val is not None:
+                return float(price_val.item())
+            
+            return 0.0
+
+        except Exception as e:
+            # Log the error safely without crashing the whole engine
+            print(f"[TCNPredictor] Prediction error: {e}")
+            return 0.0

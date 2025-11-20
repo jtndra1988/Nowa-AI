@@ -12,7 +12,7 @@ from torch.optim import AdamW
 
 from app.ml.adv.models_tcn import TemporalConvolutionalNetwork
 from app.ml.train_tft import load_training_data
-from app.ml.adv.feature_engineering import FEATURE_CONFIG, process_market_data
+from app.ml.adv.feature_engineering import FEATURE_CONFIG, apply_price_feature_config
 from app.ml.dataset import MultiModalTS
 from app.ml.losses import multitask_transformer_loss
 
@@ -27,7 +27,7 @@ MODEL_VERSION = "v1.0"
 def train():
     # 1. Load & preprocess data
     df = load_training_data(days=90)
-    df_processed = df.groupby("symbol", group_keys=False).apply(process_market_data)
+    df_processed = df.groupby("symbol", group_keys=False).apply(apply_price_feature_config)
 
     # Targets: next-step return & vol
     df_processed["target_price"] = (

@@ -16,7 +16,7 @@ from app.db import models
 from app.ml.adv.models_tft import TemporalFusionTransformer
 from app.ml.dataset import MultiModalTS
 from app.ml.losses import multitask_transformer_loss
-from app.ml.adv.feature_engineering import FEATURE_CONFIG, process_market_data
+from app.ml.adv.feature_engineering import FEATURE_CONFIG, apply_price_feature_config
 
 logger = logging.getLogger(__name__)
 logging.basicConfig(level=logging.INFO)
@@ -76,7 +76,7 @@ def train():
     df = load_training_data(days=90)
 
     # Apply shared feature engineering
-    df_processed = df.groupby("symbol", group_keys=False).apply(process_market_data)
+    df_processed = df.groupby("symbol", group_keys=False).apply(apply_price_feature_config)
 
     # Targets: next bar return & vol proxy
     df_processed["target_price"] = (

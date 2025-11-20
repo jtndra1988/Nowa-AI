@@ -14,7 +14,7 @@ import joblib
 from app.db.database import SessionLocal
 from app.db import models
 from app.core.config import settings
-
+from app.ml.adv.feature_engineering import apply_price_feature_config
 logger = logging.getLogger(__name__)
 logging.basicConfig(level=logging.INFO)
 
@@ -71,30 +71,35 @@ def _build_features(
     Build features + target for training.
 
     Returns:
-        X:          np.ndarray [N, F]
-        y:          np.ndarray [N]
+        X:           np.ndarray [N, F]
+        y:           np.ndarray [N]
         feature_cols: list of feature column names
-        df_feat:    full feature DataFrame (for debugging / potential reuse)
+        df_feat:     full feature DataFrame (for debugging / potential reuse)
     """
-    logger.info("[XGB] Building features...")
+    logger.info("[XGB] Building features (using apply_price_feature_config)...")
     df = df.copy()
     df["timestamp"] = pd.to_datetime(df["timestamp"], utc=True)
 
-    feats = []
+    feats: List[pd.DataFrame] = []
     groups = df.groupby("symbol", group_keys=False)
 
     for sym, g in groups:
         g = g.sort_values("timestamp").copy()
-        g["ret_1h"] = g["close"].pct_change()
+
+        # ✅ Shared preprocessing: returns + rolling vols, same as rest of the system
+        g = apply_price_feature_config(g)
+
+        # XGB-specific extra returns
         g["ret_4h"] = g["close"].pct_change(4)
         g["ret_12h"] = g["close"].pct_change(12)
 
-        g["log_ret"] = np.log(g["close"]).diff()
-        g["roll_vol_12h"] = g["log_ret"].rolling(12).std()
-        g["roll_vol_24h"] = g["log_ret"].rolling(24).std()
-        g["roll_vol_12h"] = g["roll_vol_12h"].fillna(g["roll_vol_12h"].median())
-        g["roll_vol_24h"] = g["roll_vol_24h"].fillna(g["roll_vol_24h"].median())
+        # Ensure rolling vols are finite (they were created by apply_price_feature_config)
+        if "roll_vol_12h" in g.columns:
+            g["roll_vol_12h"] = g["roll_vol_12h"].fillna(g["roll_vol_12h"].median())
+        if "roll_vol_24h" in g.columns:
+            g["roll_vol_24h"] = g["roll_vol_24h"].fillna(g["roll_vol_24h"].median())
 
+        # Target: forward return over `horizon`
         g["target_ret"] = g["close"].shift(-horizon) / g["close"] - 1.0
 
         feats.append(g)
@@ -111,13 +116,13 @@ def _build_features(
         "roll_vol_24h",
     ]
 
+    # Drop rows that don't have all features or target
     df_feat = df_feat.dropna(subset=feature_cols + ["target_ret"])
     X = df_feat[feature_cols].values.astype(float)
     y = df_feat["target_ret"].values.astype(float)
 
     logger.info("[XGB] Final training rows: %d", len(df_feat))
     return X, y, feature_cols, df_feat
-
 
 def _train_xgb_model(X: np.ndarray, y: np.ndarray):
     if len(X) < 500:
@@ -200,35 +205,39 @@ def build_features_for_inference(
         ["symbol", "timestamp", "open", "high", "low", "close", "volume"]
 
     Returns:
-        df_feat: DataFrame with feature_cols and "target_ret" (target_ret can be NaN at inference)
+        df_feat: DataFrame with feature_cols and "target_ret"
+                 (target_ret will typically be NaN at inference)
     """
     df = df_raw.copy()
     df["timestamp"] = pd.to_datetime(df["timestamp"], utc=True)
 
-    feats = []
+    feats: List[pd.DataFrame] = []
     groups = df.groupby("symbol", group_keys=False)
 
     for sym, g in groups:
         g = g.sort_values("timestamp").copy()
-        g["ret_1h"] = g["close"].pct_change()
+
+        # ✅ Same shared preprocessing as training
+        g = apply_price_feature_config(g)
+
+        # XGB-specific extra returns (same as training)
         g["ret_4h"] = g["close"].pct_change(4)
         g["ret_12h"] = g["close"].pct_change(12)
 
-        g["log_ret"] = np.log(g["close"]).diff()
-        g["roll_vol_12h"] = g["log_ret"].rolling(12).std()
-        g["roll_vol_24h"] = g["log_ret"].rolling(24).std()
-        g["roll_vol_12h"] = g["roll_vol_12h"].fillna(g["roll_vol_12h"].median())
-        g["roll_vol_24h"] = g["roll_vol_24h"].fillna(g["roll_vol_24h"].median())
+        # Reuse existing rolling vols, just ensure finite values
+        if "roll_vol_12h" in g.columns:
+            g["roll_vol_12h"] = g["roll_vol_12h"].fillna(g["roll_vol_12h"].median())
+        if "roll_vol_24h" in g.columns:
+            g["roll_vol_24h"] = g["roll_vol_24h"].fillna(g["roll_vol_24h"].median())
 
-        # At inference, we typically do NOT have future close to compute target_ret.
-        # Keep the column for consistency, but it will be NaN.
+        # At inference we usually don't have future prices, but keep the column
         g["target_ret"] = g["close"].shift(-horizon) / g["close"] - 1.0
 
         feats.append(g)
 
     df_feat = pd.concat(feats, axis=0).reset_index(drop=True)
 
-    # Don't drop NaNs on target_ret; but ensure feature_cols are present and finite.
+    # Don't drop on target_ret; but ensure all required feature_cols are valid.
     df_feat = df_feat.dropna(subset=feature_cols)
 
     return df_feat

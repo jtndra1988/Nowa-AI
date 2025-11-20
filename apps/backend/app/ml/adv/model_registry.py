@@ -15,7 +15,7 @@ logger = logging.getLogger(__name__)
 
 # Optional: environment-driven expected versions for hard checks
 EXPECTED_VERSIONS: Dict[str, Optional[str]] = {
-    "tft": os.getenv("NOWA_TFT_VERSION"),        # e.g. "v1.0"
+    "tft": os.getenv("NOWA_TFT_VERSION"),
     "tcn": os.getenv("NOWA_TCN_VERSION"),
     "tst": os.getenv("NOWA_TST_VERSION"),
     "xgb": os.getenv("NOWA_XGB_VERSION"),
@@ -23,7 +23,9 @@ EXPECTED_VERSIONS: Dict[str, Optional[str]] = {
     "rl": os.getenv("NOWA_RL_VERSION"),
     "options_ingestor": os.getenv("NOWA_OPT_VERSION"),
     "macro_ingestor": os.getenv("NOWA_MACRO_VERSION"),
+    "ensemble": os.getenv("NOWA_ENS_VERSION"),   # optional
 }
+
 
 
 class ModelRegistry:
@@ -48,8 +50,15 @@ class ModelRegistry:
     # Public API
     # ------------------------------------------------------------------
 
-    def get_model(self, key: str) -> Optional[Any]:
-        return self._models.get(key)
+    def get_model(self, name: str):
+        if name not in self._models:
+            self._load_model(name)
+        return self._models.get(name)
+    def _load_model(self, name: str):
+        if name == "ensemble":
+           from app.ml.ensemble import EnsembleStackerService
+           obj = EnsembleStackerService()
+           self._register(name, obj)
 
     def get_metadata(self, key: str) -> Dict[str, Any]:
         return self._metadata.get(key, {})

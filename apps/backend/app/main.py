@@ -2,7 +2,7 @@ from __future__ import annotations
 from fastapi import FastAPI
 from fastapi.middleware.cors import CORSMiddleware
 import logging
-
+from typing import Any, Dict
 from app.api.v1.health import router as health_router
 from app.api.v1.endpoints import router as core_router
 from app.api.v1.predict import router as v1_predict_router

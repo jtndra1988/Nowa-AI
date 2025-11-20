@@ -6,33 +6,29 @@ from typing import Any, Dict, Optional, List
 import pandas as pd
 from sqlalchemy.orm import Session
 from sqlalchemy import desc
+
+# Core Schemas & DB
 from app.hybrid.schemas import Layer2Prediction, MarketContext
 from app.db.database import SessionLocal
 from app.db import models
+
+# Registry & Feature Engineering
 from app.ml.adv.model_registry import model_registry
-# Feature engineering
-from app.ml.adv.feature_engineering import FeatureBuilder  # user-provided file
+from app.ml.adv.feature_engineering import FeatureBuilder
 
-# TFT / TCN / TST models
-from app.ml.adv.models_tft import TFTPredictor        # user-provided
-from app.ml.adv.models_tcn import TCNPredictor        # user-provided
-from app.ml.adv.models_tst import TSTPredictor        # user-provided
+# Model Wrappers (for type hinting if needed, though Registry handles instantiation)
+from app.ml.adv.models_tft import TFTPredictor
+from app.ml.adv.models_tcn import TCNPredictor
+from app.ml.adv.models_tst import TSTPredictor
 
-# DecisionNet
-from app.ml.adv.decision_net import decision_net_score   # user-provided
-
-# Options / Macro-Onchain experts
-from app.ml.adv.options_vol_model import (
-    options_vol_edge,
-    OptionsVolFeatureIngestion,
-)
-from app.ml.adv.macro_onchain_model import (
-    macro_onchain_bias,
-    MacroOnchainFeatureIngestion,
-)
+# DecisionNet & Experts
+from app.ml.adv.decision_net import decision_net_score
+from app.ml.adv.options_vol_model import options_vol_edge
+from app.ml.adv.macro_onchain_model import macro_onchain_bias
 from app.ml.adv.llm_narrative_model import llm_engine
-# XGB tabular specialist
-from app.ml.adv.inference_xgb import XGBInferenceService
+
+# Ensemble
+from app.ml.ensemble import EnsembleStackerService
 
 logger = logging.getLogger(__name__)
 
@@ -41,72 +37,65 @@ class ModelEngine:
     """
     Aggregates your full ML stack into one unified prediction object.
 
-    Layer 2 includes:
+    Layer 1 (Predictors):
       - TFT (Visionary)
       - TCN (Reflex)
       - TST (Transformer specialist)
-      - DecisionNet (Fusion)
-      - XGB models (tabular analyst)
-      - Options model
-      - Macro/On-chain model
+      - XGB (Tabular analyst)
+
+    Layer 2 (Fusion):
+      - DecisionNet (Neural Fusion)
+      - EnsembleStacker (Linear Meta-Learner)
+
+    Layer 3 (Experts):
+      - Options Expert
+      - Macro/On-chain Expert
+      - LLM Narrative
     """
 
     def __init__(self):
         logger.info("[ModelEngine] Initializing...")
 
-        # Central registry (singleton)
+        # 1. Central Registry (Singleton)
         self.registry = model_registry
 
-        # XGB service (tabular analyst)
+        # 2. Initialize Predictors via Registry
+        # XGB Service
         self.xgb_service = self.registry.get_model("xgb")
-        self.xgb_ready = bool(
-            self.xgb_service and getattr(self.xgb_service, "is_ready", False)
-        )
+        self.xgb_ready = bool(self.xgb_service and getattr(self.xgb_service, "is_ready", False))
 
         # TFT
         self.tft = self.registry.get_model("tft")
-        self.tft_loaded = bool(
-            self.tft
-            and getattr(self.tft, "is_model_loaded", lambda: False)()
-        )
+        self.tft_loaded = bool(self.tft and getattr(self.tft, "is_model_loaded", lambda: False)())
 
         # TCN
         self.tcn = self.registry.get_model("tcn")
-        self.tcn_loaded = bool(
-            self.tcn
-            and getattr(self.tcn, "is_model_loaded", lambda: False)()
-        )
+        self.tcn_loaded = bool(self.tcn and getattr(self.tcn, "is_model_loaded", lambda: False)())
 
         # TST
         self.tst = self.registry.get_model("tst")
-        self.tst_loaded = bool(
-            self.tst
-            and getattr(self.tst, "is_model_loaded", lambda: False)()
-        )
+        self.tst_loaded = bool(self.tst and getattr(self.tst, "is_model_loaded", lambda: False)())
 
-        # Options feature ingestor
+        # 3. Initialize Stacker (The "Judge")
+        # Ensure 'ensemble' is registered in your model_registry.py
+        self.stacker = self.registry.get_model("ensemble")
+        self.stacker_ready = bool(self.stacker and getattr(self.stacker, "is_ready", False))
+
+        # 4. Initialize Data Ingestors
         self.options_ingestor = self.registry.get_model("options_ingestor")
-
-        # Macro + on-chain feature ingestor
         self.macro_ingestor = self.registry.get_model("macro_ingestor")
 
-        # Feature builder (data-side, not in registry)
+        # 5. Feature Builder (Direct instantiation as it handles data logic)
         self.feature_builder = FeatureBuilder()
 
-    def _load_recent_ohlcv_for_symbol(
-        self,
-        symbol: str,
-        limit: int = 300,
-    ) -> pd.DataFrame:
+    # --------------------------------------------------------------
+    # Data Loading & Feature Prep
+    # --------------------------------------------------------------
+
+    def _load_recent_ohlcv_for_symbol(self, symbol: str, limit: int = 300) -> pd.DataFrame:
         """
-        Load recent OHLCV for a single symbol from MarketData.
-
-        This is used to feed XGBInferenceService; it deliberately
-        mirrors the schema used in train_xgb.py:
-            ['symbol', 'timestamp', 'open', 'high', 'low', 'close', 'volume']
-
-        Returns:
-            DataFrame (may be empty if no rows found).
+        Load recent OHLCV for XGBoost.
+        Mirrors schema: ['symbol', 'timestamp', 'open', 'high', 'low', 'close', 'volume']
         """
         session: Session = SessionLocal()
         try:
@@ -119,10 +108,7 @@ class ModelEngine:
             )
 
             if not rows:
-                logging.warning(
-                    "[ModelEngine] No OHLCV rows found for symbol %s for XGB.",
-                    symbol,
-                )
+                logging.warning(f"[ModelEngine] No OHLCV rows found for symbol {symbol} (XGB).")
                 return pd.DataFrame()
 
             data = [
@@ -137,160 +123,90 @@ class ModelEngine:
                 }
                 for r in rows
             ]
-
-            df = pd.DataFrame(data).sort_values("timestamp").reset_index(drop=True)
-            return df
+            return pd.DataFrame(data).sort_values("timestamp").reset_index(drop=True)
 
         except Exception as e:
-            logging.error(
-                "[ModelEngine] Failed to load OHLCV for XGB (symbol=%s): %s",
-                symbol,
-                e,
-                exc_info=True,
-            )
+            logging.error(f"[ModelEngine] Failed to load OHLCV for XGB ({symbol}): {e}", exc_info=True)
             return pd.DataFrame()
         finally:
             session.close()
+
     async def _build_feature_set(self, symbol: str) -> Dict[str, Any]:
         """
         Build the full feature dictionary for all models.
-
-        - Uses FeatureBuilder for sequence features (TFT/TCN/TST, options, macro).
-        - Ensures tensors have batch dimension where needed.
-        - Attaches a raw OHLCV DataFrame at features['xgb_df'] for XGBInferenceService.
         """
         try:
+            # 1. Sequence Features (TFT/TCN/TST)
             raw_features = await self.feature_builder.build_features(symbol)
-
             if not isinstance(raw_features, dict):
-                raise TypeError(
-                    f"FeatureBuilder.build_features() must return dict, got {type(raw_features)}"
-                )
-
-            # Shallow copy so we can normalize without mutating original
+                raise TypeError(f"FeatureBuilder returned {type(raw_features)}, expected dict")
+            
             features: Dict[str, Any] = dict(raw_features)
 
-            # --- Normalize 'price' tensor shape for deep models ---
+            # Normalize Tensor Shapes [L, F] -> [B, L, F]
             price = features.get("price")
             try:
-                import torch  # local import to avoid hard dependency at module import time
+                import torch
+                if isinstance(price, torch.Tensor) and price.ndim == 2:
+                    features["price"] = price.unsqueeze(0)
+            except Exception:
+                pass
 
-                if isinstance(price, torch.Tensor):
-                    # FeatureBuilder currently returns [L, F]; models expect [B, L, F]
-                    if price.ndim == 2:
-                        features["price"] = price.unsqueeze(0)  # [1, L, F]
-                    elif price.ndim == 3:
-                        # already [B, L, F] – leave as is
-                        pass
-                    else:
-                        logging.warning(
-                            "[ModelEngine] Unexpected 'price' tensor ndim=%d; expected 2 or 3.",
-                            price.ndim,
-                        )
-                elif price is not None:
-                    logging.warning(
-                        "[ModelEngine] 'price' feature is not a tensor (type=%s); "
-                        "TFT/TCN/TST may be skipped.",
-                        type(price),
-                    )
-            except Exception as e:
-                logging.warning(
-                    "[ModelEngine] Failed to normalize 'price' feature: %s", e, exc_info=True
-                )
-
-            # --- Macro + on-chain features ---
-            macro_features = features.get("macro_onchain_features", {})
-            if self.macro_ingestor is not None:
+            # 2. Expert Features (Options / Macro)
+            # Ingest live if available, otherwise keep defaults
+            if self.macro_ingestor:
                 try:
-                    ingested_macro = self.macro_ingestor.build_features(symbol)
-                    if ingested_macro:
-                        macro_features = ingested_macro
+                    ingested = self.macro_ingestor.build_features(symbol)
+                    if ingested: features["macro_onchain_features"] = ingested
                 except Exception as e:
-                    logger.warning(
-                        "[ModelEngine] MacroOnchainFeatureIngestion failed for %s: %s",
-                        symbol,
-                        e,
-                        exc_info=True,
-                    )
-            features["macro_onchain_features"] = macro_features
+                    logger.warning(f"[ModelEngine] Macro ingest failed: {e}")
 
-
-            # Options features: prefer live ingestion from OptionsDerivedMetrics.
-            # If ingestion fails or no data, fall back to any precomputed features (or empty dict).
-            options_features = features.get("options_features", {})
-            if self.options_ingestor is not None:
+            if self.options_ingestor:
                 try:
-                    ingested_opts = self.options_ingestor.build_features(symbol)
-                    if ingested_opts:
-                        options_features = ingested_opts
+                    ingested = self.options_ingestor.build_features(symbol)
+                    if ingested: features["options_features"] = ingested
                 except Exception as e:
-                    logging.warning(
-                        "[ModelEngine] OptionsVolFeatureIngestion failed for %s: %s",
-                        symbol,
-                        e,
-                        exc_info=True,
-                    )
-            features["options_features"] = options_features
+                    logger.warning(f"[ModelEngine] Options ingest failed: {e}")
 
-            # --- Attach XGB raw OHLCV DataFrame ---
-            # If FeatureBuilder already added 'xgb_df', keep it; otherwise we fetch from DB.
+            # 3. Tabular Data (XGBoost)
             if "xgb_df" not in features or features["xgb_df"] is None:
                 xgb_df = self._load_recent_ohlcv_for_symbol(symbol)
                 if not xgb_df.empty:
                     features["xgb_df"] = xgb_df
-                else:
-                    # Not fatal: XGBInferenceService will skip if xgb_df is missing
-                    logging.debug(
-                        "[ModelEngine] No XGB OHLCV available for symbol %s; "
-                        "XGB will be skipped for this request.",
-                        symbol,
-                    )
-
+            
             return features
 
         except Exception as e:
-            logging.error("[ModelEngine] Feature construction failed for %s: %s", symbol, e, exc_info=True)
-            # In production, it's better to surface a clean error than silently continue
+            logging.error(f"[ModelEngine] Feature build failed for {symbol}: {e}", exc_info=True)
             raise
 
+    # --------------------------------------------------------------
+    # Readiness
     # --------------------------------------------------------------
 
     @property
     def is_ready(self) -> bool:
-        """
-        Engine is 'ready' if at least one of the core models (TFT/TCN/TST/XGB)
-        is available.
-        """
-        return any([
-            self.tft_loaded,
-            self.tcn_loaded,
-            self.tst_loaded,
-            self.xgb_ready,
-        ])
+        """Ready if at least one core model is loaded."""
+        return any([self.tft_loaded, self.tcn_loaded, self.tst_loaded, self.xgb_ready])
 
+    # --------------------------------------------------------------
+    # Core Prediction Logic
     # --------------------------------------------------------------
 
     async def predict(self, ctx: MarketContext) -> Layer2Prediction:
         """
         Unified prediction call used by HybridInferenceService.
         """
-
         symbol = ctx.symbol.upper()
 
-        # -----------------------------------------
-        # STEP 1 → Build feature set
-        # -----------------------------------------
+        # --- STEP 1: Build Features ---
         try:
-            # Expect FeatureBuilder to return a dict of feature blocks.
-            # You can extend it to also add 'xgb_df' with raw OHLCV for XGB.
             features = await self._build_feature_set(symbol)
         except Exception as e:
-            logger.error("[ModelEngine] Feature construction failed: %s", e)
+            logger.error(f"[ModelEngine] Aborting predict due to feature error: {e}")
             raise
 
-        # -----------------------------------------
-        # STEP 2 → Run individual models
-        # -----------------------------------------
+        # --- STEP 2: Run Individual Models ---
 
         # TFT
         tft_pred = None
@@ -298,7 +214,7 @@ class ModelEngine:
             try:
                 tft_pred = self.tft.predict(features)
             except Exception as e:
-                logger.warning("[ModelEngine] TFT error: %s", e)
+                logger.warning(f"[ModelEngine] TFT error: {e}")
 
         # TCN
         tcn_pred = None
@@ -306,7 +222,7 @@ class ModelEngine:
             try:
                 tcn_pred = self.tcn.predict(features)
             except Exception as e:
-                logger.warning("[ModelEngine] TCN error: %s", e)
+                logger.warning(f"[ModelEngine] TCN error: {e}")
 
         # TST
         tst_pred = None
@@ -314,71 +230,51 @@ class ModelEngine:
             try:
                 tst_pred = self.tst.predict(features)
             except Exception as e:
-                logger.warning("[ModelEngine] TST error: %s", e)
+                logger.warning(f"[ModelEngine] TST error: {e}")
 
-        # XGB – tabular analyst
+        # XGBoost
         xgb_price_vote: Optional[float] = None
         xgb_vol_vote: Optional[float] = None
-
-        if self.xgb_ready and self.xgb_service is not None:
-            # We need a raw OHLCV DataFrame for XGB.
-            # Convention: FeatureBuilder adds 'xgb_df' into features if available.
+        if self.xgb_ready and self.xgb_service:
             xgb_df = features.get("xgb_df")
-            if xgb_df is None:
-                logger.debug(
-                    "[ModelEngine] No 'xgb_df' found in features; "
-                    "XGBInferenceService will be skipped."
-                )
-            else:
+            if xgb_df is not None:
                 try:
-                    # Use latest prediction for this symbol
-                    pred_val = self.xgb_service.predict_latest_for_symbol(
-                        df_raw=xgb_df,
-                        symbol=symbol,
-                    )
+                    pred_val = self.xgb_service.predict_latest_for_symbol(xgb_df, symbol)
                     if pred_val is not None:
                         xgb_price_vote = float(pred_val)
-                        # TODO: if you later train a dedicated vol model,
-                        #       set xgb_vol_vote accordingly.
-                        xgb_vol_vote = float(pred_val)
+                        xgb_vol_vote = float(pred_val) # Placeholder for vol model
                 except Exception as e:
-                    logger.warning("[ModelEngine] XGB error: %s", e)
+                    logger.warning(f"[ModelEngine] XGB error: {e}")
 
-        # DecisionNet (fusion of features)
+        # DecisionNet
         try:
             decision_score = decision_net_score(features)
         except Exception as e:
-            logger.warning("[ModelEngine] DecisionNet error: %s", e)
+            logger.warning(f"[ModelEngine] DecisionNet error: {e}")
             decision_score = 0.0
 
-        # Options expert
+        # Options Expert
         try:
             options_score = options_vol_edge(features.get("options_features", {}))
         except Exception:
             options_score = 0.0
 
-        # Macro/On-chain expert
+        # Macro Expert
         try:
             macro_score = macro_onchain_bias(features.get("macro_onchain_features", {}))
         except Exception:
             macro_score = 0.0
 
-        # LLM Narrative expert
+        # LLM Narrative
         llm_sentiment: Optional[float] = None
         try:
-            # For now we don't pass explicit news (you can later wire in aggregated news text).
-            narrative_result = await llm_engine.get_narrative_signal(
-                asset=symbol,
-                news_text=None,
-            )
+            narrative_result = await llm_engine.get_narrative_signal(asset=symbol, news_text=None)
             llm_sentiment = float(narrative_result.get("sentiment_score", 0.0))
         except Exception as e:
-            logger.warning("[ModelEngine] LLM narrative engine error: %s", e)
+            logger.warning(f"[ModelEngine] LLM error: {e}")
             llm_sentiment = None
 
-        # -----------------------------------------
-        # STEP 3 → Compute unified “votes”
-        # -----------------------------------------
+        # --- STEP 3: Compute Unified Votes (Ensemble) ---
         unified_vote = self._combine_votes(
             tft=tft_pred,
             tcn=tcn_pred,
@@ -391,9 +287,7 @@ class ModelEngine:
             llm_narrative=llm_sentiment,
         )
 
-        # -----------------------------------------
-        # STEP 4 → Create Layer2Prediction
-        # -----------------------------------------
+        # --- STEP 4: Create Response Object ---
         layer2 = Layer2Prediction(
             asset=symbol,
             tft_vote=float(tft_pred or 0.0),
@@ -410,10 +304,10 @@ class ModelEngine:
             unified_vote=float(unified_vote),
         )
 
-
-
         return layer2
 
+    # --------------------------------------------------------------
+    # Ensemble Logic
     # --------------------------------------------------------------
 
     def _combine_votes(
@@ -429,34 +323,46 @@ class ModelEngine:
         llm_narrative: Optional[float],
     ) -> float:
         """
-        Weighted meta-ensemble.
-        Weights can be tuned; here simple normalized mean.
-
-        Includes:
-          - tft, tcn, tst
-          - xgb_price, xgb_vol
-          - fusion (DecisionNet)
-          - options, macro
+        Smart Ensemble: Uses the Stacker if available, otherwise simpler average.
         """
+        
+        # 1. Try to use the "Judge" (Stacker)
+        if self.stacker_ready:
+            try:
+                # Pass complete list of base model predictions.
+                # The stacker's .blend() method will safely ignore keys 
+                # that it was not trained on, so it is safe to send everything.
+                base_preds = {
+                    "tft": tft or 0.0,
+                    "tcn": tcn or 0.0,
+                    "tst": tst or 0.0,
+                    "xgb": xgb_price or 0.0,       # Key matches DEFAULT_BASE_MODELS
+                    "xgb_vol": xgb_vol or 0.0,
+                    "decision_net": fusion,
+                    "options": options,
+                    "macro": macro,
+                    "llm": llm_narrative or 0.0
+                }
+                return self.stacker.blend(base_preds)
+            except Exception as e:
+                logger.warning(f"[ModelEngine] Stacker failed, reverting to mean: {e}")
 
-        vals: List[float] = [
-            v
-            for v in [
-                tft,
-                tcn,
-                tst,
-                xgb_price,
-                xgb_vol,
-                fusion,
-                options,
-                macro,
-                llm_narrative,
+        # 2. Fallback to Simple Average (Legacy Logic)
+        vals = [
+            v for v in [
+                tft, 
+                tcn, 
+                tst, 
+                xgb_price, 
+                fusion, 
+                options, 
+                macro, 
+                llm_narrative
             ]
             if v is not None
         ]
-
+        
         if not vals:
             return 0.0
-
-        arr = np.array(vals, dtype=float)
-        return float(np.mean(arr))
+            
+        return float(np.mean(vals))

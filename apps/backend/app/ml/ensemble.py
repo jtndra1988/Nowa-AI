@@ -67,12 +67,14 @@ class EnsembleStackerService:
         }
     """
 
-    def __init__(self, artifact_path: Optional[Path] = None) -> None:
-        self.artifact_path: Path = Path(artifact_path) if artifact_path else ENSEMBLE_PATH
+    def __init__(self, artifact_path: str = "model_artifacts/ensemble_stacker.pkl") -> None:
+        self.artifact_path = Path(artifact_path)
 
-        self.model = None
-        self.base_models: List[str] = []
-        self.metrics: Dict[str, Any] = {}
+        self.model = None               # sklearn LinearRegression (or similar)
+        self.base_models: List[str] = []  # e.g. ["tft", "tcn", "xgb"]
+        self.metrics: Dict[str, Any] = {}  # {"rmse": ..., "r2": ...}
+        self.trained_at_utc: Optional[str] = None
+        self.version: str = "unknown"
 
         self._load_artifact()
 
@@ -83,36 +85,50 @@ class EnsembleStackerService:
     def _load_artifact(self) -> None:
         if not self.artifact_path.exists():
             logger.warning(
-                "[EnsembleStackerService] Artifact not found at %s. "
-                "Stacker will be disabled.",
+                "[EnsembleStackerService] Artifact not found at %s",
                 self.artifact_path,
             )
             return
 
-        try:
-            artifact = joblib.load(self.artifact_path)
-        except Exception as e:  # noqa: BLE001
-            logger.error(
-                "[EnsembleStackerService] Failed to load ensemble artifact: %s",
-                e,
-                exc_info=True,
-            )
-            return
+        artifact = joblib.load(self.artifact_path)
 
+        # Required
         self.model = artifact.get("model")
-        self.base_models = artifact.get("base_models", DEFAULT_BASE_MODELS)
+
+        # Optional / metadata
+        # train_ensemble.py already sets at least "base_models" and "metrics"
+        self.base_models = artifact.get("base_models", [])
         self.metrics = artifact.get("metrics", {})
 
-        if not isinstance(self.base_models, list) or not self.base_models:
-            self.base_models = DEFAULT_BASE_MODELS
+        # If you add these in train_ensemble.py, they’ll show up here:
+        meta = artifact.get("metadata", {})
+        self.trained_at_utc = (
+            artifact.get("trained_at_utc")
+            or meta.get("trained_at_utc")
+            or meta.get("train_date_utc")
+        )
+        self.version = (
+            artifact.get("version")
+            or meta.get("version")
+            or "unknown"
+        )
 
         logger.info(
-            "[EnsembleStackerService] Loaded ensemble stacker from %s "
-            "(base_models=%s, metrics=%s)",
+            "[EnsembleStackerService] Loaded ensemble artifact from %s "
+            "(version=%s, base_models=%s)",
             self.artifact_path,
+            self.version,
             self.base_models,
-            self.metrics,
         )
+
+    def get_metadata(self) -> Dict[str, Any]:
+        return {
+            "model_name": "ensemble_stacker",
+            "version": self.version,
+            "trained_at_utc": self.trained_at_utc,
+            "base_models": self.base_models,
+            "metrics": self.metrics,
+        }
 
     @property
     def is_ready(self) -> bool:

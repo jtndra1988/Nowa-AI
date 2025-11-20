@@ -58,12 +58,13 @@ from app.tasks.collectors import (
 # Sentiment fusion (L2 sentiment)
 from app.tasks.sentiment_fusion_collector import run_sentiment_fusion
 
-# ML training tasks (TFT/TCN/XGB/LLM/RL)
+# ML training tasks (The 10-Model Brain Architecture)
 from app.tasks.training_tasks import (
-    retrain_all_core_models,
-    retrain_ensemble,
-    retrain_llm_narrative_model,
-    retrain_rl_agent,
+    retrain_all_core_models,      # Layer 1: TFT, TCN, TST, XGB
+    retrain_experts,              # Layer 3: Options, Macro/On-chain
+    retrain_fusion,               # Layer 2: Ensemble, DecisionNet
+    retrain_llm_narrative_model,  # Layer 4: Meta
+    retrain_rl_agent,             # Layer 4: Execution
 )
 
 # Options derived metrics (per symbol)
@@ -273,27 +274,48 @@ def setup_periodic_tasks(sender, **kwargs):
             name=f"[Options] Derived metrics for {sym}",
         )
 
-    # --- ML training pipeline ---
+    # --- ML training pipeline (The 10-Model Brain) ---
+    # Scheduled to respect the data dependency chain: L1/L3 -> L2 -> L4
 
+    # 1. Layer 1: Core Predictors (TFT, TCN, TST, XGB)
+    # Starts at the top of the hour.
     sender.add_periodic_task(
         crontab(minute=0, hour="*/4"),
         retrain_all_core_models.s(),
-        name="[ML] Retrain All Core L1 Models",
+        name="[ML] L1: Retrain Core Predictors",
     )
+
+    # 2. Layer 3: Domain Experts (Options, Macro)
+    # Starts 5 mins after core to distribute load (usually fast).
+    # These must complete before Fusion starts.
     sender.add_periodic_task(
-        crontab(minute=0, hour="*/4"),
-        retrain_llm_narrative_model.s(),
-        name="[ML] Retrain LLM Narrative L1 Model",
+        crontab(minute=5, hour="*/4"),
+        retrain_experts.s(),
+        name="[ML] L3: Retrain Domain Experts",
     )
+
+    # 3. Layer 2: Fusion (Ensemble, DecisionNet)
+    # Starts 20 mins in. Expects L1 and L3 training to be done.
     sender.add_periodic_task(
-        crontab(minute=15, hour="*/4"),
-        retrain_ensemble.s(),
-        name="[ML] Retrain L2 Ensemble/DecisionNet",
+        crontab(minute=20, hour="*/4"),
+        retrain_fusion.s(),
+        name="[ML] L2: Retrain Fusion Layer",
     )
+
+    # 4. Layer 4: Execution (RL Agent)
+    # Starts 40 mins in. Expects L2 fusion to be ready to provide environment state.
     sender.add_periodic_task(
-        crontab(minute=30, hour="*/4"),
+        crontab(minute=40, hour="*/4"),
         retrain_rl_agent.s(),
-        name="[ML] Retrain L3 RL Execution Agent",
+        name="[ML] L4: Retrain RL Execution Agent",
+    )
+
+    # 5. Layer 4: Meta (LLM)
+    # Independent. Runs every 12 hours as it's computationally expensive/slow.
+    sender.add_periodic_task(
+        crontab(minute=10, hour="*/12"),
+        retrain_llm_narrative_model.s(),
+        name="[ML] L4: Retrain LLM Narrative Specialist",
     )
 
     logger.info("Periodic tasks configured.")
@@ -398,7 +420,8 @@ def on_task_prerun(task_id, task, args, kwargs, **z):
         "app.tasks.collectors.run_onchain_collector",
         "app.tasks.collectors.run_cross_asset_corr_collector",
         "app.tasks.training_tasks.retrain_all_core_models",
-        "app.tasks.training_tasks.retrain_ensemble",
+        "app.tasks.training_tasks.retrain_experts",  # Updated allowlist
+        "app.tasks.training_tasks.retrain_fusion",   # Updated allowlist
         "app.tasks.training_tasks.retrain_llm_narrative_model",
         "app.tasks.training_tasks.retrain_rl_agent",
     ]:

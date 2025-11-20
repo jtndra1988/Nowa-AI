@@ -7,7 +7,7 @@ from typing import Any, Dict
 
 from fastapi import APIRouter
 from app.db.database import SessionLocal
-
+from app.ml.adv.model_registry import model_registry
 # psutil is optional – if missing, we still don't crash
 try:
     import psutil
@@ -27,7 +27,14 @@ def _utcnow_iso() -> str:
 # Basic health endpoints
 # ---------------------------------------------------------------------------
 
-
+@router.get("/health/models", summary="Model versions & status")
+async def health_models() -> Dict[str, Any]:
+    meta = model_registry.all_metadata()
+    status = "ok" if meta else "degraded"
+    return {
+        "status": status,
+        "models": meta,
+    }
 @router.get("/healthz")
 def healthz() -> Dict[str, Any]:
     return {

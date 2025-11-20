@@ -311,18 +311,12 @@ class TFTPredictor:
     def is_model_loaded(self) -> bool:
         return self.model is not None
 
-    def predict(self, features: Dict[str, Any]) -> float:
+    def predict(self, features: Dict[str, Any]) -> Dict[str, float]:
         """
-        Runs inference on the TFT model.
-
-        `features` is expected to be:
-            {
-                "block_name": array_or_tensor_like [L, F_block],
-                ...
-            }
+        Runs inference and returns BOTH price (return) and volatility.
         """
-        if self.model is None:
-            return 0.0
+        if not self.model:
+            return {"price": 0.0, "vol": 0.0}
 
         self.model.eval()
         try:
@@ -330,38 +324,32 @@ class TFTPredictor:
         except StopIteration:
             device = torch.device("cpu")
 
-        x_blocks: Dict[str, torch.Tensor] = {}
-
+        x_blocks = {}
         try:
-            # 1. Convert features to tensors
             for name, data in features.items():
-                if isinstance(data, (str, int, float, bool)) or data is None:
-                    continue
-
+                if isinstance(data, (str, int, float, bool)) or data is None: continue
                 if isinstance(data, torch.Tensor):
                     tensor = data.clone().detach()
                 else:
                     tensor = torch.tensor(data, dtype=torch.float32)
-
-                # TFT expects [Batch, Seq_Len, Features]
                 if tensor.ndim == 2:
-                    tensor = tensor.unsqueeze(0)  # [1, L, F]
+                    tensor = tensor.unsqueeze(0)
                 x_blocks[name] = tensor.to(device)
 
             if not x_blocks:
-                return 0.0
+                return {"price": 0.0, "vol": 0.0}
 
-            # 2. Run inference
             with torch.no_grad():
                 prediction = self.model(x_blocks)
 
-            # 3. Extract price
             price_val = prediction.get("price")
-            if price_val is not None:
-                return float(price_val.squeeze().item())
-
-            return 0.0
+            vol_val = prediction.get("vol")
+            
+            return {
+                "price": float(price_val.item()) if price_val is not None else 0.0,
+                "vol": float(vol_val.item()) if vol_val is not None else 0.0
+            }
 
         except Exception as e:
             print(f"[TFTPredictor] Prediction error: {e}")
-            return 0.0
+            return {"price": 0.0, "vol": 0.0}

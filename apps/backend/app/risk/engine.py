@@ -5,7 +5,8 @@ import json
 from dataclasses import dataclass, asdict, field
 from pathlib import Path
 from typing import Dict, Any, Optional
-
+from app.core.config import settings
+from app.rt_adapt.dynamic_params import get_params
 import numpy as np
 import pandas as pd
 
@@ -216,19 +217,17 @@ class RiskEngine:
 
     # -------- position proposal --------
     def propose_position(
-        self,
-        dfe: pd.DataFrame,
-        side: str,
-        confidence: float,
-        regime: int,
-        mark_price: float,
-        open_positions_usd: float,
-        portfolio_gross_exposure: float,
+        self, dfe, side, confidence, regime, mark_price, open_positions_usd, portfolio_gross_exposure
     ) -> Dict[str, Any]:
         """
         Returns:
           qty_usd, sl_price, tp_price, atr, sl_mult, tp_mult, conf_scale, reg_scale, reason
         """
+        dyn = get_params(settings.CELERY_BROKER_URL, self.symbol)
+        # 2. Overlay Dynamic Values or use Default Config
+        sl_mult_cfg = dyn.get("sl_atr_mult", self.cfg.sl_atr_mult_init)
+        tp_mult_cfg = dyn.get("tp_atr_mult", self.cfg.tp_atr_mult_init)
+        size_factor = dyn.get("size_factor", 1.0)
         side = side.upper()
         if side not in ("BUY", "SELL"):
             return {"qty_usd": 0.0, "reason": "HOLD/no action"}
@@ -239,14 +238,14 @@ class RiskEngine:
         if portfolio_gross_exposure >= self.cfg.max_portfolio_leverage * self.cfg.account_equity_usd:
             return {"qty_usd": 0.0, "reason": "portfolio leverage cap"}
 
-        atr = self._atr(dfe.tail(max(200, self.cfg.atr_length + 2)), self.cfg.atr_length)
+        atr = self._atr(dfe.tail(200), self.cfg.atr_length)
         if atr <= 0 or mark_price <= 0:
             return {"qty_usd": 0.0, "reason": "invalid ATR/price"}
 
         sl_mult = float(np.clip(self.state.sl_atr_mult, self.cfg.min_sl_atr_mult, self.cfg.max_sl_atr_mult))
         sl_dist = sl_mult * atr
 
-        target_risk_usd = self.cfg.target_daily_vol * self.cfg.account_equity_usd
+        target_risk_usd = self.cfg.target_daily_vol * self.cfg.account_equity_usd * size_factor
         base_size_usd = target_risk_usd * mark_price / max(sl_dist, 1e-9)
 
         max_risk_usd = self.cfg.per_trade_risk_pct_cap * self.cfg.account_equity_usd

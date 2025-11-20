@@ -1,7 +1,7 @@
 from typing import Dict, Any, Tuple
-
-from .schemas import ExpertSignals, MarketContext
-
+from app.hybrid.schemas import ExpertSignals, MarketContext
+from app.rt_adapt.event_bus import get_kv
+from app.core.config import settings
 
 def bandit_weights(
     features: Dict[str, Any],
@@ -10,26 +10,34 @@ def bandit_weights(
     ctx: MarketContext,
 ) -> Tuple[Dict[str, float], str]:
     """
-    Simple regime-based weighting over TFT/TCN/XGB.
-    Replace with proper contextual bandit later.
-
-    Returns:
-      weights: dict of model_name -> weight
-      tag: strategy/regime tag
+    Regime-based router.
+    Now fetches LIVE regime state from Redis (populated by rt_adapt).
     """
-    rv = float(features.get("rv_24h", 0.05))
-    trend = float(features.get("trend_score", 0.0))
+    symbol = ctx.symbol.upper()
+    
+    # 1. Fetch Regime from Nervous System (Redis)
+    # Fallback to 'chop' if system is cold
+    regime_data = get_kv(settings.CELERY_BROKER_URL, f"regime:{symbol}")
+    if not regime_data:
+        regime_data = {"regime": "chop", "vol": "mid_vol"}
+        
+    r_tag = regime_data.get("regime", "chop")
+    v_tag = regime_data.get("vol", "mid_vol")
 
-    if trend > 0.3 and rv < 0.15:
-        w = {"tft": 0.4, "tcn": 0.4, "xgb": 0.2}
-        tag = "trend_perp"
-    elif rv > 0.20:
-        w = {"tft": 0.2, "tcn": 0.5, "xgb": 0.3}
-        tag = "high_vol_momentum"
+    # 2. Route Strategy based on External Truth
+    if r_tag == "bull" or r_tag == "bear":
+        # Strong Trend -> Trust Visionary (TFT)
+        w = {"tft": 0.6, "tcn": 0.2, "xgb": 0.2}
+        strategy_tag = f"trend_{r_tag}"
+        
+    elif v_tag == "high_vol":
+        # Chaos -> Trust Reflex (TCN)
+        w = {"tft": 0.2, "tcn": 0.6, "xgb": 0.2}
+        strategy_tag = "volatility_reflex"
+        
     else:
+        # Chop/Low Vol -> Trust Analyst (XGB)
         w = {"tft": 0.2, "tcn": 0.2, "xgb": 0.6}
-        tag = "mean_revert"
+        strategy_tag = "mean_reversion"
 
-    s = sum(w.values()) or 1.0
-    w = {k: v / s for k, v in w.items()}
-    return w, tag
+    return w, strategy_tag

@@ -13,7 +13,8 @@ from app.db import models
 from app.ml.model_engine import ModelEngine  # <--- Uses the robust ML/FeatureBuilder logic
 from app.ml.adv.llm_narrative_model import llm_engine
 from app.ml.adv.rl_execution_agent import rl_agent
-
+from app.rt_adapt.cooldown_scheduler import should_skip, mark_ran
+from app.core.config import settings
 from app.hybrid.schemas import (
     MarketContext,
     Layer2Prediction,
@@ -83,8 +84,12 @@ class HybridInferenceService:
         4. RiskEngine: Validates Action -> Calculates Size -> Returns Final Decision
         """
         symbol = (ctx.symbol or "BTCUSDT").upper()
-        
-        # 1) AI LAYER (Delegated to ModelEngine)
+        # 1. Safety Check: Are we in Cooldown?
+        # If we lost money recently or volatility is insane, rt_adapt sets this flag.
+        if should_skip(settings.CELERY_BROKER_URL, symbol, "inference"):
+            logger.warning(f"[HybridInference] {symbol} is in COOLDOWN. Skipping.")
+            return self._build_fallback_decision(ctx, "cooldown_active")
+        # 2) AI LAYER (Delegated to ModelEngine)
         # This uses FeatureBuilder internally to get the correct tensor shapes
         try:
             l2_pred: Layer2Prediction = await self.model_engine.predict(ctx)
@@ -98,7 +103,7 @@ class HybridInferenceService:
                 unified_vote=0.0
             )
 
-        # 2) META LAYER (LLM)
+        # 3) META LAYER (LLM)
         llm_headline = None
         llm_score = 0.0
         if self.llm_ready:
@@ -110,7 +115,7 @@ class HybridInferenceService:
             except Exception as e:
                 logger.warning(f"[HybridInferenceService] LLM Layer failed: {e}")
 
-        # 3) PREPARE MODEL VOTES (For RL & Logging)
+        # 4) PREPARE MODEL VOTES (For RL & Logging)
         model_votes = {
             "tft_visionary": l2_pred.tft_vote,
             "tcn_reflex": l2_pred.tcn_vote,
@@ -120,7 +125,7 @@ class HybridInferenceService:
             "unified_vote": l2_pred.unified_vote
         }
 
-        # 4) EXECUTION LAYER (RL Agent)
+        # 5) EXECUTION LAYER (RL Agent)
         # RL Agent decides "What should we do?" based on the signals
         if self.rl_ready:
             try:
@@ -135,7 +140,7 @@ class HybridInferenceService:
         else:
             rl_action = self._get_fallback_rl_action()
 
-        # 5) DECISION LAYER (Risk Engine)
+        # 6) DECISION LAYER (Risk Engine)
         # Risk Engine decides "Can we actually do this?" and "How much?"
         risk_engine = RiskEngine(symbol=symbol)
         
@@ -164,7 +169,7 @@ class HybridInferenceService:
             ctx=ctx
         )
 
-        # 6) PERSISTENCE & RETURN
+        # 7) PERSISTENCE & RETURN
         decision = HybridDecision(
             symbol=symbol,
             instrument_type=ctx.instrument_type,
@@ -185,6 +190,7 @@ class HybridInferenceService:
         )
         
         self._persist_decision(decision)
+        mark_ran(settings.CELERY_BROKER_URL, symbol, "inference")
         return decision
 
     def _get_fallback_rl_action(self) -> RLAction:

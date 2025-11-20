@@ -12,6 +12,7 @@ from pydantic import BaseModel, Field
 # Market Context
 # =============================================================================
 
+
 class MarketContext(BaseModel):
     """
     Snapshot of the trading environment provided to the hybrid brain.
@@ -62,12 +63,49 @@ class Layer2Prediction(BaseModel):
     """
     Output of the ensemble / decision net (L2).
 
-    This is what flows into:
-      - RLAgent.get_optimal_action(...)
-      - HybridInferenceService final decision logic
+    In Phase 1 this also serves as the main response for the hourly
+    price prediction endpoint.
     """
 
-    asset: str
+    asset: str = Field(..., description="Symbol / asset identifier, e.g. 'BTCUSDT'.")
+
+    # --- Direction + confidence ---
+
+    direction: DirectionLiteral = Field(
+        ...,
+        description="Ensemble directional view: 'up', 'down', or 'flat'.",
+    )
+
+    price_confidence: float = Field(
+        ...,
+        ge=0.0,
+        le=1.0,
+        description=(
+            "0..1 confidence score in the price move / range prediction. "
+            "Derived from unified_vote magnitude."
+        ),
+    )
+
+    # --- Price prediction fields for the next hour ---
+
+    current_price: float = Field(
+        0.0,
+        description="Latest observed price used as reference for the forecast.",
+    )
+    predicted_price: float = Field(
+        0.0,
+        description="Forecasted price for the next hour (point estimate).",
+    )
+    predicted_range_high: float = Field(
+        0.0,
+        description="Expected upper bound for next hour price.",
+    )
+    predicted_range_low: float = Field(
+        0.0,
+        description="Expected lower bound for next hour price.",
+    )
+
+    # --- Model votes / scores ---
 
     tft_vote: float = 0.0
     tcn_vote: float = 0.0
@@ -78,21 +116,27 @@ class Layer2Prediction(BaseModel):
 
     decision_score: float = 0.0
 
-    options_features: Dict[str, Any] = {}
-    macro_onchain_features: Dict[str, Any] = {}
-
-    # NEW: scalar scores for RL & UI
     options_score: float = 0.0
     macro_score: float = 0.0
     llm_narrative_vote: float = 0.0
 
     unified_vote: float = 0.0
-    
-    # Keep these as flexible dicts or define sub-models
-    options_features: Dict[str, Any] = Field(default_factory=dict)
-    macro_onchain_features: Dict[str, Any] = Field(default_factory=dict)
-    
-    meta: Optional[Dict[str, Any]] = None
+
+    # --- Raw feature payloads (for debugging / UI) ---
+
+    options_features: Dict[str, Any] = Field(
+        default_factory=dict,
+        description="Raw options-derived feature block used by OptionsVolExpert.",
+    )
+    macro_onchain_features: Dict[str, Any] = Field(
+        default_factory=dict,
+        description="Raw macro + on-chain feature block used by MacroOnchainExpert.",
+    )
+
+    meta: Optional[Dict[str, Any]] = Field(
+        default=None,
+        description="Optional metadata / diagnostics for observability.",
+    )
 
     class Config:
         orm_mode = True
@@ -101,6 +145,7 @@ class Layer2Prediction(BaseModel):
 # =============================================================================
 # RL Action (Layer 3 Execution Policy)
 # =============================================================================
+
 
 class RLAction(BaseModel):
     """
@@ -144,6 +189,7 @@ class RLAction(BaseModel):
 # =============================================================================
 # Hybrid Decision (Final API Surface)
 # =============================================================================
+
 
 class HybridDecision(BaseModel):
     """
@@ -243,11 +289,13 @@ class HybridDecision(BaseModel):
 # (Optional) Backwards-compat ExpertSignals stub
 # =============================================================================
 
+
 class ExpertSignals(BaseModel):
     """
     Lightweight container if other parts of the code still import ExpertSignals.
     Not required by the new HybridInferenceService, but safe to keep.
     """
+
     trend: Optional[float] = None
     sentiment: Optional[float] = None
     onchain: Optional[float] = None

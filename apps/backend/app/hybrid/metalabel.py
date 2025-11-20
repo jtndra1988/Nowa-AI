@@ -11,7 +11,10 @@ _metalabel_model = None
 def _lazy_load():
     global _metalabel_model
     if _metalabel_model is None and _METALABEL_PATH.exists():
-        _metalabel_model = joblib.load(_METALABEL_PATH)
+        try:
+            _metalabel_model = joblib.load(_METALABEL_PATH)
+        except Exception as e:
+            print(f"[MetaLabel] Failed to load model: {e}")
 
 
 def metalabel_decide(
@@ -21,34 +24,52 @@ def metalabel_decide(
     ctx: MarketContext,
 ) -> Dict[str, Any]:
     """
-    Decide:
-      - execute: whether to send this to execution
-      - size_factor: recommended fraction of max size (0..1)
+    Secondary Model (Meta-Labeling) to filter false positives.
+    
+    Decides:
+      - execute: boolean (should we block this trade?)
+      - size_factor: float (0.0 to 1.0, how much capital to deploy)
     """
     _lazy_load()
 
-    base = {
-        "p_edge": meta["p_edge"],
-        "conf": meta["confidence"],
-        "rv_24h": features.get("rv_24h", 0.0),
-        "funding_1h": features.get("funding_1h", 0.0),
-    }
+    # Extract critical signals
+    # 'p_edge' is the raw model prediction (e.g. 0.005 for 0.5% return)
+    p_edge = float(meta.get("p_edge", 0.0))
+    conf = float(meta.get("confidence", 0.0))
+    rv_24h = float(features.get("roll_vol_24h", 0.0))
+    
+    # Funding rate is often a good "crowdedness" signal
+    # Check both feature set and tabular features
+    funding = float(features.get("funding_rate", 0.0))
 
+    # 1. Heuristic Logic (Fallback / Guardrails)
+    # If volatility is extremely low, don't trade (dead market)
+    if rv_24h < 0.001: 
+        return {"execute": False, "size_factor": 0.0, "reason": "vol_too_low"}
+
+    # If Machine Learning Model Exists, Use It
     if _metalabel_model is not None:
-        p_ok = float(_metalabel_model.predict_proba([base])[0, 1])
-    else:
-        # Heuristic fallback
-        penalty = 0.0
-        if abs(base["funding_1h"]) > 0.01:
-            penalty += 0.1
-        if base["rv_24h"] > 0.20:
-            penalty += 0.1
-        p_ok = max(0.0, meta["p_edge"] - penalty)
+        try:
+            # Feature vector must match training: [p_edge, conf, vol, funding]
+            X_meta = [[p_edge, conf, rv_24h, funding]]
+            # predict_proba returns [prob_0, prob_1]. We want prob_1 (Trade is Good)
+            prob_success = float(_metalabel_model.predict_proba(X_meta)[0, 1])
+            
+            if prob_success > 0.6:
+                return {"execute": True, "size_factor": 1.0, "reason": "ml_high_conviction"}
+            elif prob_success > 0.5:
+                return {"execute": True, "size_factor": 0.5, "reason": "ml_low_conviction"}
+            else:
+                return {"execute": False, "size_factor": 0.0, "reason": "ml_reject"}
+        except Exception:
+            # Fallback if ML fails
+            pass
 
-    execute = (p_ok > 0.55) and (meta["dir_raw"] != "flat")
-    size_factor = max(0.1, min(1.0, p_ok)) if execute else 0.0
-
-    return {
-        "execute": execute,
-        "size_factor": size_factor,
-    }
+    # 2. Default Heuristic (if no ML model)
+    # Scale size based on confidence
+    if conf > 65.0:
+        return {"execute": True, "size_factor": 1.0, "reason": "high_conf_heuristic"}
+    elif conf > 50.0:
+        return {"execute": True, "size_factor": 0.5, "reason": "med_conf_heuristic"}
+    
+    return {"execute": True, "size_factor": 0.25, "reason": "low_conf_heuristic"}

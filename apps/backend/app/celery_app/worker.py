@@ -17,7 +17,7 @@ from typing import List, Optional, Any, Dict
 import numpy as np
 import pandas as pd
 import logging
-
+from app.tasks.rt_checks import run_all_regime_checks
 from celery.schedules import crontab
 from celery.signals import (
     worker_ready,
@@ -265,7 +265,7 @@ def setup_periodic_tasks(sender, **kwargs):
 
     if not active_symbols:
         active_symbols = ["BTC", "ETH"]
-
+    
     # Schedule a derived-metrics ETL per symbol, once per hour.
     for sym in active_symbols:
         sender.add_periodic_task(
@@ -273,7 +273,12 @@ def setup_periodic_tasks(sender, **kwargs):
             calculate_options_derived_metrics_task.s(symbol=sym),
             name=f"[Options] Derived metrics for {sym}",
         )
-
+        
+    sender.add_periodic_task(
+            60.0, 
+            run_all_regime_checks.s(),
+            name=f"[RT] Adapt Regime & Params: {sym}"
+        )    
     # --- ML training pipeline (The 10-Model Brain) ---
     # Scheduled to respect the data dependency chain: L1/L3 -> L2 -> L4
 

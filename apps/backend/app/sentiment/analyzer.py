@@ -1,4 +1,4 @@
-# app/nlp/analyzer.py  (or app/analyzer.py if that's your layout)
+# app/sentiment/analyzer.py 
 from __future__ import annotations
 
 import os

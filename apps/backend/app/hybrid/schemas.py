@@ -68,21 +68,22 @@ class Layer2Prediction(BaseModel):
     """
 
     asset: str = Field(..., description="Symbol/asset this prediction refers to.")
-    direction: DirectionLiteral = Field(
-        ..., description="Directional view: 'up', 'down', or 'flat'."
-    )
-    price_confidence: float = Field(
-        ...,
-        ge=0.0,
-        le=1.0,
-        description="Confidence in the directional view (0..1).",
-    )
+    direction: DirectionLiteral = Field(..., description="'up', 'down', or 'flat'")
+    price_confidence: float = Field(..., ge=0.0, le=1.0)
 
-    # Optional metadata for debugging / introspection
-    meta: Optional[Dict[str, Any]] = Field(
-        default=None,
-        description="Optional metadata (trend stats, features used, etc.).",
-    )
+    unified_vote: float = 0.0
+    tft_vote: float = 0.0
+    tcn_vote: float = 0.0
+    tst_vote: float = 0.0
+    xgb_price_vote: float = 0.0  # HybridService looks for this
+    xgb_vol_vote: float = 0.0    # HybridService looks for this
+    decision_score: float = 0.0
+    
+    # Keep these as flexible dicts or define sub-models
+    options_features: Dict[str, Any] = Field(default_factory=dict)
+    macro_onchain_features: Dict[str, Any] = Field(default_factory=dict)
+    
+    meta: Optional[Dict[str, Any]] = None
 
     class Config:
         orm_mode = True

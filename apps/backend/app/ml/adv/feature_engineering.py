@@ -1,8 +1,16 @@
 import pandas as pd
 import numpy as np
-from typing import List
+from typing import Any, Dict, List
 
-
+class FeatureBuilder:
+    def __init__(self):
+        pass
+        
+    async def build_features(self, symbol: str) -> Dict[str, Any]:
+        # 1. Fetch OHLCV data from DB or Cache
+        # 2. Run create_tabular_features(df, ...)
+        # 3. Return dictionary of blocks {'price': ..., 'macro': ...}
+        return {}
 def create_tabular_features(
     df: pd.DataFrame,
     price_cols: List[str],

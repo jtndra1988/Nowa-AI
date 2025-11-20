@@ -191,3 +191,20 @@ class TemporalFusionTransformer(nn.Module):
             "vol": vol,
             "feature_weights": feature_weights,
         }
+
+class TFTPredictor:
+    def __init__(self, model_path="model_artifacts/tft_model.pth"):
+        self.model = None
+        # Logic to load self.model using torch.load(model_path) goes here
+        # self.model = TemporalFusionTransformer(...)
+        # self.model.load_state_dict(...)
+        pass
+
+    def is_model_loaded(self) -> bool:
+        return self.model is not None
+
+    def predict(self, features: Dict[str, Any]) -> float:
+        # 1. Transform 'features' dict into tensors expected by TemporalFusionTransformer
+        # 2. Run self.model(x)
+        # 3. Return float(output['price'])
+        return 0.0 # Placeholder

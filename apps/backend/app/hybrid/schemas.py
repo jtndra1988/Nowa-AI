@@ -106,7 +106,13 @@ class Layer2Prediction(BaseModel):
     )
 
     # --- Model votes / scores ---
-
+    current_price: float = 0.0
+    predicted_price: float = 0.0
+    predicted_range_high: float = 0.0
+    predicted_range_low: float = 0.0
+    direction: str = "flat"
+    price_confidence: float = 0.0
+    
     tft_vote: float = 0.0
     tcn_vote: float = 0.0
     tst_vote: float = 0.0

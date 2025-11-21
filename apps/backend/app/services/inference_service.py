@@ -227,6 +227,12 @@ class HybridInferenceService:
                     rl_mode=d.rl_mode,
                     rl_target_position=d.rl_target_position,
                     debug_payload=d.debug,
+                    direction=d.layer2_prediction.direction, # Ensure mapping from L2
+                    current_price=d.layer2_prediction.current_price,
+                    predicted_price=d.layer2_prediction.predicted_price,
+                    predicted_range_high=d.layer2_prediction.predicted_range_high,
+                    predicted_range_low=d.layer2_prediction.predicted_range_low,
+                    narrative_headline=d.llm_headline,
                     created_at=d.timestamp
                 )
                 db.add(signal)

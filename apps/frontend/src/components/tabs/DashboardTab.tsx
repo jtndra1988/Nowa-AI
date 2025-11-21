@@ -130,34 +130,34 @@ const getTrendStyles = (trend: "up" | "down" | "flat") => {
     return {
       text: "text-emerald-400",
       bg: "bg-emerald-500/10",
-      border: "border-emerald-500/40",
-      shadow: "shadow-[0_0_40px_-10px_rgba(16,185,129,0.3)]",
+      border: "border-emerald-500/50",
+      shadow: "shadow-[0_0_30px_-5px_rgba(16,185,129,0.3)]",
       gradient: "from-emerald-500/20 to-emerald-900/5",
       iconBg: "bg-emerald-500/20",
-      stroke: "#10b981",
     };
   }
-  if (trend === "down") {
+   if (trend === "down") {
     return {
       text: "text-rose-400",
       bg: "bg-rose-500/10",
-      border: "border-rose-500/40",
-      shadow: "shadow-[0_0_40px_-10px_rgba(244,63,94,0.3)]",
+      border: "border-rose-500/50",
+      shadow: "shadow-[0_0_30px_-5px_rgba(244,63,94,0.35)]",
       gradient: "from-rose-500/20 to-rose-900/5",
       iconBg: "bg-rose-500/20",
-      stroke: "#f43f5e",
     };
   }
+  // Neutral
   return {
-    text: "text-indigo-300",
-    bg: "bg-indigo-500/5",
-    border: "border-indigo-500/30",
-    shadow: "shadow-[0_0_30px_-10px_rgba(99,102,241,0.2)]",
-    gradient: "from-indigo-500/10 to-slate-900/5",
-    iconBg: "bg-indigo-500/20",
-    stroke: "#6366f1",
+    text: "text-slate-200",
+    bg: "bg-slate-600/20",
+    border: "border-slate-600/60",
+    shadow: "shadow-[0_0_30px_-8px_rgba(129,140,248,0.45)]", // indigo-ish neutral glow
+    gradient: "from-slate-800/60 to-slate-900/80",
+    iconBg: "bg-slate-800/80",
   };
 };
+
+
 
 export const DashboardTab: React.FC<Props> = ({ symbol, mode, exchange }) => {
   // 1. Connect the Simulation Hook
@@ -441,70 +441,140 @@ export const DashboardTab: React.FC<Props> = ({ symbol, mode, exchange }) => {
   );
 };
 
-/* --- Intel Card Component with Dynamic Shadow Logic --- */
+/* --- Intel Card Component with BACKGROUND Glow (not foreground tint) --- */
 const IntelCard: React.FC<{ 
   title: string; 
   value: string; 
   score: number; 
   desc: string; 
   icon: any; 
-  type: "sentiment" | "funding" | "orderflow"
+  type: "sentiment" | "funding" | "orderflow";
 }> = ({ title, value, score, desc, icon, type }) => {
-  
-  // Heuristic color logic with Shadow Boost
-  let colorClass = "text-slate-400 bg-slate-500/5 border-slate-700";
-  let shadowClass = "shadow-none";
-  let iconBg = "bg-slate-800";
-  
+  // Default: NEUTRAL (blue-ish glow)
+  let textClass = "text-sky-300";
+  let borderClass = "border-sky-500/40";
+  let glowBg = "bg-sky-500/40";     // background glow color
+  let iconBg = "bg-slate-900/80";   // icon chip
+  let badgeBg = "bg-slate-900/80";  // right-side score badge
+
+  // POSITIVE / NEGATIVE rules
   if (type === "sentiment" || type === "orderflow") {
-      if (score > 0.1) {
-        colorClass = "text-emerald-400 bg-emerald-500/10 border-emerald-500/40";
-        shadowClass = "shadow-[0_0_20px_-5px_rgba(16,185,129,0.2)]"; // Green Shadow
-        iconBg = "bg-emerald-500/20";
-      }
-      else if (score < -0.1) {
-        colorClass = "text-rose-400 bg-rose-500/10 border-rose-500/40";
-        shadowClass = "shadow-[0_0_20px_-5px_rgba(244,63,94,0.2)]"; // Red Shadow
-        iconBg = "bg-rose-500/20";
-      }
+    if (score > 0.1) {
+      // POSITIVE → GREEN glow
+      textClass = "text-emerald-300";
+      borderClass = "border-emerald-500/60";
+      glowBg = "bg-emerald-500/45";
+      iconBg = "bg-emerald-500/15";
+      badgeBg = "bg-emerald-500/10";
+    } else if (score < -0.1) {
+      // NEGATIVE → RED glow
+      textClass = "text-rose-300";
+      borderClass = "border-rose-500/60";
+      glowBg = "bg-rose-500/45";
+      iconBg = "bg-rose-500/15";
+      badgeBg = "bg-rose-500/10";
+    }
   } else if (type === "funding") {
-      // Funding > 1.5 is greedy (warning/amber), < -1.5 is fear (bullish reversal/green)
-      if (score > 1.5) {
-        colorClass = "text-amber-400 bg-amber-500/10 border-amber-500/40";
-        shadowClass = "shadow-[0_0_20px_-5px_rgba(251,191,36,0.2)]"; // Amber Shadow
-        iconBg = "bg-amber-500/20";
-      }
-      else if (score < -1.5) {
-        colorClass = "text-emerald-400 bg-emerald-500/10 border-emerald-500/40";
-        shadowClass = "shadow-[0_0_20px_-5px_rgba(16,185,129,0.2)]"; // Green Shadow
-        iconBg = "bg-emerald-500/20";
-      }
+    if (score > 1.5) {
+      // Greedy → GREEN glow
+      textClass = "text-emerald-300";
+      borderClass = "border-emerald-500/60";
+      glowBg = "bg-emerald-500/45";
+      iconBg = "bg-emerald-500/15";
+      badgeBg = "bg-emerald-500/10";
+    } else if (score < -1.5) {
+      // Stressed → RED glow
+      textClass = "text-rose-300";
+      borderClass = "border-rose-500/60";
+      glowBg = "bg-rose-500/45";
+      iconBg = "bg-rose-500/15";
+      badgeBg = "bg-rose-500/10";
+    }
+    // else: neutral blue glow
   }
 
   return (
-    <Card className={`group border transition-all duration-500 hover:scale-[1.02] hover:-translate-y-1 ${colorClass.split(' ')[2]} ${colorClass.split(' ')[1]} ${shadowClass}`}>
-      <CardContent className="p-5">
-        <div className="flex items-start justify-between mb-4">
-          <div className="flex items-center gap-3">
-            <div className={`p-2.5 rounded-xl border border-white/5 shadow-sm transition-colors ${iconBg}`}>
-              {React.cloneElement(icon, { className: `w-5 h-5 ${colorClass.split(' ')[0]}` })}
-            </div>
-            <div>
-              <div className="text-sm font-bold text-slate-200">{title}</div>
-              <div className="text-[11px] text-slate-500 font-medium">{desc}</div>
+    <div className="relative">
+      {/* 🔥 Glow BEHIND the card */}
+      <div
+        className={`
+          pointer-events-none
+          absolute
+          -inset-6
+          rounded-[32px]
+          blur-[40px]
+          opacity-70
+          ${glowBg}
+          -z-10
+        `}
+      />
+
+      {/* Dark card on top – no tinting */}
+      <Card
+        className={`
+          relative
+          z-10
+          bg-slate-950/85
+          border
+          ${borderClass}
+          rounded-3xl
+          overflow-hidden
+          transition-all
+          duration-500
+          hover:-translate-y-1
+          hover:scale-[1.01]
+        `}
+      >
+        <CardContent className="p-5">
+          <div className="flex items-start justify-between mb-4">
+            <div className="flex items-center gap-3">
+              <div
+                className={`
+                  p-2.5 rounded-xl 
+                  border border-white/5 
+                  shadow-sm 
+                  ${iconBg}
+                `}
+              >
+                {React.cloneElement(icon, {
+                  className: `w-5 h-5 ${textClass}`,
+                })}
+              </div>
+              <div>
+                <div className="text-sm font-bold text-slate-100">
+                  {title}
+                </div>
+                <div className="text-[11px] text-slate-500 font-medium">
+                  {desc}
+                </div>
+              </div>
             </div>
           </div>
-        </div>
-        
-        <div className="flex items-end justify-between">
-          <div className="text-xl font-bold text-white">{value}</div>
-          <div className={`px-2.5 py-1 rounded-lg text-[10px] font-bold uppercase tracking-wide border ${colorClass}`}>
-            {type === "funding" ? `${score.toFixed(2)} bps` : type === "orderflow" ? `${score.toFixed(2)} tilt` : `${score.toFixed(2)} score`}
+
+          <div className="flex items-end justify-between">
+            <div className="text-xl font-bold text-white">{value}</div>
+            <div
+              className={`
+                px-2.5 py-1 rounded-lg 
+                text-[10px] font-bold uppercase tracking-wide
+                border ${borderClass}
+                ${badgeBg}
+                ${textClass}
+              `}
+            >
+              {type === "funding"
+                ? `${score.toFixed(2)} bps`
+                : type === "orderflow"
+                ? `${score.toFixed(2)} tilt`
+                : `${score.toFixed(2)} score`}
+            </div>
           </div>
-        </div>
-      </CardContent>
-    </Card>
+        </CardContent>
+      </Card>
+    </div>
   );
 };
+
+
 
 export default DashboardTab;

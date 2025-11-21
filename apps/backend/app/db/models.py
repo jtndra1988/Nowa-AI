@@ -388,18 +388,29 @@ class HybridSignal(Base):
     exchange = Column(String, index=True, nullable=True)
 
     direction = Column(String, nullable=False)
+    
+    # --- NEW: Price Prediction Columns (Required for Dashboard) ---
+    current_price = Column(Float, nullable=False, default=0.0)
+    predicted_price = Column(Float, nullable=False, default=0.0)
+    predicted_range_high = Column(Float, nullable=False, default=0.0)
+    predicted_range_low = Column(Float, nullable=False, default=0.0)
+    narrative_headline = Column(String, nullable=True)
+    # --------------------------------------------------------------
+
     p_edge = Column(Float, nullable=False)
     confidence = Column(Float, nullable=False)
     size_factor = Column(Float, nullable=False)
     strategy_tag = Column(String, nullable=False)
     meta_execute = Column(Boolean, nullable=False)
+    
+    # Store the "Narrative" headline here for easy dashboard access
+    narrative_headline = Column(String, nullable=True) 
 
     debug_payload = Column(JSON, nullable=True)
 
     __table_args__ = (
         Index("ix_hybrid_signals_symbol_created_at", "symbol", "created_at"),
     )
-
 
 class ModelVersion(Base):
     __tablename__ = "model_versions"
@@ -474,3 +485,46 @@ class AIExecutionLog(Base):
 
     def __repr__(self) -> str:
         return f"<AIExecutionLog(id={self.id}, symbol={self.symbol}, action={self.decided_action})>"
+
+class MarketRegimeLog(Base):
+    """
+    Logs the 'Nervous System' state (Regime Detector) for audit trails.
+    """
+    __tablename__ = "market_regime_logs"
+
+    id = Column(Integer, primary_key=True, index=True)
+    timestamp = Column(DateTime(timezone=True), server_default=func.now(), index=True)
+    symbol = Column(String, index=True, nullable=False)
+    
+    regime = Column(String, nullable=False)  # 'bull', 'bear', 'chop'
+    vol_state = Column(String, nullable=False) # 'low_vol', 'high_vol'
+    
+    trend_slope = Column(Float, nullable=True)
+    atr_pct = Column(Float, nullable=True)
+    
+    # Store the dynamic parameters active at this time
+    active_params = Column(JSON, nullable=True)
+
+class ModelVotes(Base):
+    __tablename__ = "model_votes"
+    
+    id = Column(Integer, primary_key=True, index=True)
+    timestamp = Column(DateTime(timezone=True), server_default=func.now(), index=True)
+    symbol = Column(String, index=True, nullable=False)
+    
+    # Link to the main signal
+    hybrid_signal_id = Column(Integer, ForeignKey("hybrid_signals.id"), nullable=True)
+    
+    # Layer 1 Votes
+    tft_vote = Column(Float, default=0.0)
+    tcn_vote = Column(Float, default=0.0)
+    tst_vote = Column(Float, default=0.0)
+    xgb_vote = Column(Float, default=0.0)
+    
+    # Layer 2/3 Votes
+    decision_net_vote = Column(Float, default=0.0)
+    options_vote = Column(Float, default=0.0)
+    macro_vote = Column(Float, default=0.0)
+    llm_vote = Column(Float, default=0.0)
+    
+    ensemble_consensus = Column(Float, default=0.0)

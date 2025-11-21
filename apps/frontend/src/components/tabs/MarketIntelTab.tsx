@@ -214,8 +214,8 @@ export const MarketIntelTab: React.FC<{
     setLoading(true);
     setError(null);
 
-    // If your getMarketIntel signature is different, adjust here
-    getMarketIntel(symbol, mode)
+    // FIXED: api.ts only accepts symbol, removed 'mode' argument
+    getMarketIntel(symbol)
       .then((data) => {
         if (!alive) return;
         setIntel(data);

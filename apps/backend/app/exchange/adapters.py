@@ -32,11 +32,10 @@ def _safe_float(x: Any) -> Optional[float]:
 
 
 # ============================================================
-# Bybit (Supports both Paper & Live via TRADING_MODE)
+# Bybit Adapter
 # ============================================================
 class BybitAdapter(BaseExchangeAdapter):
     def __init__(self, paper_mode: bool = True):
-        # Determine environment based on paper_mode flag
         self.is_paper = paper_mode
         
         if self.is_paper:
@@ -76,7 +75,13 @@ class BybitAdapter(BaseExchangeAdapter):
 
         perps = []
         for t in tickers.values():
-            if t.get("type") == "swap" and "USDT" in t.get("symbol", "") and t.get("quoteVolume"):
+            # Relaxed Check: accept if type is missing OR matches swap
+            typ = t.get("type")
+            sym = t.get("symbol", "")
+            qv = t.get("quoteVolume")
+            
+            is_perp = (typ is None or typ in ("swap", "future"))
+            if is_perp and "USDT" in sym and qv:
                 perps.append(t)
 
         if not perps:
@@ -160,18 +165,17 @@ class BybitAdapter(BaseExchangeAdapter):
 
 
 # ============================================================
-# Binance (Live Data)
+# Binance Adapter
 # ============================================================
 class BinanceDataAdapter(BaseExchangeAdapter):
     """
-    Binance adapter using LIVE data (authenticated if keys provided).
+    Binance adapter using LIVE data.
     """
     BIN_OPT_REGEX = re.compile(
         r"^(?P<base>[A-Z]+)-(?P<y>\d{2})(?P<m>\d{2})(?P<d>\d{2})-(?P<strike>\d+(?:\.\d+)?)-(?P<cp>[CP])$"
     )
 
     def __init__(self):
-        # ✅ Use API keys if available for better rate limits
         api_key = getattr(settings, "BINANCE_API_KEY", "")
         api_secret = getattr(settings, "BINANCE_API_SECRET", "")
         
@@ -208,16 +212,33 @@ class BinanceDataAdapter(BaseExchangeAdapter):
             typ = t.get("type")
             sym = t.get("symbol", "")
             qv = t.get("quoteVolume")
+            
+            # ✅ FIXED: Allow 'type' to be None (defaultType='future' handles context)
+            is_perp = (typ is None or typ in ("future", "swap"))
+            
             # Ensure we only pick valid USDT futures
-            if typ in ("future", "swap") and "USDT" in sym and qv is not None:
+            if is_perp and "USDT" in sym and qv is not None:
                 perps.append(t)
 
         if not perps:
+            print("[Binance] No symbols found after filtering! Falling back to BTC, ETH.")
             return ["BTC", "ETH"]
 
         # Sort descending by 24h Quote Volume
         perps = sorted(perps, key=lambda x: x["quoteVolume"], reverse=True)[: max(1, limit)]
-        return [p["symbol"].split("/")[0] for p in perps]
+        
+        # Safe extraction of base symbol
+        bases = []
+        for p in perps:
+            s = p["symbol"]
+            # Handle 'BTC/USDT', 'BTC/USDT:USDT', 'BTCUSDT'
+            if "/" in s:
+                bases.append(s.split("/")[0])
+            else:
+                bases.append(s.replace("USDT", "").replace(":USDT", ""))
+        
+        # De-duplicate while preserving order
+        return list(dict.fromkeys(bases))
 
     # ---------- Binance Options (EAPI) ----------
     def _parse_option_symbol(self, name: str) -> Optional[Dict[str, Any]]:

@@ -470,11 +470,20 @@ def on_task_failure(task_id, exception, args, kwargs, traceback, einfo, **z):
     LAST_TASK_TS = time.time()
     WORKER_HEARTBEAT.set(int(LAST_TASK_TS))
 
-    # Celery gives us the task object in args[0] for bound tasks
     task_obj = args[0] if args else None
     task_name = getattr(task_obj, "name", "unknown_task")
+    
+    # Convert exception to string for checking
+    exc_str = str(exception).lower()
 
-    # Log with full traceback to standard logging (also goes to Telegram via handler)
+    # --- CRITICAL FIX: FILTER NOISY ALERTS ---
+    # If we are banned (418) or rate limited (429) or network down,
+    # DO NOT send a Telegram alert. Just log locally.
+    if "418" in exc_str or "429" in exc_str or "network is unreachable" in exc_str or "timed out" in exc_str:
+        logger.warning(f"Task {task_name} failed due to Network/API Limit. Alert suppressed. Error: {exc_str}")
+        return
+    # -----------------------------------------
+
     logger.error(
         "Task %s (ID: %s) failed: %s",
         task_name,
@@ -483,13 +492,8 @@ def on_task_failure(task_id, exception, args, kwargs, traceback, einfo, **z):
         exc_info=einfo,
     )
 
-    # Compose a compact error string for the alert helper
     err_text = f"{exception}\n{traceback}"
-
-    # Pretty Telegram alert specific for failed tasks
     alert_task_failure(str(task_name), str(task_id), err_text)
-
-
 
 # ======================================================================
 # 3. Helper Functions

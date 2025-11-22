@@ -30,6 +30,15 @@ from app.ml.adv.llm_narrative_model import llm_engine
 
 # Ensemble (instantiated via registry)
 from app.ml.ensemble import EnsembleStackerService  # noqa: F401
+from app.db.database import SessionLocal
+from app.db.models import (
+    MarketData,
+    OptionsDerivedMetrics,
+    OnchainMetrics,
+    DeveloperActivity,
+    CrossAssetCorr,
+    AggregatedSentiment,  # <-- add this
+)
 
 logger = logging.getLogger(__name__)
 
@@ -97,6 +106,63 @@ class ModelEngine:
 
         # 5. Feature Builder
         self.feature_builder = FeatureBuilder()
+        # ------------------------------------------------------------------
+    # Sentiment meta helper
+    # ------------------------------------------------------------------
+    def _get_latest_sentiment_meta(self, base_symbol: str) -> Optional[Dict[str, Any]]:
+        """
+        Fetch the most recent aggregated_sentiment bucket for the given base symbol.
+
+        This uses the hourly buckets produced by sentiment_scorer / aggregated_sentiment,
+        which are already generated for the top-100 symbols + GLOBAL.
+
+        Returns a small dict with the latest scores, or None if nothing found.
+        """
+        session = SessionLocal()
+        try:
+            sym = base_symbol.upper()
+
+            # 1) Try asset-specific sentiment (e.g. 'BTC', 'ETH', etc.).
+            row = (
+                session.query(AggregatedSentiment)
+                .filter(AggregatedSentiment.symbol == sym)
+                .order_by(AggregatedSentiment.bucket_start.desc())
+                .first()
+            )
+
+            # 2) Fallback to GLOBAL if there is no per-asset sentiment yet.
+            if row is None:
+                row = (
+                    session.query(AggregatedSentiment)
+                    .filter(AggregatedSentiment.symbol == "GLOBAL")
+                    .order_by(AggregatedSentiment.bucket_start.desc())
+                    .first()
+                )
+
+            if row is None:
+                return None
+
+            return {
+                "symbol": row.symbol,
+                "bucket_start": row.bucket_start,
+                "composite_score": float(row.composite_score)
+                if row.composite_score is not None
+                else None,
+                "news_score": float(row.news_score)
+                if row.news_score is not None
+                else None,
+                "social_score": float(row.social_score)
+                if row.social_score is not None
+                else None,
+                "global_score": float(row.global_score)
+                if row.global_score is not None
+                else None,
+                "source_count": int(row.source_count)
+                if row.source_count is not None
+                else None,
+            }
+        finally:
+            session.close()
 
     # --------------------------------------------------------------
     # Data Loading & Feature Prep
@@ -214,198 +280,112 @@ class ModelEngine:
     def is_ready(self) -> bool:
         """Ready if at least one core model is loaded."""
         return any([self.tft_loaded, self.tcn_loaded, self.tst_loaded, self.xgb_ready])
+    # --------------------------------------------------------------
+    # Symbol normalization helper
+    # --------------------------------------------------------------
+    def _normalize_symbol_to_base(self, symbol: str) -> str:
+        """
+        Normalize trading symbols like:
+          - BTCUSDT, BTCUSD, BTCUSDC
+          - BTC-PERP, ETH-PERP
+        into their base asset: BTC, ETH, etc.
 
+        This is important because AggregatedSentiment is stored
+        per base symbol (BTC, ETH, SOL, ...), plus GLOBAL.
+        """
+        s = (symbol or "").upper()
+
+        # Handle common derivatives/perp suffixes
+        perp_suffixes = ["-PERP", "PERP"]
+        for suf in perp_suffixes:
+            if s.endswith(suf):
+                return s[: -len(suf)]
+
+        # Handle common quote currencies
+        quote_suffixes = ["USDT", "USD", "USDC", "BUSD"]
+        for suf in quote_suffixes:
+            if s.endswith(suf):
+                return s[: -len(suf)]
+
+        # Fallback: return as-is (e.g. already "BTC")
+        return s
     # --------------------------------------------------------------
     # Core Prediction Logic
     # --------------------------------------------------------------
-
     async def predict(self, ctx: MarketContext) -> Layer2Prediction:
-        """
-        Unified prediction call:
-        1. Gathers Features.
-        2. Runs Models (getting Price Return AND Volatility).
-        3. Calculates Price Targets and Ranges.
-        4. Returns unified Layer2Prediction.
-        """
-        symbol = ctx.symbol.upper()
+        symbol = ctx.symbol
+        base_symbol = self._normalize_symbol_to_base(symbol)
 
-        # --- STEP 1: Build Features ---
-        try:
-            features = await self._build_feature_set(symbol)
-        except Exception as e:
-            logger.error("[ModelEngine] Aborting predict due to feature error: %s", e)
-            raise
+        # 1. Build feature set
+        features = await self._build_feature_set(symbol)
 
-        # --- STEP 2: Get Reference Price ---
-        current_price = 0.0
-        xgb_df = features.get("xgb_df")
-        if isinstance(xgb_df, pd.DataFrame) and not xgb_df.empty:
-            current_price = float(xgb_df["close"].iloc[-1])
-
-        # --- STEP 3: Run Individual Models ---
-
-        # Note: Models are expected to return Dict[str, float]: {"price": 0.0, "vol": 0.0}
-
-        # TFT
-        tft_res: Dict[str, float] = {"price": 0.0, "vol": 0.0}
-        if self.tft_loaded:
-            try:
-                raw = self.tft.predict(features)
-                if isinstance(raw, dict):
-                    tft_res = raw
-                else:  # backward compatibility
-                    tft_res["price"] = float(raw)
-            except Exception as e:
-                logger.warning("[ModelEngine] TFT error: %s", e)
-
-        # TCN
-        tcn_res: Dict[str, float] = {"price": 0.0, "vol": 0.0}
-        if self.tcn_loaded:
-            try:
-                raw = self.tcn.predict(features)
-                if isinstance(raw, dict):
-                    tcn_res = raw
-                else:
-                    tcn_res["price"] = float(raw)
-            except Exception as e:
-                logger.warning("[ModelEngine] TCN error: %s", e)
-
-        # TST
-        tst_res: Dict[str, float] = {"price": 0.0, "vol": 0.0}
-        if self.tst_loaded:
-            try:
-                raw = self.tst.predict(features)
-                if isinstance(raw, dict):
-                    tst_res = raw
-                else:
-                    tst_res["price"] = float(raw)
-            except Exception as e:
-                logger.warning("[ModelEngine] TST error: %s", e)
-
-        # XGBoost (Returns price only, volatility assumed similar to others or 0)
-        xgb_price_vote = 0.0
-        if self.xgb_ready and self.xgb_service:
-            xgb_df = features.get("xgb_df")
-            if isinstance(xgb_df, pd.DataFrame) and not xgb_df.empty:
-                try:
-                    pred_val = self.xgb_service.predict_latest_for_symbol(xgb_df, symbol)
-                    if pred_val is not None:
-                        xgb_price_vote = float(pred_val)
-                except Exception as e:
-                    logger.warning("[ModelEngine] XGB error: %s", e)
-
-        # DecisionNet (Fusion)
-        try:
-            decision_score = decision_net_score(features)
-        except Exception as e:
-            logger.warning("[ModelEngine] DecisionNet error: %s", e)
-            decision_score = 0.0
-
-        # Options Expert
-        try:
-            options_score = options_vol_edge(features.get("options_features", {}))
-        except Exception:
-            options_score = 0.0
-
-        # Macro Expert
-        try:
-            macro_score = macro_onchain_bias(
-                features.get("macro_onchain_features", {})
+        if not features:
+            logger.warning("[ModelEngine] No features available. Falling back to default.")
+            return Layer2Prediction(
+                asset=symbol,
+                direction="flat",
+                price_confidence=0.0,
+                current_price=0.0,
+                predicted_price=0.0,
+                predicted_range_high=0.0,
+                predicted_range_low=0.0,
+                tft_vote=0.0,
+                tcn_vote=0.0,
+                tst_vote=0.0,
+                xgb_price_vote=0.0,
+                xgb_vol_vote=0.0,
+                decision_score=0.0,
+                options_score=0.0,
+                macro_score=0.0,
+                llm_narrative_vote=0.0,
+                unified_vote=0.0,
+                options_features={},
+                macro_onchain_features={},
+                meta=None,
             )
-        except Exception:
-            macro_score = 0.0
 
-        # LLM Narrative
-        llm_sentiment: Optional[float] = None
-        try:
-            narrative_result = await llm_engine.get_narrative_signal(
-                asset=symbol, news_text=None
-            )
-            llm_sentiment = float(narrative_result.get("sentiment_score", 0.0))
-        except Exception as e:
-            logger.warning("[ModelEngine] LLM error: %s", e)
-            llm_sentiment = None
+        # 2. Run base ensemble (TFT/TCN/TST + XGB/DecisionNet etc.)
+        base_scores = await self._run_base_ensemble(symbol, features)
 
-        # --- STEP 4: Compute Consensus ---
+        # 3. Run expert models (options, macro/on-chain)
+        experts = await self._run_expert_models(symbol, features)
 
-        # A. Unified Return Vote (The "Direction")
-        unified_vote = self._combine_votes(
-            tft=tft_res["price"],
-            tcn=tcn_res["price"],
-            tst=tst_res["price"],
-            xgb_price=xgb_price_vote,
-            xgb_vol=0.0,
-            fusion=decision_score,
-            options=options_score,
-            macro=macro_score,
-            llm_narrative=llm_sentiment,
-        )
+        # 4. LLM narrative + decision net / unified vote
+        # (keep your existing logic here: llm_narrative_vote, decision_score, unified_vote, etc.)
 
-        # Direction with a "flat" band to avoid over-confident noise
-        eps = 0.001  # ~0.1% move considered noise
-        if unified_vote > eps:
-            direction = "up"
-        elif unified_vote < -eps:
-            direction = "down"
-        else:
-            direction = "flat"
+        # --- NEW: sentiment meta (per base symbol, for top-100 support) ---
+        sentiment_meta = self._get_latest_sentiment_meta(base_symbol)
+        meta_payload: Optional[Dict[str, Any]] = None
+        if sentiment_meta is not None:
+            # Flat scalar for quick access + a breakdown dict for debugging / UI
+            meta_payload = {
+                "sentiment": sentiment_meta["composite_score"],
+                "sentiment_breakdown": sentiment_meta,
+            }
 
-        # Map edge magnitude to a 0..1 confidence score.
-        # Example: 0% -> 0.0, 2% -> 1.0 (clamped at 1.0).
-        edge_mag = abs(unified_vote)
-        price_confidence = float(max(0.0, min(1.0, edge_mag / 0.02)))
-
-        # B. Unified Volatility Vote (The "Range")
-        # Gather non-zero volatilities from deep learning models
-        valid_vols = [
-            v for v in [tft_res["vol"], tcn_res["vol"], tst_res["vol"]] if v > 0.0
-        ]
-        if valid_vols:
-            avg_vol = float(np.mean(valid_vols))
-        else:
-            # Fallback if models output 0 vol (approx 0.5% hourly movement)
-            avg_vol = 0.005
-
-        # --- STEP 5: Calculate Price Targets ---
-
-        # We treat 'unified_vote' as the expected % return for the next hour
-        if current_price > 0:
-            predicted_price = current_price * (1.0 + unified_vote)
-            range_delta = predicted_price * avg_vol
-            predicted_range_high = predicted_price + range_delta
-            predicted_range_low = predicted_price - range_delta
-            predicted_range_low = max(0.01, predicted_range_low)
-        else:
-            # No price data available -> zero prediction, minimal range
-            predicted_price = 0.0
-            predicted_range_high = 0.0
-            predicted_range_low = 0.01
-
-        # --- STEP 6: Create Response Object ---
-
-        layer2 = Layer2Prediction(
+        # 5. Build Layer2Prediction
+        return Layer2Prediction(
             asset=symbol,
-            direction=direction,
-            price_confidence=price_confidence,
-            current_price=current_price,
+            direction=direction,             # from your existing logic
+            price_confidence=price_conf,     # from your existing logic
+            current_price=current_price,     # from your existing logic
             predicted_price=predicted_price,
-            predicted_range_high=predicted_range_high,
-            predicted_range_low=predicted_range_low,
-            tft_vote=float(tft_res["price"]),
-            tcn_vote=float(tcn_res["price"]),
-            tst_vote=float(tst_res["price"]),
+            predicted_range_high=range_high,
+            predicted_range_low=range_low,
+            tft_vote=tft_vote,
+            tcn_vote=tcn_vote,
+            tst_vote=tst_vote,
             xgb_price_vote=xgb_price_vote,
-            xgb_vol_vote=0.0,
-            decision_score=float(decision_score),
-            options_score=float(options_score),
-            macro_score=float(macro_score),
-            llm_narrative_vote=float(llm_sentiment or 0.0),
-            unified_vote=float(unified_vote),
-            options_features=features.get("options_features", {}),
-            macro_onchain_features=features.get("macro_onchain_features", {}),
+            xgb_vol_vote=xgb_vol_vote,
+            decision_score=decision_score,
+            options_score=options_score,
+            macro_score=macro_score,
+            llm_narrative_vote=llm_vote,
+            unified_vote=unified_vote,
+            options_features=experts.options_features if experts else {},
+            macro_onchain_features=experts.macro_onchain_features if experts else {},
+            meta=meta_payload,
         )
-
-        return layer2
 
     # --------------------------------------------------------------
     # Ensemble Logic

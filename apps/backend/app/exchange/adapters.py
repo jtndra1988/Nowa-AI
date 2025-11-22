@@ -32,20 +32,19 @@ def _safe_float(x: Any) -> Optional[float]:
 
 
 # ============================================================
-# Bybit (paper mode) — used read-only for data/learning
+# Bybit (Supports both Paper & Live via TRADING_MODE)
 # ============================================================
 class BybitAdapter(BaseExchangeAdapter):
-    """
-    Bybit adapter (sandbox mode). Provides:
-      - get_top_symbols_by_volume()
-      - get_options_chain()
-      - get_ticker()
-      - fetch_ohlcv() / get_futures_ohlcv()
-    """
-
     def __init__(self, paper_mode: bool = True):
-        api_key = getattr(settings, "BYBIT_TESTNET_API_KEY", None)
-        api_secret = getattr(settings, "BYBIT_TESTNET_API_SECRET", None)
+        # Determine environment based on paper_mode flag
+        self.is_paper = paper_mode
+        
+        if self.is_paper:
+            api_key = getattr(settings, "BYBIT_TESTNET_API_KEY", None)
+            api_secret = getattr(settings, "BYBIT_TESTNET_API_SECRET", None)
+        else:
+            api_key = getattr(settings, "BYBIT_API_KEY", None)
+            api_secret = getattr(settings, "BYBIT_API_SECRET", None)
 
         self.exchange = ccxt.bybit({
             "apiKey": api_key,
@@ -55,7 +54,8 @@ class BybitAdapter(BaseExchangeAdapter):
                 "recvWindow": 20000,
             },
         })
-        if paper_mode:
+        
+        if self.is_paper:
             try:
                 self.exchange.set_sandbox_mode(True)
             except Exception:
@@ -63,7 +63,7 @@ class BybitAdapter(BaseExchangeAdapter):
 
         try:
             self.exchange.load_markets(True)
-            print("[Bybit] markets loaded.")
+            print(f"[Bybit] ({'Paper' if self.is_paper else 'Live'}) markets loaded.")
         except Exception as e:
             print(f"[Bybit] load_markets failed: {e}")
 
@@ -86,17 +86,11 @@ class BybitAdapter(BaseExchangeAdapter):
         return [p["symbol"].split("/")[0] for p in perps]
 
     def get_options_chain(self, underlying_symbol: str) -> List[Dict[str, Any]]:
-        """
-        Returns list[dict] rows:
-          expiry, strike, option_type ('CALL'/'PUT'), timestamp,
-          bid, ask, last_price, mark_price, volume, open_interest,
-          iv, delta, gamma, theta, vega
-        """
         base = underlying_symbol.upper()
         try:
             res = self.exchange.public_get_v5_market_tickers({
                 "category": "option",
-                "baseCoin": base,  # e.g., 'BTC'
+                "baseCoin": base,
             })
         except Exception as e:
             print(f"[Bybit] options tickers failed: {e}")
@@ -106,9 +100,8 @@ class BybitAdapter(BaseExchangeAdapter):
         if not rows:
             return []
 
-        df = pd.DataFrame(rows)
         out: List[Dict[str, Any]] = []
-        for _, r in df.iterrows():
+        for r in pd.DataFrame(rows).to_dict("records"):
             try:
                 expiry_ms = r.get("deliveryTime") or r.get("expiryDate")
                 ts_ms = r.get("updatedTime") or r.get("timestamp")
@@ -167,32 +160,39 @@ class BybitAdapter(BaseExchangeAdapter):
 
 
 # ============================================================
-# Binance (read-only) — spot/futures + options (EAPI) for data
+# Binance (Live Data)
 # ============================================================
 class BinanceDataAdapter(BaseExchangeAdapter):
     """
-    Binance data adapter (read-only) for training/ETL:
-      - get_top_symbols_by_volume()
-      - get_options_chain()   (via EAPI — returns normalized rows)
-      - get_ticker()
-      - fetch_ohlcv() / get_futures_ohlcv()
+    Binance adapter using LIVE data (authenticated if keys provided).
     """
-
     BIN_OPT_REGEX = re.compile(
         r"^(?P<base>[A-Z]+)-(?P<y>\d{2})(?P<m>\d{2})(?P<d>\d{2})-(?P<strike>\d+(?:\.\d+)?)-(?P<cp>[CP])$"
     )
-    # Example: BTC-241227-50000-C
 
     def __init__(self):
-        self.exchange = ccxt.binance({
+        # ✅ Use API keys if available for better rate limits
+        api_key = getattr(settings, "BINANCE_API_KEY", "")
+        api_secret = getattr(settings, "BINANCE_API_SECRET", "")
+        
+        config = {
             "enableRateLimit": True,
             "options": {
-                "defaultType": "future",   # USD-M futures/linear for OHLCV/tickers
+                "defaultType": "future",   # USD-M futures
             }
-        })
+        }
+        
+        if api_key and api_secret:
+            config["apiKey"] = api_key
+            config["secret"] = api_secret
+            print("[Binance] Initializing with API keys (Authenticated).")
+        else:
+            print("[Binance] Initializing in public mode (Unauthenticated).")
+
+        self.exchange = ccxt.binance(config)
         try:
             self.exchange.load_markets(True)
-            print("[Binance] markets loaded.")
+            print("[Binance] Markets loaded.")
         except Exception as e:
             print(f"[Binance] load_markets failed: {e}")
 
@@ -208,29 +208,25 @@ class BinanceDataAdapter(BaseExchangeAdapter):
             typ = t.get("type")
             sym = t.get("symbol", "")
             qv = t.get("quoteVolume")
-            if typ in ("future", "swap") and "USDT" in sym and qv:
+            # Ensure we only pick valid USDT futures
+            if typ in ("future", "swap") and "USDT" in sym and qv is not None:
                 perps.append(t)
 
         if not perps:
             return ["BTC", "ETH"]
 
+        # Sort descending by 24h Quote Volume
         perps = sorted(perps, key=lambda x: x["quoteVolume"], reverse=True)[: max(1, limit)]
         return [p["symbol"].split("/")[0] for p in perps]
 
     # ---------- Binance Options (EAPI) ----------
     def _parse_option_symbol(self, name: str) -> Optional[Dict[str, Any]]:
-        """
-        Parse Binance option instrument names like 'BTC-241227-50000-C'
-        """
-        if not name:
-            return None
+        if not name: return None
         m = self.BIN_OPT_REGEX.match(name)
-        if not m:
-            return None
+        if not m: return None
         gd = m.groupdict()
         base = gd["base"]
         y, mth, d = int(gd["y"]), int(gd["m"]), int(gd["d"])
-        # 20xx assumption for yy
         year = 2000 + y
         expiry = pd.Timestamp(year=year, month=mth, day=d, tz="UTC")
         return {
@@ -241,29 +237,15 @@ class BinanceDataAdapter(BaseExchangeAdapter):
         }
 
     def get_options_chain(self, underlying_symbol: str) -> List[Dict[str, Any]]:
-        """
-        Returns normalized rows for Binance options via EAPI.
-        We try multiple EAPI endpoints (ccxt maps) and fall back gracefully to [].
-        """
         base = underlying_symbol.upper()
-
-        # Attempt several public EAPI endpoints ccxt may expose.
-        # We expect a list of tickers where each item includes 'symbol' (instrument name) and prices.
-        candidates = [
-            "eapiPublicGetTicker",             # common in ccxt for binance options
-            "eapiPublicGetMark",               # alt
-            "eapiPublicGetOpenInterest",       # alt (less pricing info)
-        ]
+        candidates = ["eapiPublicGetTicker", "eapiPublicGetMark"]
         data: List[Dict[str, Any]] = []
 
         for meth in candidates:
             if hasattr(self.exchange, meth):
                 try:
                     res = getattr(self.exchange, meth)()
-                    # res could be dict or list; normalize to list
-                    tickers = res if isinstance(res, list) else res.get("data") or res.get("result") or res.get("tickers") or []
-                    if isinstance(tickers, dict):
-                        tickers = tickers.get("list", []) or []
+                    tickers = res if isinstance(res, list) else res.get("data") or []
                     if tickers:
                         data = tickers
                         break
@@ -271,42 +253,29 @@ class BinanceDataAdapter(BaseExchangeAdapter):
                     print(f"[Binance] {meth} failed: {e}")
 
         if not data:
-            # As a last resort, try ccxt's generic fetch method if exposed
-            try:
-                # Some ccxt versions expose: self.exchange.eapiPublicGetTickerBookTicker()
-                if hasattr(self.exchange, "eapiPublicGetTickerBookTicker"):
-                    res = self.exchange.eapiPublicGetTickerBookTicker()
-                    data = res if isinstance(res, list) else res.get("data", [])  # best effort
-            except Exception as e:
-                print(f"[Binance] eapiPublicGetTickerBookTicker failed: {e}")
-
-        if not data:
             return []
 
         out: List[Dict[str, Any]] = []
         for item in data:
             try:
-                # instrument name can be under 'symbol' or 'instrumentId'
-                name = item.get("symbol") or item.get("instrumentId") or item.get("symbolName")
+                name = item.get("symbol") or item.get("instrumentId")
                 meta = self._parse_option_symbol(name)
                 if not meta or meta["base"] != base:
                     continue
 
-                # timestamps may be 'time' or 'updateTime' in ms
-                ts_ms = item.get("time") or item.get("updateTime") or item.get("timestamp")
-                # prices could be best bid/ask (bidPrice/askPrice) and last/mark
+                ts_ms = item.get("time") or item.get("updateTime")
                 out.append({
                     "expiry": meta["expiry"],
                     "strike": meta["strike"],
                     "option_type": meta["option_type"],
                     "timestamp": pd.to_datetime(ts_ms, unit="ms", utc=True).to_pydatetime() if ts_ms else None,
-                    "bid": _safe_float(item.get("bidPrice") or item.get("bestBidPrice") or item.get("bid")),
-                    "ask": _safe_float(item.get("askPrice") or item.get("bestAskPrice") or item.get("ask")),
-                    "last_price": _safe_float(item.get("lastPrice") or item.get("last")),
+                    "bid": _safe_float(item.get("bidPrice")),
+                    "ask": _safe_float(item.get("askPrice")),
+                    "last_price": _safe_float(item.get("lastPrice")),
                     "mark_price": _safe_float(item.get("markPrice")),
-                    "volume": _safe_float(item.get("volume") or item.get("volume24h")),
+                    "volume": _safe_float(item.get("volume")),
                     "open_interest": _safe_float(item.get("openInterest")),
-                    "iv": _safe_float(item.get("impliedVolatility") or item.get("iv")),
+                    "iv": _safe_float(item.get("impliedVolatility")),
                     "delta": _safe_float(item.get("delta")),
                     "gamma": _safe_float(item.get("gamma")),
                     "theta": _safe_float(item.get("theta")),

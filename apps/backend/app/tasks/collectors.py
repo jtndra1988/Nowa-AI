@@ -215,33 +215,41 @@ def collect_options_task(self, symbol: str, adapter_payload: Optional[dict] = No
 #  TASK 2: Collect FUTURES Data → futures_market_data
 # =============================================================================
 @celery_app.task(name="tasks.collect_futures")
-def collect_futures_task(underlying_symbol: str): # Accepts base symbol e.g., 'BTC'
+def collect_futures_task(underlying_symbol: str):
     print(f"[*] Starting FUTURES data collection for: {underlying_symbol}")
-    PAPER_MODE = bool(getattr(settings, "PAPER_TRADING", True))
-    # Assuming Bybit is the primary for futures ticker data based on worker.py EXEC init
-    adapter = BybitAdapter(paper_mode=PAPER_MODE)
-    futures_symbol = f"{underlying_symbol}/USDT" # Construct the pair symbol
+    
+    # ✅ LOGIC UPDATE: Check settings to choose correct adapter
+    use_binance = getattr(settings, "USE_BINANCE_FOR_DATA", False)
+    
+    if use_binance:
+        adapter = BinanceDataAdapter()
+        # Binance mostly requires "BTC/USDT", ccxt handles the translation usually
+        futures_symbol = f"{underlying_symbol}/USDT"
+    else:
+        # Fallback to Bybit if binance flag is false
+        PAPER_MODE = bool(getattr(settings, "PAPER_TRADING", True))
+        adapter = BybitAdapter(paper_mode=PAPER_MODE)
+        futures_symbol = f"{underlying_symbol}/USDT"
 
     try:
-        # Fetch ticker using the pair symbol
-        ticker_data = adapter.get_ticker(futures_symbol, params={'category': 'linear'})
+        # Fetch ticker
+        # Note: params={'category': 'linear'} is specific to Bybit, Binance ignores it cleanly usually
+        ticker_data = adapter.get_ticker(futures_symbol, params={'category': 'linear'} if not use_binance else {})
     except Exception as fetch_e:
         print(f"[!] Could not fetch futures ticker for {futures_symbol}: {fetch_e}. Skipping.")
-        return # Exit if fetching fails
+        return
 
-    if not ticker_data or not ticker_data.get('timestamp'): # Ensure data and timestamp exist
+    if not ticker_data or not ticker_data.get('timestamp'):
         print(f"[!] Invalid or empty ticker data received for {futures_symbol}. Skipping.")
         return
 
-    # Normalize symbol from ticker response (might be BTCUSDT or BTC/USDT)
     norm_symbol = _norm_futures_symbol(ticker_data.get("symbol") or futures_symbol)
 
     db_session = SessionLocal()
     try:
         ts_ms = ticker_data.get('timestamp')
-        ts = datetime.fromtimestamp(ts_ms / 1000, tz=timezone.utc) # Already timezone-aware
+        ts = datetime.fromtimestamp(ts_ms / 1000, tz=timezone.utc)
 
-        # Explicit check for duplicate using normalized symbol and timestamp
         exists = db_session.query(FuturesMarketData.id).filter(
             FuturesMarketData.symbol == norm_symbol,
             FuturesMarketData.timestamp == ts
@@ -250,11 +258,11 @@ def collect_futures_task(underlying_symbol: str): # Accepts base symbol e.g., 'B
         if not exists:
             futures_data_record = FuturesMarketData(
                 symbol=norm_symbol, timestamp=ts,
-                open=_safe_float(ticker_data.get('openPrice') or ticker_data.get('open')), # Check Bybit keys
+                open=_safe_float(ticker_data.get('openPrice') or ticker_data.get('open')),
                 high=_safe_float(ticker_data.get('highPrice') or ticker_data.get('high')),
                 low=_safe_float(ticker_data.get('lowPrice') or ticker_data.get('low')),
                 close=_safe_float(ticker_data.get('lastPrice') or ticker_data.get('last') or ticker_data.get('close')),
-                volume=_safe_float(ticker_data.get('volume24h') or ticker_data.get('baseVolume')), # Check Bybit keys
+                volume=_safe_float(ticker_data.get('volume24h') or ticker_data.get('baseVolume')),
             )
             db_session.add(futures_data_record)
             db_session.commit()
@@ -265,10 +273,8 @@ def collect_futures_task(underlying_symbol: str): # Accepts base symbol e.g., 'B
     except Exception as e:
         print(f"[!] ERROR saving futures data for {norm_symbol} to DB: {e}")
         db_session.rollback()
-        # raise e # Optionally re-raise
     finally:
         db_session.close()
-
 # =============================================================================
 #  TASK 3: Collect Fear & Greed Index
 # =============================================================================

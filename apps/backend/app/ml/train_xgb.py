@@ -24,6 +24,16 @@ ARTIFACTS_DIR = Path(getattr(settings, "MODEL_ARTIFACTS_DIR", "model_artifacts")
 ARTIFACTS_DIR.mkdir(parents=True, exist_ok=True)
 ARTIFACT_PATH = ARTIFACTS_DIR / "xgb_model.pkl"
 
+# -------------------------------------------------------------------
+# Shared sentiment feature list (used by XGB + DecisionNet)
+# -------------------------------------------------------------------
+SENTIMENT_FEATURES: List[str] = [
+    "news_score",
+    "social_score",
+    "global_score",
+    "composite_score",
+]
+
 # Try real XGBoost if available
 try:
     from xgboost import XGBRegressor  # type: ignore
@@ -119,8 +129,7 @@ def _build_features(
     )
 
     # Feature columns: price + sentiment
-    sentiment_cols = ["news_score", "social_score", "global_score", "composite_score"]
-    feature_cols = [
+    price_feature_cols = [
         "close",
         "volume",
         "ret_1h",
@@ -128,7 +137,8 @@ def _build_features(
         "ret_12h",
         "roll_vol_12h",
         "roll_vol_24h",
-    ] + sentiment_cols
+    ]
+    feature_cols = price_feature_cols + SENTIMENT_FEATURES
 
     # Drop rows that don't have all features or target
     df_feat = df_feat.dropna(subset=feature_cols + ["target_ret"])
@@ -322,7 +332,7 @@ def main():
     finally:
         session.close()
     logger.info("[XGB] Training complete.")
-    
+
 
 if __name__ == "__main__":
     main()

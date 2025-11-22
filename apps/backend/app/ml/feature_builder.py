@@ -27,14 +27,18 @@ from app.db import models
 
 logger = logging.getLogger(__name__)
 
-BUCKET_FREQ = "1H"  # hourly sentiment grid
+# ✅ FIXED: Lowercase 'h' to silence Pandas FutureWarning
+BUCKET_FREQ = "1h"  # hourly sentiment grid
 
 
 def _ensure_dt(series: pd.Series) -> pd.Series:
-    """Force a pandas Series to UTC datetimes, ignoring invalid rows."""
-    if not pd.api.types.is_datetime64_any_dtype(series):
-        series = pd.to_datetime(series, utc=True, errors="coerce")
-    return series
+    """
+    Force a pandas Series to UTC datetimes, ignoring invalid rows.
+    
+    ✅ FIXED: Always run pd.to_datetime(utc=True), even if input is already
+    datetime-like, to ensure we convert Naive -> UTC Aware.
+    """
+    return pd.to_datetime(series, utc=True, errors="coerce")
 
 
 def _load_sentiment_frame(
@@ -63,12 +67,14 @@ def _load_sentiment_frame(
     )
 
     if not rows:
-        logger.warning(
-            "[FeatureBuilder] No SentimentData rows found between %s and %s for %s",
-            start_ts,
-            end_ts,
-            sym_list_with_global,
-        )
+        # Only log warning if we actually expected data but got none
+        # (Reduces noise for new setups)
+        if len(sym_list) > 0:
+            logger.debug(
+                "[FeatureBuilder] No SentimentData rows found between %s and %s",
+                start_ts,
+                end_ts,
+            )
         return pd.DataFrame(columns=["symbol", "timestamp", "source", "sentiment_score"])
 
     data = [
@@ -142,6 +148,7 @@ def join_sentiment_features(
         return df
 
     df = df.copy()
+    # ✅ Force UTC on input dataframe to match DB data
     df["timestamp"] = _ensure_dt(df["timestamp"])
 
     symbols = df["symbol"].dropna().astype(str).unique().tolist()
@@ -165,6 +172,7 @@ def join_sentiment_features(
         return df
 
     # Bucket both price & sentiment on the same hourly grid
+    # Both are now guaranteed to be UTC-aware datetime64[ns, UTC]
     df["bucket_ts"] = df["timestamp"].dt.floor(BUCKET_FREQ)
     s_df["bucket_ts"] = s_df["timestamp"].dt.floor(BUCKET_FREQ)
 

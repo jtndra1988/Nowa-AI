@@ -15,17 +15,35 @@ logger = logging.getLogger(__name__)
 # --- SHARED CONFIGURATION ---
 # This is the single source of truth for feature columns.
 # Both training (MultiModalTS) and inference (FeatureBuilder) MUST use this.
+
+# Sequential price features for TFT / TCN / TST
+PRICE_FEATURES: List[str] = [
+    "open",
+    "high",
+    "low",
+    "close",
+    "volume",
+    "ret_1h",
+    "log_ret",
+    "roll_vol_6h",
+    "roll_vol_12h",
+    "roll_vol_24h",
+    "roll_mean_24h",
+]
+
+# Sequential sentiment features (from aggregated_sentiment)
+SENTIMENT_FEATURES: List[str] = [
+    "composite_score",
+    "news_score",
+    "social_score",
+    "global_score",
+]
+
 FEATURE_CONFIG: Dict[str, List[str]] = {
     # Sequential "price" block for TFT / TCN / TST
-    "price": [
-        "close",
-        "volume",
-        "ret_1h",
-        "roll_vol_6h",
-        "roll_vol_12h",
-        "roll_vol_24h",
-        "roll_mean_24h",
-    ],
+    "price": PRICE_FEATURES,
+    # Sequential "sentiment" block (top-100 coins, any symbol)
+    "sentiment": SENTIMENT_FEATURES,
 }
 
 
@@ -67,7 +85,7 @@ def process_market_data(df: pd.DataFrame) -> pd.DataFrame:
 
 def apply_price_feature_config(df: pd.DataFrame) -> pd.DataFrame:
     """
-    Apply standard price features and guarantee that all FEATURE_CONFIG['price']
+    Apply standard price features and guarantee that all PRICE_FEATURES
     columns exist (filling missing ones with 0.0).
 
     This is the *canonical* helper for both training and inference.
@@ -86,10 +104,6 @@ def build_price_sequence_block(df: pd.DataFrame, seq_len: int) -> torch.Tensor:
     """
     Build a [seq_len, num_price_features] tensor from a time-indexed DataFrame
     using the shared FEATURE_CONFIG.
-
-    This is used by:
-      - FeatureBuilder (inference)
-      - Training code/tests if needed.
     """
     df = apply_price_feature_config(df)
 
@@ -117,8 +131,6 @@ def create_tabular_features(
       - <col>_raw
       - <col>_roll_mean_<w>
       - <col>_roll_std_<w>
-
-    Both training (MultiModalTS) and any future inference code MUST call this.
     """
     df = df.copy()
     tabular_df = pd.DataFrame(index=df.index)

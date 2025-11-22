@@ -8,7 +8,7 @@ from fastapi import APIRouter, Depends, Query
 from pydantic import BaseModel
 from sqlalchemy import desc, select
 from sqlalchemy.orm import Session
-
+from app.db.models import AggregatedSentiment
 from app.db.database import SessionLocal
 from app import db as db_pkg  # gives us db.models.*
 
@@ -24,6 +24,75 @@ def get_db():
     finally:
         db.close()
 
+def _build_sentiment_symbol_candidates(raw_symbol: str) -> list[str]:
+    """
+    Build a generic candidate list for sentiment symbols from any exchange symbol.
+
+    Examples:
+      - BTC-PERP     -> ["BTC-PERP", "BTC"]
+      - BTCUSDT      -> ["BTCUSDT", "BTC"]
+      - BTC/USDT     -> ["BTC/USDT", "BTC"]
+      - eth-usdt     -> ["ETH-USDT", "ETH"]
+    """
+    s = (raw_symbol or "").strip().upper()
+    candidates = set()
+
+    if not s:
+        return []
+
+    # Original
+    candidates.add(s)
+
+    # Split pairs like "BTC/USDT"
+    if "/" in s:
+        base, quote = s.split("/", 1)
+        candidates.add(base)
+        candidates.add(quote)
+
+    # Strip common suffixes (USDT, USD, PERP, -PERP, -USDT, etc.)
+    suffixes = [
+        "-PERP",
+        "-SPOT",
+        "-USD",
+        "-USDT",
+        "USDT",
+        "USD",
+        "PERP",
+    ]
+    for suf in suffixes:
+        if s.endswith(suf):
+            base = s[: -len(suf)]
+            if base:
+                candidates.add(base)
+
+    # Return in a stable order
+    return list(candidates)
+
+
+def get_latest_sentiment_bucket(db: Session, symbol: str) -> dict | None:
+    candidates = _symbol_candidates(symbol)   # instead of _build_sentiment_symbol_candidates
+    if not candidates:
+        return None
+
+    row = (
+        db.query(AggregatedSentiment)
+        .filter(AggregatedSentiment.symbol.in_(candidates))
+        .order_by(AggregatedSentiment.bucket_start.desc())
+        .first()
+    )
+
+    if not row:
+        return None
+
+    return {
+        "symbol": row.symbol,
+        "bucket_start": row.bucket_start,
+        "composite": row.composite_score,
+        "news": row.news_score,
+        "social": row.social_score,
+        "global_score": row.global_score,
+        "source_count": row.source_count,
+    }
 
 def _get_model(name: str) -> Any | None:
     """Safely get a model from app.db.models, or None if it doesn't exist."""
@@ -181,30 +250,6 @@ def _load_market_intel_from_db(
                     score=float(getattr(r, "final_sentiment", 0.0) or 0.0),
                 )
             )
-
-    # --- AggregatedSentiment -> sentimentBreakdown (1H market sentiment block) ---
-    AggregatedSentiment = _get_model("AggregatedSentiment")
-    if AggregatedSentiment is not None:
-        last_row = (
-            db.execute(
-                select(AggregatedSentiment)
-                .where(AggregatedSentiment.symbol.in_(candidates))
-                .order_by(desc(AggregatedSentiment.bucket_start))
-                .limit(1)
-            )
-            .scalars()
-            .first()
-        )
-        if last_row is not None:
-            sentiment_breakdown = SentimentBreakdown(
-                composite=float(getattr(last_row, "composite_score", 0.0) or 0.0),
-                news=float(getattr(last_row, "news_score", 0.0) or 0.0),
-                social=float(getattr(last_row, "social_score", 0.0) or 0.0),
-                global_score=float(getattr(last_row, "global_score", 0.0) or 0.0),
-            )
-        # If there is no AggregatedSentiment row yet, we just leave it as None.
-        # Frontend will fall back to sentimentHistory.
-
     # --- OnchainMetrics -> onChainHistory ---
     OnchainMetrics = _get_model("OnchainMetrics")
     if OnchainMetrics is not None:
@@ -348,7 +393,16 @@ def _load_market_intel_from_db(
                     val=float(getattr(cac, "corr_btc_dxy", 0.0) or 0.0),
                 )
             )
-
+    # --- NEW: generic sentiment fetch for ANY top-100 asset ---
+    sentiment_raw = get_latest_sentiment_bucket(db, symbol)
+    sentiment_breakdown = None
+    if sentiment_raw is not None:
+        sentiment_breakdown = SentimentBreakdown(
+            composite=sentiment_raw["composite"],
+            news=sentiment_raw["news"],
+            social=sentiment_raw["social"],
+            global_score=sentiment_raw["global_score"],
+        )
     # --- Simple radar summary from what we have ---
     last_sentiment = sentiment_history[-1].score if sentiment_history else 0.0
     last_funding = funding_history[-1].v if funding_history else 0.0
@@ -374,7 +428,7 @@ def _load_market_intel_from_db(
     )
 
     return MarketIntelResponse(
-        symbol=symbol.upper(),
+        symbol=symbol,
         mode=mode,
         sentimentHistory=sentiment_history,
         onChainHistory=onchain_history,

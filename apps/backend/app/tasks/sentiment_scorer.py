@@ -1,11 +1,11 @@
-# app/tasks/sentiment_scorer.py
-
 from __future__ import annotations
 
 from collections import defaultdict
 from dataclasses import dataclass
 from datetime import datetime, timedelta, timezone
 from typing import Dict, Tuple
+
+from sqlalchemy import func
 
 from app.celery_app.app import celery_app
 from app.db.database import SessionLocal
@@ -59,11 +59,27 @@ def run_sentiment_scorer() -> int:
     Returns: number of (symbol, hour) buckets updated.
     """
     db = SessionLocal()
-    now = datetime.now(timezone.utc)
 
-    # We'll look back a bit (2 hours) to ensure we cover last complete hour(s).
-    lookback_hours = 2
-    cutoff = now - timedelta(hours=lookback_hours)
+    # 1) Find the latest sentiment timestamp we actually have
+    try:
+        last_ts = db.query(func.max(SentimentData.timestamp)).scalar()
+    except Exception as e:
+        print(f"[SentimentScorer] Error fetching latest timestamp: {e}")
+        db.close()
+        return 0
+
+    if not last_ts:
+        print("[SentimentScorer] No SentimentData found. Nothing to aggregate.")
+        db.close()
+        return 0
+
+    if last_ts.tzinfo is None:
+        last_ts = last_ts.replace(tzinfo=timezone.utc)
+
+    # 2) Look back from *that* point (not from 'now')
+    #    24h is a good default: covers recent history and is safe to rerun.
+    lookback_hours = 24
+    cutoff = last_ts - timedelta(hours=lookback_hours)
 
     # Limit to top-100 + GLOBAL
     top100_map = build_top100_slug_map()
@@ -72,7 +88,11 @@ def run_sentiment_scorer() -> int:
     try:
         rows = (
             db.query(SentimentData)
-            .filter(SentimentData.timestamp >= cutoff)
+            .filter(
+                SentimentData.timestamp >= cutoff,
+                SentimentData.timestamp <= last_ts,
+                SentimentData.sentiment_score.isnot(None),
+            )
             .all()
         )
     except Exception as e:

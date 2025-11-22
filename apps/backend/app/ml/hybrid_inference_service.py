@@ -1,6 +1,6 @@
 import logging
 from datetime import datetime
-from typing import Any, Dict
+from typing import Optional, Dict, Any
 
 from app.hybrid.schemas import (
     MarketContext,
@@ -21,7 +21,7 @@ from app.ml.adv.model_registry import model_registry
 # Meta components
 from app.hybrid.bandit import bandit_weights
 from app.hybrid.metalabel import metalabel_decide
-
+from app.ml.adv.decision_net import DECISION_NET_INPUT_KEYS, decision_net_score
 logger = logging.getLogger(__name__)
 
 
@@ -60,6 +60,53 @@ class HybridInferenceService:
         self.rl_agent = (
             self.registry.get_model("rl") if self.registry else rl_agent
         )
+    
+    def _build_expert_inputs(self, layer2: Layer2Prediction) -> Dict[str, float]:
+        """
+        Build the expert_inputs dict for DecisionNet from the Layer2Prediction.
+        This includes the core model votes and, if available, sentiment features.
+        """
+        # Base expert inputs from Layer2Prediction
+        base: Dict[str, float] = {
+            "tft_vote": float(getattr(layer2, "tft_vote", 0.0) or 0.0),
+            "tcn_vote": float(getattr(layer2, "tcn_vote", 0.0) or 0.0),
+            "tst_vote": float(getattr(layer2, "tst_vote", 0.0) or 0.0),
+            "xgb_price_vote": float(getattr(layer2, "xgb_price_vote", 0.0) or 0.0),
+            "xgb_vol_vote": float(getattr(layer2, "xgb_vol_vote", 0.0) or 0.0),
+            "options_score": float(getattr(layer2, "options_score", 0.0) or 0.0),
+            "macro_score": float(getattr(layer2, "macro_score", 0.0) or 0.0),
+            "llm_narrative": float(getattr(layer2, "llm_narrative_vote", 0.0) or 0.0),
+        }
+
+        # Sentiment features may live inside layer2.meta["sentiment"] or directly as attributes.
+        sentiment_meta: Dict[str, Any] = {}
+        if getattr(layer2, "meta", None):
+            sentiment_meta = layer2.meta.get("sentiment", {}) or {}
+
+        def _get_sentiment_field(name: str) -> float:
+            # 1) try dedicated attribute on layer2 (e.g. layer2.composite_score)
+            if hasattr(layer2, name):
+                val = getattr(layer2, name)
+                if val is not None:
+                    return float(val)
+            # 2) otherwise, look into meta["sentiment"]
+            if sentiment_meta:
+                val = sentiment_meta.get(name)
+                if val is not None:
+                    return float(val)
+            return 0.0
+
+        # Only populate sentiment keys that DecisionNet is actually expecting.
+        for s_key in ("composite_score", "news_score", "social_score", "global_score"):
+            if s_key in DECISION_NET_INPUT_KEYS:
+                base[s_key] = _get_sentiment_field(s_key)
+
+        # Finally, build the expert_inputs dict in the exact order of DECISION_NET_INPUT_KEYS
+        expert_inputs: Dict[str, float] = {}
+        for key in DECISION_NET_INPUT_KEYS:
+            expert_inputs[key] = float(base.get(key, 0.0) or 0.0)
+
+        return expert_inputs
 
     @property
     def is_ready(self) -> bool:
@@ -127,9 +174,9 @@ class HybridInferenceService:
             ctx=ctx,
         )
 
-        size_factor: float = float(meta_decision.get("size_factor", 1.0))
-        meta_execute: bool = bool(meta_decision.get("execute", True))
-        meta_reason: str = str(meta_decision.get("reason", "default"))
+        size_factor = meta_decision.get("size_factor", 0.0)
+        meta_execute = meta_decision.get("execute", False)
+        meta_reason = meta_decision.get("reason", "N/A")
 
         # 5) Run RL Agent (Execution policy)
         #    We pass in model_votes + strategy tag so RL knows the regime.
@@ -144,6 +191,16 @@ class HybridInferenceService:
             # Simple encoding: 1.0 if we are in a trend-following regime, else 0.0
             "regime_tag": 1.0 if "trend" in (strategy_tag or "").lower() else 0.0,
         }
+
+        # 5) DecisionNet expert aggregation (including sentiment features)
+        decision_net_score_val: Optional[float] = None
+        expert_inputs: Dict[str, float] = {}
+        try:
+            expert_inputs = self._build_expert_inputs(layer2)
+            # This will internally respect DECISION_NET_INPUT_KEYS (including any sentiment keys)
+            decision_net_score_val = float(decision_net_score(expert_inputs))
+        except Exception as e:
+            logger.warning("[HybridInference] DecisionNet scoring failed: %s", e)
 
         # Default RL action if the policy is missing or fails
         rl_action = RLAction(
@@ -191,8 +248,9 @@ class HybridInferenceService:
             debug={
                 "meta_reason": meta_reason,
                 "layer2_votes": model_votes,
-                "raw_features_keys": list(raw_features.keys()),
-            },
+                "decision_net_score": decision_net_score_val,
+                "decision_net_inputs": expert_inputs,
+            }
         )
 
         return decision

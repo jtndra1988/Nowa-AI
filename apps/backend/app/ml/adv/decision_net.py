@@ -3,12 +3,18 @@ import torch.nn as nn
 from pathlib import Path
 from typing import Dict, Any, Optional, List
 
+# Reuse sentiment feature list from XGB training
+from app.ml.train_xgb import SENTIMENT_FEATURES
+
 # Device + default runtime artifact
 DEVICE = "cuda" if torch.cuda.is_available() else "cpu"
 DECISION_NET_PATH = Path("./model_artifacts/decision_net.pth")
 
 # Canonical input routing from Layer 1 / experts:
 # These keys define BOTH training and inference ordering.
+#
+# First: model/expert votes
+# Then:  tabular sentiment features (SENTIMENT_FEATURES)
 DECISION_NET_INPUT_KEYS: List[str] = [
     "tft_vote",         # TFT (Visionary) price signal
     "tcn_vote",         # TCN (Reflex) price signal
@@ -18,7 +24,7 @@ DECISION_NET_INPUT_KEYS: List[str] = [
     "options_score",    # Options expert (Gamma/Vanna/Charm edge)
     "macro_score",      # Macro + on-chain expert
     "llm_narrative",    # LLM narrative sentiment score
-]
+] + SENTIMENT_FEATURES   # ["news_score", "social_score", "global_score", "composite_score"]
 
 
 class DecisionNet(nn.Module):
@@ -83,6 +89,8 @@ def build_decision_feature_vector(expert_inputs: Dict[str, Any]) -> torch.Tensor
             "options_score": float,
             "macro_score": float,
             "llm_narrative": float,
+            # plus sentiment features:
+            # "news_score", "social_score", "global_score", "composite_score"
         }
 
     Missing keys are filled with 0.0, and non-numeric values are safely coerced.

@@ -9,7 +9,7 @@ import pandas as pd
 from torch.utils.data import DataLoader
 from torch.optim import AdamW
 from sqlalchemy import func
-
+from app.ml.feature_builder import join_sentiment_features
 # Internal imports
 from app.db.database import SessionLocal
 from app.db import models
@@ -75,13 +75,17 @@ def train():
     # 1. Data prep
     df = load_training_data(days=90)
 
-    # Apply shared feature engineering
+        # Apply shared feature engineering
     df_processed = df.groupby("symbol", group_keys=False).apply(apply_price_feature_config)
 
-    # Targets: next bar return & vol proxy
+    # Join hourly sentiment features (composite / news / social / global)
+    df_processed = join_sentiment_features(df_processed)
+
+    # Targets: next bar return & vol proxy (built AFTER sentiment → no leakage)
     df_processed["target_price"] = (
         df_processed.groupby("symbol")["close"].shift(-1) / df_processed["close"] - 1
     )
+
     df_processed["target_vol"] = df_processed.groupby("symbol")["roll_vol_6h"].shift(-1)
     df_processed = df_processed.dropna()
 

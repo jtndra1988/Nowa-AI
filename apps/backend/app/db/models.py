@@ -528,3 +528,37 @@ class ModelVotes(Base):
     llm_vote = Column(Float, default=0.0)
     
     ensemble_consensus = Column(Float, default=0.0)
+
+class AggregatedSentiment(Base):
+    __tablename__ = "aggregated_sentiment"
+
+    id = Column(Integer, primary_key=True, index=True)
+    symbol = Column(String(32), index=True, nullable=False)
+    bucket_start = Column(DateTime(timezone=True), index=True, nullable=False)
+
+    # Per-source buckets (optional but useful)
+    news_score = Column(Float, nullable=True)
+    social_score = Column(Float, nullable=True)
+    global_score = Column(Float, nullable=True)
+
+    # Single composite sentiment for your AI / UI
+    composite_score = Column(Float, nullable=True)
+
+    source_count = Column(Integer, default=0)
+
+    created_at = Column(
+        DateTime(timezone=True),
+        server_default=func.now(),
+    )
+    updated_at = Column(
+        DateTime(timezone=True),
+        onupdate=func.now(),
+    )
+
+    __table_args__ = (
+        UniqueConstraint(
+            "symbol",
+            "bucket_start",
+            name="uq_aggregated_sentiment_symbol_bucket",
+        ),
+    )

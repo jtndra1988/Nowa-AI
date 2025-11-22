@@ -80,6 +80,12 @@ export type RadarIntel = {
   liquidity: "LOW" | "NORMAL" | "HIGH";
   warning: string;
 };
+export type SentimentBreakdown = {
+  composite: number;
+  news: number;
+  social: number;
+  global_score: number;
+};
 
 export type MarketIntel = {
   symbol: string;
@@ -92,7 +98,9 @@ export type MarketIntel = {
   cvdHistory: SimpleSeriesPoint[];
   correlations: CorrelationPoint[];
   radar: RadarIntel;
+  sentimentBreakdown?: SentimentBreakdown; // NEW
 };
+
 
 export type LiveTrade = {
   id: string;

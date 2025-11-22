@@ -214,7 +214,6 @@ export const MarketIntelTab: React.FC<{
     setLoading(true);
     setError(null);
 
-    // FIXED: api.ts only accepts symbol, removed 'mode' argument
     getMarketIntel(symbol)
       .then((data) => {
         if (!alive) return;
@@ -247,7 +246,22 @@ export const MarketIntelTab: React.FC<{
     pro.onChainHistory ?? pro.onchainHistory ?? [];
   const cvdArr: IntelSeriesPoint[] = pro.cvdHistory ?? pro.cvd ?? [];
 
+  const breakdown = (pro as any).sentimentBreakdown || null;
+
   // Latest Values & Safe Defaults
+  const latestComposite = safeNum(
+    breakdown?.composite ??
+      (sentimentArr.length
+        ? sentimentArr[sentimentArr.length - 1].score ??
+          sentimentArr[sentimentArr.length - 1].s
+        : 0),
+    0
+  );
+
+  const newsScore = safeNum(breakdown?.news, 0);
+  const socialScore = safeNum(breakdown?.social, 0);
+  const globalScore = safeNum(breakdown?.global_score, 0);
+
   const activeAddr = safeNum(
     chainArr.length
       ? chainArr[chainArr.length - 1].active ??
@@ -261,33 +275,26 @@ export const MarketIntelTab: React.FC<{
       : 0,
     0
   );
-  const latestScore = safeNum(
-    sentimentArr.length
-      ? sentimentArr[sentimentArr.length - 1].score ??
-          sentimentArr[sentimentArr.length - 1].s
-      : 0,
-    0
-  );
 
   // Mock RSI Calculation (or extraction if API provided it later)
-  const derivedRsi = 50 + latestScore * 20;
+  const derivedRsi = 50 + latestComposite * 20;
 
   // Logic & Derived State
   const regimeText =
     pro.radar?.regime ??
-    (latestScore > 0.25
+    (latestComposite > 0.25
       ? "MOMENTUM"
-      : latestScore < -0.25
+      : latestComposite < -0.25
       ? "MEAN-REVERT"
       : "BALANCED");
 
-      const correlations: CorItem[] = Array.isArray(pro.correlations)
+  const correlations: CorItem[] = Array.isArray(pro.correlations)
     ? pro.correlations
     : [];
 
   // Radar Chart Logic normalization (Spot centric)
   const trendScore =
-    latestScore > 0 ? 75 + latestScore * 25 : 25 + latestScore * 25;
+    latestComposite > 0 ? 75 + latestComposite * 25 : 25 + latestComposite * 25;
   const volumeScore = Math.min(Math.abs(cvdDelta / 1000), 100);
   const onChainScore = chainArr.length > 0 ? 80 : 40;
   const corrScore =
@@ -309,7 +316,12 @@ export const MarketIntelTab: React.FC<{
     { subject: "Correlations", A: corrScore, fullMark: 100 },
     {
       subject: "Momentum",
-      A: regimeText === "MOMENTUM" ? 85 : regimeText === "MEAN-REVERT" ? 55 : 65,
+      A:
+        regimeText === "MOMENTUM"
+          ? 85
+          : regimeText === "MEAN-REVERT"
+          ? 55
+          : 65,
       fullMark: 100,
     },
   ];
@@ -321,9 +333,9 @@ export const MarketIntelTab: React.FC<{
     regimeText === "MOMENTUM"
       ? `${displaySymbol} is showing strong directional momentum.`
       : `${displaySymbol} is in a choppy/ranging zone.`,
-    latestScore > 0.2
+    latestComposite > 0.2
       ? "Social Sentiment is Bullish."
-      : latestScore < -0.2
+      : latestComposite < -0.2
       ? "Social Sentiment is Bearish."
       : "Social Sentiment is Neutral.",
   ];
@@ -349,9 +361,9 @@ export const MarketIntelTab: React.FC<{
 
   // 3. Signal Confluence
   const confluenceBullets = [
-    cvdDelta > 0 && latestScore > 0
+    cvdDelta > 0 && latestComposite > 0
       ? "Volume and Sentiment align Bullish (Strong Signal)."
-      : cvdDelta < 0 && latestScore < 0
+      : cvdDelta < 0 && latestComposite < 0
       ? "Volume and Sentiment align Bearish (Strong Signal)."
       : "Divergence: Volume and Sentiment disagree.",
     chainArr.length > 0
@@ -360,12 +372,12 @@ export const MarketIntelTab: React.FC<{
   ];
   let confSignal: "positive" | "negative" | "neutral" | "warning" = "neutral";
   const directionMatch =
-    (cvdDelta > 0 && latestScore > 0) ||
-    (cvdDelta < 0 && latestScore < 0);
+    (cvdDelta > 0 && latestComposite > 0) ||
+    (cvdDelta < 0 && latestComposite < 0);
   if (directionMatch) confSignal = "positive";
   else confSignal = "warning";
 
-    const hasAnyData =
+  const hasAnyData =
     sentimentArr.length > 0 ||
     chainArr.length > 0 ||
     cvdArr.length > 0 ||
@@ -404,9 +416,6 @@ export const MarketIntelTab: React.FC<{
       </Card>
     );
   }
-
-
-
 
   return (
     <div className="flex flex-col gap-6 pb-10 animate-in fade-in duration-500">
@@ -449,14 +458,26 @@ export const MarketIntelTab: React.FC<{
       {/* --- KPI STATISTICS (SPOT ONLY) --- */}
       <div className="grid grid-cols-1 sm:grid-cols-2 lg:grid-cols-4 gap-4">
         <KpiCard
-          label={`${displaySymbol} Sentiment`}
-          value={latestScore.toFixed(2)}
-          subValue="AI Social Score"
-          trend={latestScore > 0 ? "up" : latestScore < 0 ? "down" : "neutral"}
+          label={`${displaySymbol} Market Sentiment (1H)`}
+          value={latestComposite.toFixed(2)}
+          subValue={
+            breakdown
+              ? `News ${newsScore.toFixed(2)} · Social ${socialScore.toFixed(
+                  2
+                )} · Global ${globalScore.toFixed(2)}`
+              : "AI Sentiment (1H)"
+          }
+          trend={
+            latestComposite > 0
+              ? "up"
+              : latestComposite < 0
+              ? "down"
+              : "neutral"
+          }
           color={
-            latestScore > 0
+            latestComposite > 0
               ? "text-green-400"
-              : latestScore < 0
+              : latestComposite < 0
               ? "text-red-400"
               : "text-slate-100"
           }

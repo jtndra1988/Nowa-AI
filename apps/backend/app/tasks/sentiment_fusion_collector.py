@@ -38,11 +38,28 @@ def run_sentiment_fusion(hours_window: int = 6):
         for sym in symbols:
             subset = df[df["symbol"] == sym]
             # ... (Aggregations and Weighted final sentiment logic - unchanged) ...
-            avg_news = subset[subset["source_lower"].str.contains("newsapi|cryptopanic")]["sentiment_score"].mean()
-            whale = subset[subset["source_lower"].str.contains("santiment|whale")]["sentiment_score"].mean()
-            social = subset[subset["source_lower"].str.contains("lunarcrush")]["sentiment_score"].mean()
-            fear_greed = subset[subset["source_lower"].str.contains("alternative.me")]["sentiment_score"].mean()
-            market_ctx = subset[subset["source_lower"].str.contains("coinmarketcap")]["sentiment_score"].mean()
+            avg_news = subset[
+                subset["source_lower"].str.contains("newsapi|cryptopanic|news|headline")
+            ]["sentiment_score"].mean()
+
+            whale = subset[
+                subset["source_lower"].str.contains("santiment|whale")
+            ]["sentiment_score"].mean()
+
+            social = subset[
+                subset["source_lower"].str.contains("lunarcrush|social")
+            ]["sentiment_score"].mean()
+
+            fear_greed = subset[
+                subset["source_lower"].str.contains(
+                    "feargreedindex|fear & greed|feargreed"
+                )
+            ]["sentiment_score"].mean()
+
+            market_ctx = subset[
+                subset["source_lower"].str.contains("cmc/global_metrics|coinmarketcap|cmc")
+            ]["sentiment_score"].mean()
+
 
             weights = { "avg_news_sentiment": 1.0, "whale_emotion": 1.3, "social_score": 1.2, "fear_greed_index": 0.8, "market_ctx": 1.0, }
             components = { "avg_news_sentiment": avg_news, "whale_emotion": whale, "social_score": social, "fear_greed_index": fear_greed, "market_ctx": market_ctx, }

@@ -2,7 +2,7 @@ from __future__ import annotations
 
 import logging
 from datetime import datetime, timedelta, timezone
-from typing import Any, List, Literal
+from typing import Any, List, Literal, Optional
 
 from fastapi import APIRouter, Depends, Query
 from pydantic import BaseModel
@@ -32,12 +32,6 @@ def _get_model(name: str) -> Any | None:
     except Exception:
         return None
 
-def _get_model(name: str) -> Any | None:
-    """Safely get a model from app.db.models, or None if it doesn't exist."""
-    try:
-        return getattr(db_pkg.models, name)  # type: ignore[attr-defined]
-    except Exception:
-        return None
 
 def _symbol_candidates(symbol: str) -> List[str]:
     """Return plausible symbol keys for intel lookups.
@@ -112,6 +106,15 @@ class RadarIntel(BaseModel):
     warning: str = ""
 
 
+class SentimentBreakdown(BaseModel):
+    """1H sentiment breakdown used by the Market Sentiment block."""
+
+    composite: float = 0.0
+    news: float = 0.0
+    social: float = 0.0
+    global_score: float = 0.0
+
+
 class MarketIntelResponse(BaseModel):
     symbol: str
     mode: str
@@ -123,6 +126,8 @@ class MarketIntelResponse(BaseModel):
     cvdHistory: List[SimpleSeriesPoint]
     correlations: List[CorrelationPoint]
     radar: RadarIntel
+    # NEW: per-symbol sentiment breakdown (composite/news/social/global)
+    sentimentBreakdown: Optional[SentimentBreakdown] = None
 
 
 # ---------------------------------------------------------------------------
@@ -135,7 +140,7 @@ def _load_market_intel_from_db(
     symbol: str,
     mode: str,
 ) -> MarketIntelResponse:
-    """Pull timeseries snapshots for the Market Intel tab."""
+    """Pull timeseries snapshots + sentiment breakdown for the Market Intel tab."""
     now = datetime.now(timezone.utc)
     lookback_hours = 24
     since = now - timedelta(hours=lookback_hours)
@@ -151,8 +156,9 @@ def _load_market_intel_from_db(
     oi_history: List[SimpleSeriesPoint] = []
     cvd_history: List[SimpleSeriesPoint] = []
     correlations: List[CorrelationPoint] = []
+    sentiment_breakdown: Optional[SentimentBreakdown] = None
 
-    # --- SentimentFusion -> sentimentHistory ---
+    # --- SentimentFusion -> sentimentHistory (time series) ---
     SentimentFusion = _get_model("SentimentFusion")
     if SentimentFusion is not None:
         rows = (
@@ -175,6 +181,29 @@ def _load_market_intel_from_db(
                     score=float(getattr(r, "final_sentiment", 0.0) or 0.0),
                 )
             )
+
+    # --- AggregatedSentiment -> sentimentBreakdown (1H market sentiment block) ---
+    AggregatedSentiment = _get_model("AggregatedSentiment")
+    if AggregatedSentiment is not None:
+        last_row = (
+            db.execute(
+                select(AggregatedSentiment)
+                .where(AggregatedSentiment.symbol.in_(candidates))
+                .order_by(desc(AggregatedSentiment.bucket_start))
+                .limit(1)
+            )
+            .scalars()
+            .first()
+        )
+        if last_row is not None:
+            sentiment_breakdown = SentimentBreakdown(
+                composite=float(getattr(last_row, "composite_score", 0.0) or 0.0),
+                news=float(getattr(last_row, "news_score", 0.0) or 0.0),
+                social=float(getattr(last_row, "social_score", 0.0) or 0.0),
+                global_score=float(getattr(last_row, "global_score", 0.0) or 0.0),
+            )
+        # If there is no AggregatedSentiment row yet, we just leave it as None.
+        # Frontend will fall back to sentimentHistory.
 
     # --- OnchainMetrics -> onChainHistory ---
     OnchainMetrics = _get_model("OnchainMetrics")
@@ -258,7 +287,7 @@ def _load_market_intel_from_db(
             funding_history.append(
                 SimpleSeriesPoint(
                     t=r.timestamp,
-                    # IMPORTANT: column is funding_rate, not 'rate'
+                    # IMPORTANT: column is funding_rate in your models
                     v=float(getattr(r, "funding_rate", 0.0) or 0.0),
                 )
             )
@@ -280,10 +309,16 @@ def _load_market_intel_from_db(
             .all()
         )
         for r in reversed(rows):
+            # Be robust to cvd_1m vs cdv_1m naming
+            cvd_val = (
+                getattr(r, "cvd_1m", None)
+                or getattr(r, "cdv_1m", None)
+                or 0.0
+            )
             cvd_history.append(
                 SimpleSeriesPoint(
                     t=r.timestamp,
-                    v=float(getattr(r, "cdv_1m", 0.0) or 0.0),
+                    v=float(cvd_val or 0.0),
                 )
             )
 
@@ -349,7 +384,9 @@ def _load_market_intel_from_db(
         cvdHistory=cvd_history,
         correlations=correlations,
         radar=radar,
+        sentimentBreakdown=sentiment_breakdown,
     )
+
 
 # ---------------------------------------------------------------------------
 # Mock / safe fallback (only for catastrophic errors)
@@ -412,6 +449,7 @@ def _build_mock_market_intel(symbol: str, mode: str) -> MarketIntelResponse:
             CorrelationPoint(name="BTC vs DXY", val=-0.35),
         ],
         radar=radar,
+        sentimentBreakdown=None,
     )
 
 

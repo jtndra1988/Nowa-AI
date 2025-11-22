@@ -17,13 +17,10 @@ from sklearn.metrics import mean_squared_error
 from app.core.config import settings
 from app.db import models
 from app.db.database import SessionLocal
+from app.ml.feature_builder import join_sentiment_features
 
 logger = logging.getLogger(__name__)
 logging.basicConfig(level=logging.INFO)
-
-# ---------------------------------------------------------------------
-# Paths & versioning (aligned with macro_onchain_model.py)
-# ---------------------------------------------------------------------
 
 ARTIFACTS_DIR = Path(getattr(settings, "MODEL_ARTIFACTS_DIR", "model_artifacts"))
 ARTIFACTS_DIR.mkdir(parents=True, exist_ok=True)
@@ -33,48 +30,28 @@ MACRO_MODEL_PATH = ARTIFACTS_DIR / "macro_onchain_bias.joblib"
 MACRO_MODEL_VERSION = "v1.0"
 MACRO_MODEL_ROOT = Path("models") / "macro_onchain"
 
+SENTIMENT_COLS = ["news_score", "social_score", "global_score", "composite_score"]
+
 FEATURE_COLS = [
     "stablecoin_netflow",
     "btc_exchange_reserves_change",
     "dxy_trend",
     "spx_trend",
-]
+] + SENTIMENT_COLS
 
-
-# ---------------------------------------------------------------------
-# Data loading & dataset construction
-# ---------------------------------------------------------------------
 
 def _load_macro_onchain_dataset(
     session,
     lookback_days: int = 180,
 ) -> pd.DataFrame:
     """
-    Load macro/on-chain features and join with MarketData to build
-    a regression dataset.
-
-    Assumptions (adjust to your actual ORM names):
-      - There is a table models.MacroOnchainMetrics (or similar) with fields:
-          symbol: str
-          timestamp: datetime
-          stablecoin_netflow: float
-          btc_exchange_reserves_change: float
-          dxy_trend: float
-          spx_trend: float
-
-      - MarketData has:
-          symbol: str
-          timestamp: datetime
-          close: numeric
-
-    Target:
-      - 1-step-ahead return: close_{t+1} / close_t - 1
+    Load macro/on-chain metrics, join with MarketData and hourly sentiment
+    to build a regression dataset with target_ret.
     """
     logger.info("[MacroOnchainTrain] Loading macro/on-chain metrics from DB...")
 
-    # Latest macro timestamp
     last_ts = session.query(
-        func.max(models.MacroOnchainMetrics.timestamp)  # TODO: adjust model name if different
+        func.max(models.MacroOnchainMetrics.timestamp)
     ).scalar()
     if not last_ts:
         raise RuntimeError(
@@ -84,9 +61,8 @@ def _load_macro_onchain_dataset(
 
     start_ts = last_ts - timedelta(days=lookback_days)
 
-    # ---- Load macro/on-chain metrics ----
     macro_rows = (
-        session.query(models.MacroOnchainMetrics)  # TODO: adjust model name if different
+        session.query(models.MacroOnchainMetrics)
         .filter(models.MacroOnchainMetrics.timestamp >= start_ts)
         .order_by(models.MacroOnchainMetrics.symbol, models.MacroOnchainMetrics.timestamp)
         .all()
@@ -120,9 +96,8 @@ def _load_macro_onchain_dataset(
         df_macro["symbol"].nunique(),
     )
 
-    # ---- Load MarketData for forward returns ----
+    # Load MarketData for forward returns
     logger.info("[MacroOnchainTrain] Loading MarketData for return targets...")
-
     mkt_rows = (
         session.query(models.MarketData)
         .filter(models.MarketData.timestamp >= start_ts)
@@ -145,7 +120,7 @@ def _load_macro_onchain_dataset(
     df_mkt = pd.DataFrame(mkt_records)
     df_mkt["timestamp"] = pd.to_datetime(df_mkt["timestamp"], utc=True)
 
-    # ---- Join macro + prices on (symbol, timestamp) ----
+    # Join macro + prices
     df = pd.merge(
         df_macro,
         df_mkt,
@@ -157,23 +132,26 @@ def _load_macro_onchain_dataset(
             "[MacroOnchainTrain] Join between MacroOnchainMetrics and MarketData is empty."
         )
 
-    # ---- Compute forward 1-step return per symbol ----
     df = df.sort_values(["symbol", "timestamp"]).reset_index(drop=True)
     df["target_ret"] = df.groupby("symbol")["close"].shift(-1) / df["close"] - 1.0
 
-    # Drop rows with missing targets or features
-    df = df.dropna(
-        subset=["target_ret"] + FEATURE_COLS
-    ).reset_index(drop=True)
+    # === Attach sentiment features ===
+    df = join_sentiment_features(
+        session=session,
+        df=df,
+        symbol_col="symbol",
+        timestamp_col="timestamp",
+        fill_value=0.0,
+    )
+
+    # Clean up & drop rows with missing features/targets
+    df.replace([np.inf, -np.inf], np.nan, inplace=True)
+    df = df.dropna(subset=["target_ret"] + FEATURE_COLS).reset_index(drop=True)
 
     if df.empty:
         raise RuntimeError(
             "[MacroOnchainTrain] No rows with valid target_ret and feature set."
         )
-
-    # Replace inf / -inf and clamp extremes if needed
-    df.replace([np.inf, -np.inf], np.nan, inplace=True)
-    df = df.dropna(subset=FEATURE_COLS + ["target_ret"]).reset_index(drop=True)
 
     logger.info(
         "[MacroOnchainTrain] Final training dataset: %d rows, %d symbols",
@@ -205,12 +183,8 @@ def _train_val_split(
     return X_train, X_val, y_train, y_val
 
 
-# ---------------------------------------------------------------------
-# Training entrypoint
-# ---------------------------------------------------------------------
-
 def main():
-    logger.info("[MacroOnchainTrain] ==== Training macro/on-chain bias model ====")
+    logger.info("[MacroOnchainTrain] ==== Training macro/on-chain bias model (with sentiment) ====")
 
     session = SessionLocal()
     try:
@@ -220,7 +194,6 @@ def main():
 
     X_train, X_val, y_train, y_val = _train_val_split(df, train_frac=0.8)
 
-    # You can tune these hyperparameters; this is a solid starting point.
     model = GradientBoostingRegressor(
         n_estimators=200,
         learning_rate=0.05,
@@ -263,11 +236,9 @@ def main():
         "metadata": metadata,
     }
 
-    # ---- Save runtime artifact (used by macro_onchain_model.py) ----
     joblib.dump(artifact, MACRO_MODEL_PATH)
     logger.info("[MacroOnchainTrain] Saved runtime artifact to %s", MACRO_MODEL_PATH)
 
-    # ---- Save versioned artifact + metadata JSON ----
     version_dir = MACRO_MODEL_ROOT / f"{MACRO_MODEL_VERSION}_{timestamp}"
     version_dir.mkdir(parents=True, exist_ok=True)
 

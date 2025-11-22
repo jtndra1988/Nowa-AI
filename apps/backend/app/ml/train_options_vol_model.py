@@ -16,42 +16,29 @@ import joblib
 from app.db.database import SessionLocal
 from app.db import models
 from app.core.config import settings
+from app.ml.feature_builder import join_sentiment_features
 
 logger = logging.getLogger(__name__)
 logging.basicConfig(level=logging.INFO)
 
-# ---------------------------------------------------------------------
-# Paths and versioning
-# ---------------------------------------------------------------------
-
 ARTIFACTS_DIR = Path(getattr(settings, "MODEL_ARTIFACTS_DIR", "model_artifacts"))
 ARTIFACTS_DIR.mkdir(parents=True, exist_ok=True)
 
-# "Current production" options model artifact
 OPTIONS_MODEL_PATH = ARTIFACTS_DIR / "options_vol_edge.joblib"
 
-# Versioned options model artifacts
 OPTIONS_MODEL_VERSION = "v1.0"
 OPTIONS_MODEL_ROOT = Path("models") / "options_vol"
 
+SENTIMENT_COLS = ["news_score", "social_score", "global_score", "composite_score"]
 
-# ---------------------------------------------------------------------
-# Data loading & feature building
-# ---------------------------------------------------------------------
+BASE_FEATURE_COLS = ["iv_rank", "risk_reversal_25d", "term_structure_slope"]
+FEATURE_COLS = BASE_FEATURE_COLS + SENTIMENT_COLS
+
 
 def _load_joined_dataset(session, lookback_days: int = 60) -> pd.DataFrame:
     """
-    Load OptionsDerivedMetrics and join with MarketData to build
-    a training dataset for the options vol model.
-
-    For each symbol/timestamp:
-      - Features:  iv_rank, risk_reversal_25d, term_structure_slope
-      - Target:   1-step-ahead return (close_{t+1} / close_t - 1)
-
-    Returns:
-        DataFrame with columns:
-          ['symbol', 'timestamp', 'iv_rank', 'risk_reversal_25d',
-           'term_structure_slope', 'target_ret']
+    Load OptionsDerivedMetrics and join with MarketData and sentiment
+    to build a training dataset for the options vol model.
     """
     logger.info("[OptionsVolTrain] Loading derived metrics from DB...")
 
@@ -61,7 +48,6 @@ def _load_joined_dataset(session, lookback_days: int = 60) -> pd.DataFrame:
 
     start_ts = last_ts - timedelta(days=lookback_days)
 
-    # Load derived metrics
     derived_rows = (
         session.query(models.OptionsDerivedMetrics)
         .filter(models.OptionsDerivedMetrics.timestamp >= start_ts)
@@ -92,7 +78,7 @@ def _load_joined_dataset(session, lookback_days: int = 60) -> pd.DataFrame:
         df_derived["symbol"].nunique(),
     )
 
-    # Load market data for the same window to compute forward returns
+    # MarketData for returns
     logger.info("[OptionsVolTrain] Loading market data for return targets...")
     mkt_rows = (
         session.query(models.MarketData)
@@ -115,7 +101,7 @@ def _load_joined_dataset(session, lookback_days: int = 60) -> pd.DataFrame:
     df_mkt = pd.DataFrame(mkt_records)
     df_mkt["timestamp"] = pd.to_datetime(df_mkt["timestamp"], utc=True)
 
-    # Merge derived metrics with price data
+    # Join derived metrics with price
     df = pd.merge(
         df_derived,
         df_mkt,
@@ -125,36 +111,28 @@ def _load_joined_dataset(session, lookback_days: int = 60) -> pd.DataFrame:
     if df.empty:
         raise RuntimeError("[OptionsVolTrain] Join between derived metrics and MarketData is empty.")
 
-    # Compute 1-step-ahead return per symbol
     df = df.sort_values(["symbol", "timestamp"]).reset_index(drop=True)
-    df["target_ret"] = (
-        df.groupby("symbol")["close"].shift(-1) / df["close"] - 1.0
-    )
+    df["target_ret"] = df.groupby("symbol")["close"].shift(-1) / df["close"] - 1.0
 
-    # Drop rows without a valid target
     df = df.dropna(subset=["target_ret"]).reset_index(drop=True)
     if df.empty:
         raise RuntimeError("[OptionsVolTrain] No rows with valid forward return target.")
 
     # Feature engineering to match options_vol_edge() expectations
-    # iv_rank: normalized avg_iv_near_term in [0, 1] assuming IV in [0, 2]
     iv_near = df["avg_iv_near_term"].astype(float)
     iv_near = iv_near.replace([np.inf, -np.inf], np.nan)
     median_iv = iv_near.median() if not np.isnan(iv_near.median()) else 0.5
     iv_near = iv_near.fillna(median_iv)
     df["iv_rank"] = np.clip(iv_near / 2.0, 0.0, 1.0)
 
-    # risk_reversal_25d: directly from iv_skew_25d (fill NaN with 0)
     skew = df["iv_skew_25d"].astype(float)
     skew = skew.replace([np.inf, -np.inf], np.nan).fillna(0.0)
     df["risk_reversal_25d"] = skew
 
-    # term_structure_slope: directly from iv_term_slope_near_far (fill NaN with 0)
     term_slope = df["iv_term_slope_near_far"].astype(float)
     term_slope = term_slope.replace([np.inf, -np.inf], np.nan).fillna(0.0)
     df["term_structure_slope"] = term_slope
 
-    # Keep only the columns we need going forward
     df = df[
         [
             "symbol",
@@ -165,6 +143,15 @@ def _load_joined_dataset(session, lookback_days: int = 60) -> pd.DataFrame:
             "target_ret",
         ]
     ]
+
+    # === Attach sentiment features ===
+    df = join_sentiment_features(
+        session=session,
+        df=df,
+        symbol_col="symbol",
+        timestamp_col="timestamp",
+        fill_value=0.0,
+    )
 
     logger.info(
         "[OptionsVolTrain] Final training dataset: %d rows, %d symbols",
@@ -182,8 +169,7 @@ def _train_val_split(
     """
     Simple chronological train/val split.
     """
-    feature_cols = ["iv_rank", "risk_reversal_25d", "term_structure_slope"]
-    X = df[feature_cols].values.astype(float)
+    X = df[FEATURE_COLS].values.astype(float)
     y = df["target_ret"].values.astype(float)
 
     n = len(df)
@@ -197,12 +183,8 @@ def _train_val_split(
     return X_train, X_val, y_train, y_val
 
 
-# ---------------------------------------------------------------------
-# Training entrypoint
-# ---------------------------------------------------------------------
-
 def main():
-    logger.info("[OptionsVolTrain] ==== Training options volatility model ====")
+    logger.info("[OptionsVolTrain] ==== Training options volatility model (with sentiment) ====")
     session = SessionLocal()
     try:
         df = _load_joined_dataset(session, lookback_days=90)
@@ -211,7 +193,6 @@ def main():
 
     X_train, X_val, y_train, y_val = _train_val_split(df, train_frac=0.8)
 
-    # Model choice: GradientBoostingRegressor (robust, handles small feature set well)
     model = GradientBoostingRegressor(
         n_estimators=200,
         learning_rate=0.05,
@@ -227,15 +208,13 @@ def main():
     rmse = float(mean_squared_error(y_val, y_pred, squared=False))
     logger.info("[OptionsVolTrain] Validation RMSE: %.6f", rmse)
 
-    # Build artifact with model + metadata
-    feature_names = ["iv_rank", "risk_reversal_25d", "term_structure_slope"]
     timestamp = datetime.utcnow().strftime("%Y%m%dT%H%M%SZ")
 
     metadata = {
         "model_name": "options_vol_edge",
         "version": OPTIONS_MODEL_VERSION,
         "trained_at_utc": timestamp,
-        "feature_names": feature_names,
+        "feature_names": FEATURE_COLS,
         "lookback_days": 90,
         "train_val_split": 0.8,
         "model_type": "GradientBoostingRegressor",
@@ -256,11 +235,9 @@ def main():
         "metadata": metadata,
     }
 
-    # Save "current production" artifact
     joblib.dump(artifact, OPTIONS_MODEL_PATH)
     logger.info("[OptionsVolTrain] Saved runtime artifact to %s", OPTIONS_MODEL_PATH)
 
-    # Save versioned artifact + metadata JSON
     version_dir = OPTIONS_MODEL_ROOT / f"{OPTIONS_MODEL_VERSION}_{timestamp}"
     version_dir.mkdir(parents=True, exist_ok=True)
 

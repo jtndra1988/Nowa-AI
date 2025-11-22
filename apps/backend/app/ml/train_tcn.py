@@ -3,6 +3,7 @@ import os
 import json
 from datetime import datetime
 from pathlib import Path
+from app.ml.feature_builder import join_sentiment_features
 
 import torch
 import pandas as pd
@@ -25,14 +26,18 @@ MODEL_VERSION = "v1.0"
 
 
 def train():
-    # 1. Load & preprocess data
+    # 1. Data prep
     df = load_training_data(days=90)
     df_processed = df.groupby("symbol", group_keys=False).apply(apply_price_feature_config)
+
+    # Join hourly sentiment features
+    df_processed = join_sentiment_features(df_processed)
 
     # Targets: next-step return & vol
     df_processed["target_price"] = (
         df_processed.groupby("symbol")["close"].shift(-1) / df_processed["close"] - 1
     )
+
     df_processed["target_vol"] = df_processed.groupby("symbol")["roll_vol_6h"].shift(-1)
     df_processed = df_processed.dropna()
 

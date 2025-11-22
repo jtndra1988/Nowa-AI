@@ -11,6 +11,7 @@ from app.ml.train_tft import load_training_data
 from app.ml.adv.feature_engineering import FEATURE_CONFIG, process_market_data
 from app.ml.dataset import MultiModalTS
 from app.ml.losses import multitask_transformer_loss
+from app.ml.feature_builder import join_sentiment_features
 
 logger = logging.getLogger(__name__)
 logging.basicConfig(level=logging.INFO)
@@ -20,9 +21,14 @@ DEVICE = 'cuda' if torch.cuda.is_available() else 'cpu'
 def train():
     df = load_training_data(days=90)
     df_processed = df.groupby("symbol", group_keys=False).apply(process_market_data)
+
+    # Join hourly sentiment features
+    df_processed = join_sentiment_features(df_processed)
     
+    # Targets AFTER sentiment join
     df_processed["target_price"] = df_processed.groupby("symbol")["close"].shift(-1) / df_processed["close"] - 1
     df_processed["target_vol"] = df_processed.groupby("symbol")["roll_vol_6h"].shift(-1)
+
     df_processed = df_processed.dropna()
 
     ds = MultiModalTS(

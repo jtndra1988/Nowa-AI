@@ -15,6 +15,8 @@ from app.db.database import SessionLocal
 from app.db import models
 from app.core.config import settings
 from app.ml.adv.feature_engineering import apply_price_feature_config
+from app.ml.feature_builder import join_sentiment_features
+
 logger = logging.getLogger(__name__)
 logging.basicConfig(level=logging.INFO)
 
@@ -65,18 +67,19 @@ def _load_market_data(session, lookback_days: int = 60) -> pd.DataFrame:
 
 def _build_features(
     df: pd.DataFrame,
+    session,
     horizon: int = 1,
 ) -> Tuple[np.ndarray, np.ndarray, List[str], pd.DataFrame]:
     """
-    Build features + target for training.
+    Build features + target for training, including sentiment.
 
     Returns:
-        X:           np.ndarray [N, F]
-        y:           np.ndarray [N]
+        X:            np.ndarray [N, F]
+        y:            np.ndarray [N]
         feature_cols: list of feature column names
-        df_feat:     full feature DataFrame (for debugging / potential reuse)
+        df_feat:      full feature DataFrame
     """
-    logger.info("[XGB] Building features (using apply_price_feature_config)...")
+    logger.info("[XGB] Building features (price + sentiment)...")
     df = df.copy()
     df["timestamp"] = pd.to_datetime(df["timestamp"], utc=True)
 
@@ -86,26 +89,37 @@ def _build_features(
     for sym, g in groups:
         g = g.sort_values("timestamp").copy()
 
-        # ✅ Shared preprocessing: returns + rolling vols, same as rest of the system
+        # Shared price preprocessing / rolling vols
         g = apply_price_feature_config(g)
 
         # XGB-specific extra returns
         g["ret_4h"] = g["close"].pct_change(4)
         g["ret_12h"] = g["close"].pct_change(12)
 
-        # Ensure rolling vols are finite (they were created by apply_price_feature_config)
+        # Ensure rolling vols are finite
         if "roll_vol_12h" in g.columns:
             g["roll_vol_12h"] = g["roll_vol_12h"].fillna(g["roll_vol_12h"].median())
         if "roll_vol_24h" in g.columns:
             g["roll_vol_24h"] = g["roll_vol_24h"].fillna(g["roll_vol_24h"].median())
 
-        # Target: forward return over `horizon`
+        # Target: forward return
         g["target_ret"] = g["close"].shift(-horizon) / g["close"] - 1.0
 
         feats.append(g)
 
     df_feat = pd.concat(feats, axis=0).reset_index(drop=True)
 
+    # === Join sentiment features per (symbol, hour) ===
+    df_feat = join_sentiment_features(
+        session=session,
+        df=df_feat,
+        symbol_col="symbol",
+        timestamp_col="timestamp",
+        fill_value=0.0,
+    )
+
+    # Feature columns: price + sentiment
+    sentiment_cols = ["news_score", "social_score", "global_score", "composite_score"]
     feature_cols = [
         "close",
         "volume",
@@ -114,7 +128,7 @@ def _build_features(
         "ret_12h",
         "roll_vol_12h",
         "roll_vol_24h",
-    ]
+    ] + sentiment_cols
 
     # Drop rows that don't have all features or target
     df_feat = df_feat.dropna(subset=feature_cols + ["target_ret"])
@@ -124,6 +138,7 @@ def _build_features(
     logger.info("[XGB] Final training rows: %d", len(df_feat))
     return X, y, feature_cols, df_feat
 
+
 def _train_xgb_model(X: np.ndarray, y: np.ndarray):
     if len(X) < 500:
         raise RuntimeError(f"[XGB] Not enough rows to train (got {len(X)}, need >= 500)")
@@ -132,7 +147,7 @@ def _train_xgb_model(X: np.ndarray, y: np.ndarray):
     X_train, X_val = X[:split], X[split:]
     y_train, y_val = y[:split], y[split:]
 
-    # --- New: tabular scaler for training ---
+    # Tabular scaler
     scaler = StandardScaler()
     X_train_scaled = scaler.fit_transform(X_train)
     X_val_scaled = scaler.transform(X_val)
@@ -151,7 +166,7 @@ def _train_xgb_model(X: np.ndarray, y: np.ndarray):
             random_state=42,
         )
     else:
-        logger.info("[XGB] xgboost not installed, falling back to GradientBoostingRegressor...")
+        logger.info("[XGB] xgboost not installed, using GradientBoostingRegressor...")
         model = GradientBoostingRegressor(
             n_estimators=300,
             max_depth=3,
@@ -172,6 +187,7 @@ def _train_xgb_model(X: np.ndarray, y: np.ndarray):
 # Inference utilities
 # =========================
 
+
 def load_xgb_artifact(artifact_path: Path = ARTIFACT_PATH) -> Dict[str, Any]:
     """
     Load the trained XGB artifact from disk.
@@ -189,7 +205,9 @@ def load_xgb_artifact(artifact_path: Path = ARTIFACT_PATH) -> Dict[str, Any]:
     artifact = joblib.load(artifact_path)
     required_keys = {"model", "scaler", "feature_cols"}
     if not required_keys.issubset(artifact.keys()):
-        raise RuntimeError(f"[XGB] Artifact missing keys: {required_keys - set(artifact.keys())}")
+        raise RuntimeError(
+            f"[XGB] Artifact missing keys: {required_keys - set(artifact.keys())}"
+        )
     return artifact
 
 
@@ -197,16 +215,14 @@ def build_features_for_inference(
     df_raw: pd.DataFrame,
     feature_cols: List[str],
     horizon: int = 1,
+    session=None,
 ) -> pd.DataFrame:
     """
-    Build the SAME tabular features for inference as in training.
+    Build the SAME tabular features for inference as in training,
+    including sentiment join via feature_builder.
 
-    df_raw must contain at least:
+    df_raw must contain:
         ["symbol", "timestamp", "open", "high", "low", "close", "volume"]
-
-    Returns:
-        df_feat: DataFrame with feature_cols and "target_ret"
-                 (target_ret will typically be NaN at inference)
     """
     df = df_raw.copy()
     df["timestamp"] = pd.to_datetime(df["timestamp"], utc=True)
@@ -217,27 +233,38 @@ def build_features_for_inference(
     for sym, g in groups:
         g = g.sort_values("timestamp").copy()
 
-        # ✅ Same shared preprocessing as training
         g = apply_price_feature_config(g)
-
-        # XGB-specific extra returns (same as training)
         g["ret_4h"] = g["close"].pct_change(4)
         g["ret_12h"] = g["close"].pct_change(12)
 
-        # Reuse existing rolling vols, just ensure finite values
         if "roll_vol_12h" in g.columns:
             g["roll_vol_12h"] = g["roll_vol_12h"].fillna(g["roll_vol_12h"].median())
         if "roll_vol_24h" in g.columns:
             g["roll_vol_24h"] = g["roll_vol_24h"].fillna(g["roll_vol_24h"].median())
 
-        # At inference we usually don't have future prices, but keep the column
         g["target_ret"] = g["close"].shift(-horizon) / g["close"] - 1.0
 
         feats.append(g)
 
     df_feat = pd.concat(feats, axis=0).reset_index(drop=True)
 
-    # Don't drop on target_ret; but ensure all required feature_cols are valid.
+    # Join sentiment using a DB session (reuse if provided)
+    owns_session = False
+    if session is None:
+        session = SessionLocal()
+        owns_session = True
+    try:
+        df_feat = join_sentiment_features(
+            session=session,
+            df=df_feat,
+            symbol_col="symbol",
+            timestamp_col="timestamp",
+            fill_value=0.0,
+        )
+    finally:
+        if owns_session:
+            session.close()
+
     df_feat = df_feat.dropna(subset=feature_cols)
 
     return df_feat
@@ -250,14 +277,10 @@ def predict_xgb_from_raw(
     """
     High-level inference entrypoint.
 
-    1. Loads artifact (model + scaler + feature_cols).
-    2. Rebuilds tabular features from raw OHLCV (same logic as training).
-    3. Applies scaler and runs model.predict().
-    4. Returns predictions + the feature DataFrame (aligned by row).
-
-    Returns:
-        preds:    np.ndarray [N]
-        df_feat:  DataFrame with feature columns and original metadata (symbol, timestamp, etc.)
+    1. Load artifact (model + scaler + feature_cols).
+    2. Rebuild tabular features (price + sentiment).
+    3. Apply scaler and run model.predict().
+    4. Return predictions + feature DataFrame.
     """
     artifact = load_xgb_artifact(artifact_path)
     model = artifact["model"]
@@ -279,13 +302,13 @@ def predict_xgb_from_raw(
 # Training entrypoint
 # =========================
 
+
 def main():
-    logger.info("[XGB] ==== Training XGB core model ====")
+    logger.info("[XGB] ==== Training XGB core model (price + sentiment) ====")
     session = SessionLocal()
     try:
         df = _load_market_data(session, lookback_days=90)
-        X, y, feature_cols, _ = _build_features(df)
-
+        X, y, feature_cols, _ = _build_features(df, session)
         model, scaler, metrics = _train_xgb_model(X, y)
 
         artifact = {
@@ -299,7 +322,7 @@ def main():
     finally:
         session.close()
     logger.info("[XGB] Training complete.")
-
+    
 
 if __name__ == "__main__":
     main()

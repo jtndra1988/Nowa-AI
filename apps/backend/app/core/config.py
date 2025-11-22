@@ -46,6 +46,9 @@ class Settings(BaseSettings):
     BYBIT_TESTNET_API_KEY: str
     BYBIT_TESTNET_API_SECRET: str
     USE_BINANCE_FOR_DATA: bool = True
+    BINANCE_API_KEY:str
+    BINANCE_API_SECRET:str
+
     # --- Trading ---
     TRADING_MODE: str
 

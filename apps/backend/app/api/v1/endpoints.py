@@ -43,43 +43,43 @@ def get_active_assets(
     db: Session = Depends(get_db),
 ):
     """
-    Return at most `limit` base symbols that actually exist in the database.
-    Used to populate frontend asset selectors dynamically.
+    Return at most `limit` base symbols derived from SPOT market data.
+    Used to populate frontend asset selectors (NeonHeader search) with spot assets only.
     """
     try:
-        # 1. Try Futures
-        symbols = db.query(models.FuturesMarketData.symbol).distinct().all()
+        # 1. Use SPOT candles as the single source of truth
+        symbols = db.query(models.MarketData.symbol).distinct().all()
 
-        # 2. If empty, Try Spot
-        if not symbols:
-            symbols = db.query(models.MarketData.symbol).distinct().all()
-
-        # 3. If still empty, fallback
+        # If no spot data at all, fallback to a safe default
         if not symbols:
             return ["BTC", "ETH"][:limit]
 
-        # Clean up symbols (e.g., "BTC/USDT" -> "BTC")
         cleaned_assets: list[str] = []
         seen = set()
 
         for (sym,) in symbols:
-            base = (
-                sym.replace("/USDT", "")
-                .replace("USDT", "")
-                .replace("-PERP", "")
-                .upper()
-            )
+            if not sym:
+                continue
+            base = sym.upper()
+
+            # Normalize common formats: "BTC/USDT", "BTCUSDT", "BTC-USDT", "BTC-PERP"
+            for suffix in ("/USDT", "-USDT", "USDT", "-PERP"):
+                if base.endswith(suffix):
+                    base = base[: -len(suffix)]
+                    break
+
+            base = base.strip()
             if base and base not in seen:
                 seen.add(base)
                 cleaned_assets.append(base)
 
-        # Sort and cap to `limit`
         cleaned_assets = sorted(cleaned_assets)
         return cleaned_assets[:limit]
 
     except Exception as e:
-        logger.error(f"Failed to fetch active assets: {e}")
-        return ["BTC", "ETH"][:limit]  # Fail safe
+        logger.error(f"Failed to fetch active SPOT assets: {e}", exc_info=True)
+        # Fail-safe to a small spot list
+        return ["BTC", "ETH"][:limit]
 
 
 # --- EXISTING READ ENDPOINTS ---

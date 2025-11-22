@@ -9,8 +9,8 @@ import pandas as pd
 from torch.utils.data import DataLoader
 from torch.optim import AdamW
 from sqlalchemy import func
+
 from app.ml.feature_builder import join_sentiment_features
-# Internal imports
 from app.db.database import SessionLocal
 from app.db import models
 from app.ml.adv.models_tft import TemporalFusionTransformer
@@ -34,9 +34,7 @@ MODEL_VERSION = "v1.0"
 
 
 def load_training_data(days: int = 90) -> pd.DataFrame:
-    """
-    Load OHLCV training data from the DB for the last `days` days.
-    """
+    """Load OHLCV training data from the DB for the last `days` days."""
     session = SessionLocal()
     try:
         logger.info("Fetching training data from DB...")
@@ -75,7 +73,7 @@ def train():
     # 1. Data prep
     df = load_training_data(days=90)
 
-        # Apply shared feature engineering
+    # Apply shared feature engineering
     df_processed = df.groupby("symbol", group_keys=False).apply(apply_price_feature_config)
 
     # Join hourly sentiment features (composite / news / social / global)
@@ -85,8 +83,8 @@ def train():
     df_processed["target_price"] = (
         df_processed.groupby("symbol")["close"].shift(-1) / df_processed["close"] - 1
     )
-
     df_processed["target_vol"] = df_processed.groupby("symbol")["roll_vol_6h"].shift(-1)
+
     df_processed = df_processed.dropna()
 
     # 2. Dataset & loader
@@ -99,7 +97,6 @@ def train():
         roll_windows=[],
         seq_len=SEQ_LEN,
     )
-
     loader = DataLoader(ds, batch_size=BATCH_SIZE, shuffle=True)
 
     # 3. Model init
@@ -117,6 +114,14 @@ def train():
 
     optimizer = AdamW(model.parameters(), lr=LR)
 
+    # Loss config (shared across epochs)
+    price_loss_params = {
+        "alpha": 0.5,  # weight on MSE
+        "beta": 0.2,   # weight on directional penalty
+        "lam": 0.1,    # weight on Sharpe proxy
+    }
+    vol_weight = 0.2  # adjust if you want to down/up-weight vol task
+
     # 4. Training loop
     model.train()
     last_epoch_loss = None
@@ -125,12 +130,19 @@ def train():
         total_loss = 0.0
 
         for x_blocks, _, y_dict in loader:
+            # Move batch to device
             x_blocks = {k: v.to(DEVICE) for k, v in x_blocks.items()}
             y_dict = {k: v.to(DEVICE) for k, v in y_dict.items()}
 
             optimizer.zero_grad()
             pred = model(x_blocks)
-            loss_dict = multitask_transformer_loss(pred, y_dict)
+
+            loss_dict = multitask_transformer_loss(
+                pred,
+                y_dict,
+                price_loss_params=price_loss_params,
+                vol_weight=vol_weight,
+            )
             loss = loss_dict["total_loss"]
 
             loss.backward()
@@ -140,7 +152,9 @@ def train():
 
         epoch_loss = total_loss / len(loader)
         last_epoch_loss = epoch_loss
-        logger.info(f"[TFT] Epoch {epoch + 1}/{EPOCHS} | Loss: {epoch_loss:.4f}")
+        logger.info(
+            f"[TFT] Epoch {epoch + 1}/{EPOCHS} | Total: {epoch_loss:.4f}"
+        )
 
     # 5. Legacy full-model save (for TFTPredictor)
     ARTIFACT_DIR.mkdir(exist_ok=True, parents=True)

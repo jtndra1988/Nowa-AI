@@ -33,6 +33,8 @@ def _load_series(db_engine, table: str, symbol: str, limit: int) -> pd.DataFrame
     return pd.read_sql(sql, db_engine, params={"sym": symbol, "lim": limit}, parse_dates=["timestamp"])
 
 
+
+
 def _corre(a: pd.DataFrame, b: pd.DataFrame, window_mins: int) -> float:
     """Compute correlation on returns over a rolling window (using resampled closes)."""
     if a.empty or b.empty:
@@ -40,6 +42,14 @@ def _corre(a: pd.DataFrame, b: pd.DataFrame, window_mins: int) -> float:
     # Resample to align timestamps
     a = a.set_index("timestamp").resample(f"{window_mins}min").last()
     b = b.set_index("timestamp").resample(f"{window_mins}min").last()
+    
+    # --- FIX START: Normalize timezones ---
+    # Convert both to timezone-naive to avoid "tz-naive vs tz-aware" join errors
+    if a.index.tz is not None:
+        a.index = a.index.tz_localize(None)
+    if b.index.tz is not None:
+        b.index = b.index.tz_localize(None)
+    # --- FIX END ---
     
     # Join on index
     merged = a.join(b, how="inner", lsuffix="_a", rsuffix="_b").dropna()
@@ -51,7 +61,6 @@ def _corre(a: pd.DataFrame, b: pd.DataFrame, window_mins: int) -> float:
     merged["ret_b"] = merged["close_b"].pct_change()
     
     return float(merged["ret_a"].corr(merged["ret_b"]) or 0.0)
-
 
 def _load_macro(indicator: str, limit: int = 3000) -> pd.DataFrame:
     """

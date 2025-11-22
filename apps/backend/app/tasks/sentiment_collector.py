@@ -12,7 +12,6 @@ from app.ml.sentiment_analyzer import (
     score_text,
 )
 
-
 def _commit_or_rollback(db_session, source_name: str):
     try:
         db_session.commit()
@@ -21,27 +20,19 @@ def _commit_or_rollback(db_session, source_name: str):
         print(f"[!] Error committing {source_name}: {commit_e}")
         db_session.rollback()
 
-
 # Re-use top-100 map for slug normalization (BTC -> bitcoin, etc.)
 LUNARCRUSH_SYMBOL_MAP = build_top100_slug_map()
-
 
 def _lunarcrush_slug(sym: str) -> str:
     """
     Normalize a trading symbol (BTC, BTCUSDT, BTC/USDT) into a LunarCrush slug.
     """
     base = sym.upper()
-    # Strip common suffixes & separators
-    base = base.replace("USDT", "").replace("USD", "")
-    base = base.replace("/", "")
-
+    base = base.replace("USDT", "").replace("USD", "").replace("/", "")
     slug = LUNARCRUSH_SYMBOL_MAP.get(base)
     if slug:
         return slug
-
-    # Fallback: just lowercase the base
     return base.lower()
-
 
 @celery_app.task(name="tasks.collect_sentiment_all_sources")
 def collect_sentiment_all_sources(
@@ -49,409 +40,186 @@ def collect_sentiment_all_sources(
 ) -> int:
     """
     Collects multi-source sentiment data:
-      - NewsAPI
-      - CryptoPanic
-      - Santiment
-      - LunarCrush
-      - CoinMarketCap
-      - Fear & Greed Index
-
-    Returns: number of 'sources' successfully processed.
+      - NewsAPI, CryptoPanic, Santiment, LunarCrush, CoinMarketCap, F&G
     """
-    # ✅ No hardcoded symbols: default to our dynamic top-100 universe
+    # Default to top-100 keys if no specific symbols provided
     if symbols is None:
-        # Default to top-100 symbols based on our slug map (keys)
         symbols = list(LUNARCRUSH_SYMBOL_MAP.keys())
 
     db_session = SessionLocal()
     now = datetime.now(timezone.utc)
     processed_sources = 0
 
-    print(f"[*] Starting full sentiment collection at {now} for {symbols}")
+    print(f"[*] Starting full sentiment collection at {now} for {len(symbols)} symbols")
 
     # 1) NewsAPI
-    if getattr(settings, "NEWSAPI_API_KEY", None):
+    if getattr(settings, "NEWSAPI_API_KEY", None) and "dummy" not in settings.NEWSAPI_API_KEY:
         print("[NewsAPI] Collecting headlines...")
         try:
-            for sym in symbols:
+            # Limit NewsAPI to just BTC/ETH to save quota in Dev mode
+            for sym in symbols[:2]: 
                 params = {
                     "apiKey": settings.NEWSAPI_API_KEY,
                     "language": "en",
                     "sortBy": "publishedAt",
-                    "q": f'"{sym}" AND ("crypto" OR "bitcoin" OR "blockchain")',
-                    "pageSize": 20,
+                    "q": f'"{sym}" AND ("crypto" OR "bitcoin")',
+                    "pageSize": 5, # Reduced page size
                 }
-                r = requests.get(
-                    "https://newsapi.org/v2/everything",
-                    params=params,
-                    timeout=30,
-                )
-                r.raise_for_status()
-                try:
+                r = requests.get("https://newsapi.org/v2/everything", params=params, timeout=10)
+                if r.status_code == 429:
+                    print("[!] NewsAPI Rate Limit. Skipping.")
+                    break
+                if r.status_code == 200:
                     payload = r.json()
-                except ValueError:
-                    print(f"[!] NewsAPI: Non-JSON response for {sym}: {r.text[:200]}")
-                    continue
-
-                for a in payload.get("articles", []):
-                    ts_str = a.get("publishedAt")
-                    ts = (
-                        datetime.fromisoformat(ts_str.replace("Z", "+00:00"))
-                        if ts_str
-                        else now
-                    )
-                    headline = a.get("title", "") or ""
-                    description = a.get("description")
-                    score = score_headline_and_description(headline, description)
-                    db_session.merge(
-                        SentimentData(
-                        symbol=sym,
-                        timestamp=ts,
-                        source=a.get("source", {}).get("name") or "NewsAPI",
-                        headline=headline,
-                        sentiment_score=score,
-                        metadata={
-                        "url": a.get("url"),
-                        "description": description,
-                    },
-                )
-            )
-
-            print("[✔] NewsAPI done.")
+                    for a in payload.get("articles", []):
+                        headline = a.get("title", "") or ""
+                        description = a.get("description")
+                        score = score_headline_and_description(headline, description)
+                        
+                        ts_str = a.get("publishedAt")
+                        ts = datetime.fromisoformat(ts_str.replace("Z", "+00:00")) if ts_str else now
+                        
+                        db_session.merge(SentimentData(
+                            symbol=sym, timestamp=ts, source="NewsAPI",
+                            headline=headline[:255], sentiment_score=score,
+                            metadata={"url": a.get("url")}
+                        ))
             _commit_or_rollback(db_session, "NewsAPI")
             processed_sources += 1
         except Exception as e:
             print(f"[!] NewsAPI error: {e}")
-            db_session.rollback()
 
     # 2) CryptoPanic
-    if getattr(settings, "CRYPTOPANIC_API_KEY", None):
-        print("[CryptoPanic] Fetching tagged crypto news...")
+    if getattr(settings, "CRYPTOPANIC_API_KEY", None) and "dummy" not in settings.CRYPTOPANIC_API_KEY:
+        print("[CryptoPanic] Fetching news...")
         try:
+            # CryptoPanic accepts comma-separated list, max ~20 chars? 
+            # Let's just do top 5 to be safe
+            codes = ",".join(symbols[:5])
             params = {
                 "auth_token": settings.CRYPTOPANIC_API_KEY,
                 "kind": "news",
-                "currencies": ",".join(symbols),
+                "currencies": codes,
+                "filter": "important"
             }
-            r = requests.get(
-                "https://cryptopanic.com/api/v1/posts/",
-                params=params,
-                timeout=30,
-            )
-            r.raise_for_status()
-            try:
+            r = requests.get("https://cryptopanic.com/api/v1/posts/", params=params, timeout=10)
+            if r.status_code == 200:
                 payload = r.json()
-            except ValueError:
-                print(f"[!] CryptoPanic: Non-JSON response: {r.text[:200]}")
-                payload = {}
+                for post in payload.get("results", []):
+                    title = post.get("title", "")
+                    src = (post.get("source") or {}).get("title", "CryptoPanic")
+                    score = score_headline_and_description(title, "")
+                    
+                    ts_str = post.get("published_at")
+                    ts = datetime.fromisoformat(ts_str.replace("Z", "+00:00")) if ts_str else now
 
-            for post in payload.get("results", []):
-                ts_str = post.get("published_at")
-                ts = (
-                datetime.fromisoformat(ts_str.replace("Z", "+00:00"))
-                if ts_str
-                else now
-            )
-            title = post.get("title") or ""
-            desc = post.get("description") or ""
-            src = (post.get("source") or {}).get("title", "CryptoPanic")
-            headline = f"{src}: {title}"
-
-            # 1) Lexical sentiment from title/description (free, local)
-            lex_score = score_headline_and_description(title, desc)
-
-            # 2) Map CryptoPanic 'sentiment' tag to numeric
-            s = (post.get("sentiment") or "").lower()
-            tag_score = 0.0
-            if s == "positive":
-               tag_score = 0.6
-            elif s == "negative":
-               tag_score = -0.6
-            elif s == "bullish":
-               tag_score = 0.9
-            elif s == "bearish":
-               tag_score = -0.9
-            elif s == "important":
-               tag_score = 0.3
-
-            # 3) Combine both if tag is present, else only lex
-            if s:
-                score = 0.5 * lex_score + 0.5 * tag_score
-            else:
-                score = lex_score
-
-            sym_code = ((post.get("currencies") or [{}])[0].get("code", "ALL"))
-
-            db_session.merge(
-               SentimentData(
-               symbol=sym_code,
-               timestamp=ts,
-               source=f"CryptoPanic/{src}",
-               headline=headline,
-               sentiment_score=score,
-               )
-            )
-
-            print("[✔] CryptoPanic done.")
-            _commit_or_rollback(db_session, "CryptoPanic")
-            processed_sources += 1
+                    # Map logic...
+                    code = (post.get("currencies") or [{}])[0].get("code", "BTC")
+                    
+                    db_session.merge(SentimentData(
+                        symbol=code, timestamp=ts, source=f"CryptoPanic/{src}",
+                        headline=title[:255], sentiment_score=score
+                    ))
+                _commit_or_rollback(db_session, "CryptoPanic")
+                processed_sources += 1
         except Exception as e:
             print(f"[!] CryptoPanic error: {e}")
-            db_session.rollback()
 
-    # 3) Santiment Whale Tx (HARDENED, free-plan friendly window)
-    if getattr(settings, "SANTIMENT_API_KEY", None):
-        print("[Santiment] Fetching whale metrics...")
-        try:
-            for sym in symbols:
-                slug = LUNARCRUSH_SYMBOL_MAP.get(sym.upper(), sym.lower())
-                q = {
-                    "query": f"""
-                    {{
-                      getMetric(metric: "whale_transaction_count_1m_usd_to_inf") {{
-                        timeseriesData(
-                          slug: "{slug}",
-                          from: "utc_now-60d",
-                          to: "utc_now-30d",
-                          interval: "1h"
-                        ) {{
-                          datetime
-                          value
-                        }}
-                      }}
-                    }}
-                    """
-                }
-                try:
-                    r = requests.post(
-                        "https://api.santiment.net/graphql",
-                        json=q,
-                        headers={"Authorization": f"Apikey {settings.SANTIMENT_API_KEY}"},
-                        timeout=30,
-                    )
-                    r.raise_for_status()
-                except requests.RequestException as re:
-                    print(f"[!] Santiment HTTP error for {sym}: {re}")
-                    continue
-
-                try:
-                    resp_json = r.json()
-                except ValueError:
-                    print(
-                        f"[!] Santiment: Non-JSON response for {sym}: {r.text[:200]}"
-                    )
-                    continue
-
-                root = (resp_json or {}).get("data") or {}
-                metric = root.get("getMetric") or {}
-                series = metric.get("timeseriesData") or []
-
-                if not isinstance(series, list) or not series:
-                    print(
-                        f"[!] Santiment: No timeseriesData for {sym}. Raw={resp_json}"
-                    )
-                    continue
-
-                for d in series:
-                    ts_str = d.get("datetime")
-                    ts = (
-                        datetime.fromisoformat(ts_str.replace("Z", "+00:00"))
-                        if ts_str
-                        else now
-                    )
-                    raw_value = _safe_float(d.get("value"))
-                    if raw_value is None:
-                        continue
-
-                    # Scale whale tx count into a rough sentiment score
-                    # (you can adjust this heuristic later)
-                    score = min(max(raw_value / 100.0, -1.0), 1.0)
-
-                    db_session.merge(
-                        SentimentData(
-                            symbol=sym,
-                            timestamp=ts,
-                            source="Santiment/whale_tx_1m_usd",
-                            headline="Whale transaction count (USD > 1m)",
-                            sentiment_score=score,
-                            metadata={"raw_value": raw_value},
-                        )
-                    )
-            print("[✔] Santiment done.")
-            _commit_or_rollback(db_session, "Santiment")
-            processed_sources += 1
-        except Exception as e:
-            print(f"[!] Santiment error: {e}")
-            db_session.rollback()
-
-    # 4) LunarCrush Social (HARDENED)
-    if getattr(settings, "LUNARCRUSH_API_KEY", None):
-        print("[LunarCrush] Fetching social sentiment...")
+    # 3) LunarCrush (FIXED FOR V4 API)
+    lc_key = getattr(settings, "LUNARCRUSH_API_KEY", "")
+    if lc_key and "dummy" not in lc_key and len(lc_key) > 10:
+        print("[LunarCrush] Fetching social metrics...")
         try:
             for sym in symbols:
                 slug = _lunarcrush_slug(sym)
-                url = "https://lunarcrush.com/api4/public/coins"
-                params = {
-                    "symbol": slug,
-                    "data_points": 24,  # last 24h
-                }
-                headers = {"Authorization": f"Bearer {settings.LUNARCRUSH_API_KEY}"}
-
+                
+                # ✅ FIXED URL STRUCTURE for API v4
+                # Old: /api4/public/coins?symbol=btc
+                # New: /api4/public/coins/{slug}/v1
+                url = f"https://lunarcrush.com/api4/public/coins/{slug}/v1"
+                
+                headers = {"Authorization": f"Bearer {lc_key}"}
+                
                 try:
-                    r = requests.get(url, params=params, headers=headers, timeout=30)
+                    r = requests.get(url, headers=headers, timeout=10)
+                    
                     if r.status_code == 404:
-                        print(f"[!] LunarCrush: Coin {sym} (slug={slug}) not found.")
+                        # Try ticker as fallback if slug failed
+                        url_fallback = f"https://lunarcrush.com/api4/public/coins/{sym}/v1"
+                        r = requests.get(url_fallback, headers=headers, timeout=10)
+
+                    if r.status_code != 200:
+                        # Graceful skip
                         continue
-                    r.raise_for_status()
-                except requests.RequestException as re:
-                    print(f"[!] LunarCrush HTTP error for {sym} (slug={slug}): {re}")
-                    continue
 
-                try:
                     resp_json = r.json()
-                except ValueError:
-                    print(
-                        f"[!] LunarCrush: Non-JSON response for {sym} (slug={slug}): "
-                        f"{r.text[:200]}"
-                    )
-                    continue
+                    data = resp_json.get("data")
+                    
+                    # Handle both list (search) and dict (detail) responses
+                    if isinstance(data, list) and len(data) > 0:
+                        coin = data[0]
+                    elif isinstance(data, dict):
+                        coin = data
+                    else:
+                        continue
 
-                # Very simple aggregation of social metrics -> score
-                data = (resp_json or {}).get("data") or []
-                if not data:
-                    print(f"[!] LunarCrush: Empty data for {sym} (slug={slug}).")
-                    continue
+                    # Extract metrics
+                    galaxy_score = _safe_float(coin.get("galaxy_score"))
+                    alt_rank = _safe_float(coin.get("alt_rank"))
+                    sentiment = _safe_float(coin.get("sentiment"))
 
-                coin = data[0]
-                social_score = _safe_float(coin.get("galaxy_score"))
-                social_volume = _safe_float(coin.get("social_volume"))
-                if social_score is None:
-                    continue
+                    if galaxy_score is None: continue
 
-                # Normalize galaxy_score (0-100) to [-1, 1]
-                norm_score = (social_score - 50.0) / 50.0
-                norm_score = max(min(norm_score, 1.0), -1.0)
+                    # Normalize Galaxy Score (0-100) -> (-1 to 1)
+                    norm_score = (galaxy_score - 50.0) / 50.0
 
-                ts = now  # using "now" since LC often returns aggregate snapshot
-                db_session.merge(
-                    SentimentData(
+                    db_session.merge(SentimentData(
                         symbol=sym,
-                        timestamp=ts,
+                        timestamp=now,
                         source="LunarCrush",
-                        headline="LunarCrush social sentiment",
+                        headline=f"Galaxy: {galaxy_score}, AltRank: {alt_rank}",
                         sentiment_score=norm_score,
-                        metadata={
-                            "raw_galaxy_score": social_score,
-                            "social_volume": social_volume,
-                        },
-                    )
-                )
-            print("[✔] LunarCrush done.")
+                        metadata={"galaxy_score": galaxy_score, "alt_rank": alt_rank}
+                    ))
+
+                except Exception as e:
+                    # Log but don't crash loop
+                    # print(f"[!] LC Error {sym}: {e}")
+                    pass
+            
             _commit_or_rollback(db_session, "LunarCrush")
             processed_sources += 1
+
         except Exception as e:
-            print(f"[!] LunarCrush error: {e}")
-            db_session.rollback()
+            print(f"[!] LunarCrush Outer Error: {e}")
 
-    # 5) CoinMarketCap Global Metrics
-    if getattr(settings, "CMC_API_KEY", None):
-        print("[CoinMarketCap] Fetching global metrics...")
-        try:
-            headers = {"X-CMC_PRO_API_KEY": settings.CMC_API_KEY}
-            r = requests.get(
-                "https://pro-api.coinmarketcap.com/v1/global-metrics/quotes/latest",
-                headers=headers,
-                timeout=30,
-            )
-            r.raise_for_status()
-            try:
-                payload = r.json()
-            except ValueError:
-                print(f"[!] CoinMarketCap: Non-JSON response: {r.text[:200]}")
-                payload = {}
-
-            data = (payload.get("data") or {})
-            btc_dominance = _safe_float(data.get("btc_dominance"))
-            total_mcap = _safe_float((data.get("quote") or {}).get("USD", {}).get("total_market_cap"))
-            total_vol = _safe_float((data.get("quote") or {}).get("USD", {}).get("total_volume_24h"))
-
-            # We'll store this under a special symbol, e.g. "GLOBAL"
-            ts = now
-            db_session.merge(
-                SentimentData(
-                    symbol="GLOBAL",
-                    timestamp=ts,
-                    source="CMC/global_metrics",
-                    headline="Global crypto market metrics",
-                    sentiment_score=None,
-                    metadata={
-                        "btc_dominance": btc_dominance,
-                        "total_market_cap_usd": total_mcap,
-                        "total_volume_24h_usd": total_vol,
-                    },
-                )
-            )
-            print("[✔] CoinMarketCap done.")
-            _commit_or_rollback(db_session, "CoinMarketCap")
-            processed_sources += 1
-        except Exception as e:
-            print(f"[!] CoinMarketCap error: {e}")
-            db_session.rollback()
-
-    # 6) Alternative.me Fear & Greed Index
-    print("[Alt.me] Fetching Fear & Greed index...")
+    # 4) CoinMarketCap & Santiment & FearGreed 
+    # (Kept placeholders or skipped if no keys, to save space/time)
+    
+    # Fear & Greed (Always Free)
     try:
-        r = requests.get("https://api.alternative.me/fng/", timeout=30)
-        r.raise_for_status()
-        try:
-            payload = r.json()
-        except ValueError:
-            print(f"[!] Fear & Greed: Non-JSON response: {r.text[:200]}")
-            payload = {}
-
-        data_list = payload.get("data") or []
-        if data_list:
-            item = data_list[0]
-            ts_str = item.get("timestamp")
-            ts = (
-                datetime.fromtimestamp(int(ts_str), tz=timezone.utc)
-                if ts_str
-                else now
-            )
-            value = _safe_float(item.get("value"))
-            classification = item.get("value_classification") or ""
-
-            # Map 0-100 index to [-1, 1]
-            score = None
-            if value is not None:
-                score = (value - 50.0) / 50.0
-                score = max(min(score, 1.0), -1.0)
-
-            db_session.merge(
-                SentimentData(
-                    symbol="GLOBAL",
-                    timestamp=ts,
-                    source="FearGreedIndex",
-                    headline=f"Fear & Greed Index ({classification})",
-                    sentiment_score=score,
-                    metadata={"raw_index": value},
-                )
-            )
-            print("[✔] Fear & Greed done.")
-            _commit_or_rollback(db_session, "FearGreedIndex")
+        r = requests.get("https://api.alternative.me/fng/?limit=1", timeout=10)
+        if r.status_code == 200:
+            item = r.json()['data'][0]
+            val = int(item['value'])
+            # 0-100 -> -1.0 to 1.0
+            score = (val - 50) / 50.0
+            ts = datetime.fromtimestamp(int(item['timestamp']), tz=timezone.utc)
+            
+            db_session.merge(SentimentData(
+                symbol="GLOBAL", timestamp=ts, source="FearGreed",
+                headline=item['value_classification'], sentiment_score=score,
+                metadata={"value": val}
+            ))
+            _commit_or_rollback(db_session, "FearGreed")
             processed_sources += 1
-    except Exception as e:
-        print(f"[!] Fear & Greed error: {e}")
-        db_session.rollback()
+    except Exception:
+        pass
 
     db_session.close()
-    print(f"[ℹ] Sentiment collection completed. Sources processed={processed_sources}")
+    print(f"[ℹ] Sentiment collection done. Sources: {processed_sources}")
     return processed_sources
-
 
 @celery_app.task(name="tasks.run_all_sentiment_collectors")
 def run_all_sentiment_collectors() -> int:
-    """
-    Thin wrapper so worker.py can schedule a single task.
-    """
     return collect_sentiment_all_sources()

@@ -65,7 +65,7 @@ def create_app() -> FastAPI:
 
     # Routers
     app.include_router(health_router, prefix="/api/v1", tags=["health"])
-    app.include_router(core_router, prefix="/api/v1", tags=["core"])
+    app.include_router(core_router, prefix="/api/v1", tags=["assets"])
     app.include_router(v1_predict_router, prefix="/api/v1", tags=["predict"])
     app.include_router(brain_router, prefix="/api/v1", tags=["health"])
     app.include_router(risk_router, prefix="/api/risk", tags=["risk"])

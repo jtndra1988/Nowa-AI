@@ -7,41 +7,42 @@ export type SymbolCode = string;
 export const EXCHANGES = ["Binance", "OKX", "Bybit", "Deribit", "Kraken"] as const;
 export type ExchangeCode = (typeof EXCHANGES)[number];
 
-export type Asset =
-  | "BTC" | "ETH" | "SOL" | "BNB" | "XRP" | "ADA" | "DOGE" | "TRX" | "TON"
-  | "DOT" | "MATIC" | "LTC" | "SHIB" | "AVAX" | "LINK" | "UNI" | "ATOM"
-  | "XLM" | "ETC" | "AAVE" | "NEAR" | "OP" | "ARB" | "ICP" | "HBAR" | "SUI"
-  | "APT" | "FIL" | "RNDR" | "TIA" | "INJ" | "FTM" | "GRT" | "EGLD" | "KAS"
-  | "SEI" | "ALGO" | "IMX" | "MKR" | "RUNE" | "QNT" | "FLOW" | "BCH"
-  | "PEPE" | "WIF" | "JTO" | "PYTH" | "JUP" | "SAND" | "MANA" | "AXS" | "ENS"
-  | "DYDX" | "SFP" | "XMR" | "ZEC" | "GMT" | "WLD" | "LDO" | "BLUR" | "ZRX"
-  | "CELR" | "STX" | "BAT" | "1INCH" | "COMP" | "CRV" | "KAVA" | "KLAY"
-  | "CELO" | "CHZ" | "SNX" | "SKL" | "AR" | "ROSE" | "ANKR" | "GMX" | "APE"
-  | "OND" | "STRK" | "AEVO" | "ALT" | "TAO" | "ORDI" | "BONK" | "NEO"
-  | "IOTA" | "XEC" | "TFUEL" | "THETA" | "PYR" | "GHST" | "OCEAN" | "GLM"
-  | "CKB";
+// Relaxed Asset type to string to allow dynamic lists
+export type Asset = string;
 
+// Initial Fallback (Used before API loads)
 export const ALL_ASSETS: Asset[] = [
-  "BTC", "ETH", "SOL", "BNB", "XRP", "ADA", "DOGE", "TRX", "TON",
-  "DOT", "MATIC", "LTC", "SHIB", "AVAX", "LINK", "UNI", "ATOM",
-  "XLM", "ETC", "AAVE", "NEAR", "OP", "ARB", "ICP", "HBAR", "SUI",
-  "APT", "FIL", "RNDR", "TIA", "INJ", "FTM", "GRT", "EGLD", "KAS",
-  "SEI", "ALGO", "IMX", "MKR", "RUNE", "QNT", "FLOW", "BCH",
-  "PEPE", "WIF", "JTO", "PYTH", "JUP", "SAND", "MANA", "AXS", "ENS",
-  "DYDX", "SFP", "XMR", "ZEC", "GMT", "WLD", "LDO", "BLUR", "ZRX",
-  "CELR", "STX", "BAT", "1INCH", "COMP", "CRV", "KAVA", "KLAY",
-  "CELO", "CHZ", "SNX", "SKL", "AR", "ROSE", "ANKR", "GMX", "APE",
-  "OND", "STRK", "AEVO", "ALT", "TAO", "ORDI", "BONK", "NEO",
-  "IOTA", "XEC", "TFUEL", "THETA", "PYR", "GHST", "OCEAN", "GLM",
-  "CKB"
+  "BTC",
+  "ETH",
+  "SOL",
+  "BNB",
+  "XRP",
+  "DOGE",
+  "TON",
+  "ADA",
+  "AVAX",
+  "LINK",
 ];
-
-export const TOP_ASSETS: Asset[] = [
-  "BTC","ETH","SOL","BNB","XRP","ADA","DOGE","TRX","TON","DOT",
-  "MATIC","LTC","SHIB","AVAX","LINK","UNI","ATOM","XLM","ETC","AAVE",
-];
+export const TOP_ASSETS: Asset[] = ALL_ASSETS;
 
 export const MOCK = false;
+
+// --- Dynamic Asset Fetcher (Top 10 from backend) ---
+export async function fetchActiveAssets(): Promise<string[]> {
+  const base = process.env.NEXT_PUBLIC_API_BASE || "http://localhost:8000";
+  try {
+    const res = await fetch(`${base}/api/v1/assets?limit=10`, {
+      method: "GET",
+      cache: "no-store",
+    });
+    if (!res.ok) throw new Error("Failed to fetch assets");
+    return await res.json();
+  } catch (e) {
+    console.warn("Asset fetch failed, using fallback:", e);
+    // Fallback is also just 10 assets
+    return ALL_ASSETS;
+  }
+}
 
 // --- Types ---
 export type FeatureImportance = { name: string; weight: number };
@@ -98,7 +99,7 @@ export type MarketIntel = {
   cvdHistory: SimpleSeriesPoint[];
   correlations: CorrelationPoint[];
   radar: RadarIntel;
-  sentimentBreakdown?: SentimentBreakdown; // NEW
+  sentimentBreakdown?: SentimentBreakdown;
 };
 
 
@@ -144,7 +145,7 @@ export type Order = {
   timestamp: string;
 };
 
-// --- NEW: Types for System Health ---
+// --- System Health Types ---
 export type SystemStatus = {
   status: "OK" | "DEGRADED" | "DOWN";
   api_latency: number;
@@ -176,7 +177,6 @@ export type ServiceHealth = {
 };
 
 // --- Helpers ---
-const clamp = (v: number, lo: number, hi: number) => Math.max(lo, Math.min(hi, v));
 const rand = () => Math.random();
 const pick = <T,>(xs: readonly T[]): T => xs[Math.floor(rand() * xs.length)];
 const randomId = () => Math.random().toString(36).slice(2);
@@ -191,8 +191,6 @@ const basePriceFor = (symbol: string): number => {
   if (s.startsWith("BTC")) return 68000;
   if (s.startsWith("ETH")) return 3200;
   if (s.startsWith("SOL")) return 180;
-  if (s.startsWith("BNB")) return 600;
-  if (s.startsWith("XRP")) return 0.6;
   return 100;
 };
 
@@ -337,70 +335,35 @@ export async function placeOrder(params: PlaceOrderParams): Promise<Order> {
 // --- System Health & Status (backend snapshot) ---
 function normalizeService(svc: any | undefined): ServiceHealth | undefined {
   if (!svc) return undefined;
-
   const raw = (svc.status ?? "unknown").toString().toLowerCase();
-  let status: ServiceStatus;
-  if (raw === "ok" || raw === "degraded" || raw === "down") {
-    status = raw as ServiceStatus;
-  } else {
-    status = "unknown";
-  }
-
   return {
-    status,
+    status: (raw === "ok" || raw === "degraded" || raw === "down") ? raw as ServiceStatus : "unknown",
     detail: svc.detail,
   };
 }
 
 function normalizeSystemSnapshot(raw: any, latency: number): SystemStatus {
-  // 1) Overall status – supports both new & old payloads
   let status: SystemStatus["status"] = "DOWN";
-
   if (typeof raw.status === "string") {
     const up = raw.status.toUpperCase();
-    if (up === "OK" || up === "DEGRADED" || up === "DOWN") {
-      status = up as SystemStatus["status"];
-    }
-  } else if (typeof raw.backend_api === "string") {
-    const v = raw.backend_api.toLowerCase();
-    status = v === "ok" ? "OK" : v === "degraded" ? "DEGRADED" : "DOWN";
+    if (up === "OK" || up === "DEGRADED" || up === "DOWN") status = up as SystemStatus["status"];
   }
 
-  // 2) Brain flags – support different field names
   const brainSource = raw.brain || raw;
   const brain = {
-  ready:
-    Boolean(brainSource.ready) ||
-    brainSource.ai_brain === "ready" ||
-    Boolean(brainSource.is_ready),
-
-  l2_model:
-    Boolean(brainSource.l2_model) ||
-    Boolean(brainSource.l2_ensemble) ||
-    Boolean(brainSource.has_l2_models),
-
-  llm_engine:
-    Boolean(brainSource.llm_engine) ||
-    Boolean(brainSource.llm_ready),
-
-  rl_agent:
-    Boolean(brainSource.rl_agent) ||
-    Boolean(brainSource.rl_ready),
-};
-
-
-  // 3) Resources
-  const resourcesRaw = raw.resources || {};
-  const resources = {
-    cpu_load:
-      typeof resourcesRaw.cpu_load === "number" ? resourcesRaw.cpu_load : 0,
-    ram_usage:
-      typeof resourcesRaw.ram_usage === "number" ? resourcesRaw.ram_usage : 0,
-    gpu_util:
-      typeof resourcesRaw.gpu_util === "number" ? resourcesRaw.gpu_util : 0,
+    ready: Boolean(brainSource.ready || brainSource.ai_brain === "ready" || brainSource.is_ready),
+    l2_model: Boolean(brainSource.l2_model || brainSource.l2_ensemble),
+    llm_engine: Boolean(brainSource.llm_engine || brainSource.llm_ready),
+    rl_agent: Boolean(brainSource.rl_agent || brainSource.rl_ready),
   };
 
-  // 4) Services (DB / Redis / Celery / Binance / LLM)
+  const resourcesRaw = raw.resources || {};
+  const resources = {
+    cpu_load: resourcesRaw.cpu_load || 0,
+    ram_usage: resourcesRaw.ram_usage || 0,
+    gpu_util: resourcesRaw.gpu_util || 0,
+  };
+
   const servicesRaw = raw.services || {};
   const services: SystemStatus["services"] = {
     db: normalizeService(servicesRaw.db),
@@ -416,50 +379,28 @@ function normalizeSystemSnapshot(raw: any, latency: number): SystemStatus {
     brain,
     resources,
     services,
-    timestamp: raw.timestamp || raw.time || new Date().toISOString(),
+    timestamp: raw.timestamp || new Date().toISOString(),
   };
 }
 
 export async function getSystemStatus(): Promise<SystemStatus> {
   const start = performance.now();
-  const apiBase =
-    process.env.NEXT_PUBLIC_API_BASE || "http://localhost:8000";
+  const apiBase = process.env.NEXT_PUBLIC_API_BASE || "http://localhost:8000";
   const url = `${apiBase.replace(/\/$/, "")}/api/v1/system-health`;
 
   try {
-    const res = await fetch(url, {
-      method: "GET",
-      // no headers => no CORS preflight
-      cache: "no-store",
-    });
-
-    if (!res.ok) {
-      throw new Error(`HTTP ${res.status}`);
-    }
-
+    const res = await fetch(url, { method: "GET", cache: "no-store" });
+    if (!res.ok) throw new Error(`HTTP ${res.status}`);
     const raw = await res.json();
     const latency = Math.round(performance.now() - start);
-
     return normalizeSystemSnapshot(raw, latency);
   } catch (e) {
     const latency = Math.round(performance.now() - start);
-    console.error("getSystemStatus failed", e);
-
-    // Fallback so UI still renders something
     return {
       status: "DOWN",
       api_latency: latency,
-      brain: {
-        ready: false,
-        l2_model: false,
-        llm_engine: false,
-        rl_agent: false,
-      },
-      resources: {
-        cpu_load: 0,
-        ram_usage: 0,
-        gpu_util: 0,
-      },
+      brain: { ready: false, l2_model: false, llm_engine: false, rl_agent: false },
+      resources: { cpu_load: 0, ram_usage: 0, gpu_util: 0 },
       services: {},
       timestamp: new Date().toISOString(),
     };
@@ -470,76 +411,47 @@ export async function getSystemStatus(): Promise<SystemStatus> {
 function normalizeSystemSnapshotFromSSE(raw: any): SystemStatus {
   const brain = {
     ready: Boolean(raw.ai_ready ?? raw.is_ready),
-    l2_model: Boolean(raw.l2 ?? raw.l2_model ?? raw.has_l2_models),
-    llm_engine: Boolean(raw.llm ?? raw.llm_engine ?? raw.llm_ready),
-    rl_agent: Boolean(raw.rl ?? raw.rl_agent ?? raw.rl_ready),
+    l2_model: Boolean(raw.l2 ?? raw.l2_model),
+    llm_engine: Boolean(raw.llm ?? raw.llm_engine),
+    rl_agent: Boolean(raw.rl ?? raw.rl_agent),
   };
 
   const resourcesRaw = raw.resources || {};
   const resources = {
-    cpu_load:
-      typeof resourcesRaw.cpu_load === "number" ? resourcesRaw.cpu_load : 0,
-    ram_usage:
-      typeof resourcesRaw.ram_usage === "number" ? resourcesRaw.ram_usage : 0,
-    gpu_util:
-      typeof resourcesRaw.gpu_util === "number" ? resourcesRaw.gpu_util : 0,
+    cpu_load: resourcesRaw.cpu_load || 0,
+    ram_usage: resourcesRaw.ram_usage || 0,
+    gpu_util: resourcesRaw.gpu_util || 0,
   };
 
-  const status: SystemStatus["status"] = brain.ready ? "OK" : "DOWN";
-
   return {
-    status,
-    api_latency: 0, // SSE doesn't give per-sample latency
+    status: brain.ready ? "OK" : "DOWN",
+    api_latency: 0,
     brain,
     resources,
     services: {},
-    timestamp:
-      raw.timestamp ||
-      (raw.ts
-        ? new Date(raw.ts * 1000).toISOString()
-        : new Date().toISOString()),
+    timestamp: raw.timestamp || new Date().toISOString(),
   };
 }
 
-export function subscribeSystemStream(
-  onUpdate: (snapshot: SystemStatus) => void,
-  onError?: (err: any) => void
-): () => void {
-  const apiBase =
-    process.env.NEXT_PUBLIC_API_BASE || "http://localhost:8000";
+export function subscribeSystemStream(onUpdate: (snapshot: SystemStatus) => void, onError?: (err: any) => void): () => void {
+  const apiBase = process.env.NEXT_PUBLIC_API_BASE || "http://localhost:8000";
   const url = `${apiBase.replace(/\/$/, "")}/api/v1/system-stream`;
-
   let es: EventSource | null = null;
 
   try {
     es = new EventSource(url, { withCredentials: false });
-  } catch (e) {
-    console.error("Failed to create EventSource", e);
-    onError?.(e);
-    return () => {};
-  }
+    es.onmessage = (ev) => {
+      try {
+        onUpdate(normalizeSystemSnapshotFromSSE(JSON.parse(ev.data)));
+      } catch (e) { console.error(e); }
+    };
+    es.onerror = (err) => { onError?.(err); es?.close(); };
+  } catch (e) { onError?.(e); }
 
-  es.onmessage = (ev) => {
-    try {
-      const raw = JSON.parse(ev.data);
-      const snap = normalizeSystemSnapshotFromSSE(raw);
-      onUpdate(snap);
-    } catch (e) {
-      console.error("Failed to parse system-stream event", e);
-    }
-  };
-
-  es.onerror = (err) => {
-    console.error("system-stream SSE error", err);
-    onError?.(err);
-    es?.close();
-  };
-
-  return () => {
-    es?.close();
-  };
+  return () => es?.close();
 }
-// --- Mocks for other data ---
+
+// --- Mocks & Wrappers ---
 export function streamPredict(asset: string, cb: (p: Partial<PredictResponse>) => void): () => void {
   const s = formatSymbol(asset, "futures");
   cb(mockPredict(asset, s));
@@ -567,26 +479,14 @@ export async function getDashboardMetrics(symbol: SymbolCode): Promise<Dashboard
   };
 }
 
-// --- THIS WAS THE KEY ADDITION ---
-export async function getMarketIntel(
-  symbol: SymbolCode
-): Promise<MarketIntel> {
-  const base =
-    process.env.NEXT_PUBLIC_API_BASE || "http://localhost:8000";
-
-  const res = await fetch(
-    `${base}/api/v1/market-intel/${encodeURIComponent(symbol)}`,
-    {
-      method: "GET",
-      headers: { "Content-Type": "application/json" },
-      cache: "no-store",
-    }
-  );
-
-  if (!res.ok) {
-    throw new Error(`Failed to load market intel (${res.status})`);
-  }
-
+export async function getMarketIntel(symbol: SymbolCode): Promise<MarketIntel> {
+  const base = process.env.NEXT_PUBLIC_API_BASE || "http://localhost:8000";
+  const res = await fetch(`${base}/api/v1/market-intel/${encodeURIComponent(symbol)}`, {
+    method: "GET",
+    headers: { "Content-Type": "application/json" },
+    cache: "no-store",
+  });
+  if (!res.ok) throw new Error(`Failed to load market intel (${res.status})`);
   return (await res.json()) as MarketIntel;
 }
 
@@ -610,12 +510,14 @@ export function tickLiveTrades(asset: string, mode: MarketMode, apply: (fn: any)
   const id = setInterval(() => { }, 3000);
   return () => clearInterval(id);
 }
+
 // Clean API Export
 const API = {
   MOCK,
   TOP_ASSETS,
   ALL_ASSETS,
   EXCHANGES,
+  fetchActiveAssets, // ✅ Exported for use in UI
   formatSymbol,
   toAsset,
   getTicker,

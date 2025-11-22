@@ -5,8 +5,9 @@ from typing import Optional, List
 from sqlalchemy import text
 
 from app.celery_app.app import celery_app
-from app.exchange.adapters import BybitAdapter
-from app.db.database import get_db, engine
+from app.core.config import settings
+from app.exchange.adapters import BybitAdapter, BinanceDataAdapter
+from app.db.database import SessionLocal, engine
 from app.db.models import CrossAssetCorr
 
 WINDOWS = [60, 240, 1440]  # minutes (1h, 4h, 1d)
@@ -36,13 +37,19 @@ def _corre(a: pd.DataFrame, b: pd.DataFrame, window_mins: int) -> float:
     """Compute correlation on returns over a rolling window (using resampled closes)."""
     if a.empty or b.empty:
         return 0.0
+    # Resample to align timestamps
     a = a.set_index("timestamp").resample(f"{window_mins}min").last()
     b = b.set_index("timestamp").resample(f"{window_mins}min").last()
+    
+    # Join on index
     merged = a.join(b, how="inner", lsuffix="_a", rsuffix="_b").dropna()
+    
     if len(merged) < 10:
         return 0.0
+        
     merged["ret_a"] = merged["close_a"].pct_change()
     merged["ret_b"] = merged["close_b"].pct_change()
+    
     return float(merged["ret_a"].corr(merged["ret_b"]) or 0.0)
 
 
@@ -62,34 +69,51 @@ def _load_macro(indicator: str, limit: int = 3000) -> pd.DataFrame:
     return pd.read_sql(sql, engine, params={"ind": indicator, "lim": limit}, parse_dates=["timestamp"])
 
 
+# ✅ FIXED: Renamed function to match the import in collectors.py
 @celery_app.task(name="tasks.run_cross_asset_corre")
-def run_cross_asset_corre_task(symbol: Optional[str] = None, window: int = 500) -> int:
+def run_cross_asset_corre(symbol: Optional[str] = None, window: int = 500) -> int:
     """
-    Compute cross-asset correlations for dynamic top-30 symbols (plus optional `symbol`)
+    Compute cross-asset correlations for dynamic top-10 symbols (plus optional `symbol`)
     vs ETH, DXY, NDX, GOLD and store in CrossAssetCorr.
     Returns the number of correlation rows inserted.
     """
-    print("[*] Starting cross-asset correlation collection …")
+    print("[*] Starting cross-asset correlation collection ...")
 
-    adapter = BybitAdapter()
-    top_syms: List[str] = adapter.get_top_symbols_by_volume(limit=30) or []
+    # ✅ FIXED: Use the correct adapter based on settings
+    use_binance = getattr(settings, "USE_BINANCE_FOR_DATA", True)
+    if use_binance:
+        adapter = BinanceDataAdapter()
+    else:
+        PAPER_MODE = bool(getattr(settings, "PAPER_TRADING", True))
+        adapter = BybitAdapter(paper_mode=PAPER_MODE)
+
+    # ✅ FIXED: Limit to Top 10 to match other collectors
+    top_syms: List[str] = adapter.get_top_symbols_by_volume(limit=10) or []
+    
     if symbol and symbol not in top_syms:
         top_syms.insert(0, symbol)
 
-    # Load common series once
+    # Load common series once to save DB hits
     eth_df = _load_series(engine, table="futures_market_data", symbol="ETH/USDT", limit=max(1000, window * 3))
     dxy_df = _load_macro("DXY", limit=max(1000, window * 3))
     ndx_df = _load_macro("NDX", limit=max(1000, window * 3))
     gold_df = _load_macro("GOLD", limit=max(1000, window * 3))
 
     written = 0
-    session = next(get_db())
+    session = SessionLocal()
+    
     try:
         for base_sym in top_syms:
-            print(f"[→] {base_sym}")
+            # Skip ETH vs ETH correlation (redundant)
+            if base_sym == "ETH": 
+                continue
+                
+            # print(f"[→] Calculating correlations for {base_sym}...")
+            
             base_df = _load_series(
                 engine, table="futures_market_data", symbol=f"{base_sym}/USDT", limit=max(1000, window * 3)
             )
+            
             if base_df.empty:
                 continue
 
@@ -106,10 +130,12 @@ def run_cross_asset_corre_task(symbol: Optional[str] = None, window: int = 500) 
                 session.add(row)
                 written += 1
             session.commit()
+            
     except Exception as e:
         print(f"[!] Cross-asset correlation error: {e}")
         session.rollback()
     finally:
         session.close()
-        print("[✔] Cross-asset correlation updated.")
+        print(f"[✔] Cross-asset correlations updated. Rows written: {written}")
+        
     return written

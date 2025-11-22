@@ -67,29 +67,42 @@ class BybitAdapter(BaseExchangeAdapter):
             print(f"[Bybit] load_markets failed: {e}")
 
     def get_top_symbols_by_volume(self, limit: int = 10) -> List[str]:
+        # --- DEV MODE OVERRIDE ---
+        if limit <= 10:
+            return ["BTC", "ETH", "SOL", "BNB", "XRP", "ADA", "DOGE", "AVAX", "TRX", "LINK"][:limit]
+        # -------------------------
+
         try:
             tickers = self.exchange.fetch_tickers()
         except Exception as e:
-            print(f"[Bybit] fetch_tickers failed: {e}")
+            print(f"[Binance] fetch_tickers failed: {e}")
             return ["BTC", "ETH"]
 
         perps = []
         for t in tickers.values():
-            # Relaxed Check: accept if type is missing OR matches swap
             typ = t.get("type")
             sym = t.get("symbol", "")
             qv = t.get("quoteVolume")
             
-            is_perp = (typ is None or typ in ("swap", "future"))
-            if is_perp and "USDT" in sym and qv:
+            is_perp = (typ is None or typ in ("future", "swap"))
+            
+            if is_perp and "USDT" in sym and qv is not None:
                 perps.append(t)
 
         if not perps:
             return ["BTC", "ETH"]
 
         perps = sorted(perps, key=lambda x: x["quoteVolume"], reverse=True)[: max(1, limit)]
-        return [p["symbol"].split("/")[0] for p in perps]
-
+        
+        bases = []
+        for p in perps:
+            s = p["symbol"]
+            if "/" in s:
+                bases.append(s.split("/")[0])
+            else:
+                bases.append(s.replace("USDT", "").replace(":USDT", ""))
+        
+        return list(dict.fromkeys(bases))
     def get_options_chain(self, underlying_symbol: str) -> List[Dict[str, Any]]:
         base = underlying_symbol.upper()
         try:

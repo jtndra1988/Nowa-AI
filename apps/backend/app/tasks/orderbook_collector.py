@@ -1,4 +1,5 @@
 import datetime as dt
+import time
 from typing import List, Tuple
 import numpy as np
 import ccxt
@@ -80,6 +81,7 @@ def run_orderbook_snapshot(symbols: List[str]):
     skipped_count = 0
     try:
         for sym_raw in symbols:
+            time.sleep(3.0)
             norm_symbol = _norm_futures_symbol(sym_raw) # Normalize symbol
             try:
                 data = collect_orderbook_and_trades(norm_symbol) # Use normalized symbol

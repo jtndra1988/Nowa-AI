@@ -186,33 +186,44 @@ const NeonHeader: React.FC<Props> = ({
   }, [ticker.price]);
 
   // ---------- search + suggestions ----------
-  const [q, setQ] = useState("");
-  const [suggestions, setSuggestions] = useState<SymbolCode[]>([]);
-  const [prices, setPrices] = useState<Record<string, number>>({});
-  const [open, setOpen] = useState(false);
+ const [q, setQ] = useState("");
+ const [suggestions, setSuggestions] = useState<SymbolCode[]>([]);
+ const [prices, setPrices] = useState<Record<string, number>>({});
+ const [open, setOpen] = useState(false);
 
-  const assets = useMemo(
-    () =>
-      API.ALL_ASSETS.map((a: any) =>
-        API.formatSymbol(a, DEFAULT_MODE)
-      ) as SymbolCode[],
-    []
-  );
+  // ✅ NEW: State for dynamic assets
+  const [availableAssets, setAvailableAssets] = useState<string[]>(API.ALL_ASSETS);
 
+  // ✅ NEW: Fetch active assets on mount
   useEffect(() => {
-    const term = q.trim().toLowerCase();
-    if (!term) {
-      setSuggestions([]);
-      setOpen(false);
-      return;
+  API.fetchActiveAssets().then((data) => {
+    if (data && data.length > 0) {
+      setAvailableAssets(data);
     }
-    const list = assets
-      .filter((s) => s.toLowerCase().includes(term))
-      .slice(0, 8);
-    setSuggestions(list);
-    setOpen(list.length > 0);
-  }, [q, assets]);
+  });
+}, []);
 
+ const assets = useMemo(
+  () =>
+    availableAssets.map((a: any) =>
+      API.formatSymbol(a, DEFAULT_MODE)
+    ) as SymbolCode[],
+  [availableAssets]
+);
+
+useEffect(() => {
+  const term = q.trim().toLowerCase();
+  if (!term) {
+    setSuggestions([]);
+    setOpen(false);
+    return;
+  }
+  const list = assets
+    .filter((s) => s.toLowerCase().includes(term))
+    .slice(0, 8); // at most 8 shown from the 10-universe
+  setSuggestions(list);
+  setOpen(list.length > 0);
+}, [q, assets]);
   useEffect(() => {
     if (!open || suggestions.length === 0) return;
     let alive = true;

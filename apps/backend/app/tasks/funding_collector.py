@@ -23,7 +23,7 @@ def collect_funding_rates_task():
 
     try:
         # ✅ top-100 universe instead of 30
-        assets = adapter.get_top_symbols_by_volume(limit=100)
+        assets = adapter.get_top_symbols_by_volume(limit=10)
         if not assets:
             print("[!] No top symbols found for funding rate collection.")
             return

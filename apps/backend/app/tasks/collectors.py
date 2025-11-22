@@ -3,7 +3,7 @@ import asyncio
 import requests
 import sqlalchemy
 import yfinance as yf
-import time  # ✅ Critical for throttling
+import time
 from datetime import datetime, timedelta, timezone
 from typing import Dict, Any, List, Optional
 import os
@@ -44,12 +44,11 @@ def _safe_datetime_from_ms(val: Any) -> Optional[datetime]:
             return None
 
 # =============================================================================
-#  TASK 1: Collect OPTIONS Data (per-contract) → options_chain
+#  TASK 1: Collect OPTIONS Data
 # =============================================================================
 @celery_app.task(name="tasks.collect_options", bind=True, autoretry_for=(Exception,), retry_backoff=True, max_retries=3)
 def collect_options_task(self, symbol: str, adapter_payload: Optional[dict] = None) -> int:
     task_id = self.request.id
-    # Log at debug to reduce noise
     logger.debug(f"Task {task_id}: Starting options collection for {symbol}.")
 
     tz_now = _utcnow()
@@ -71,8 +70,7 @@ def collect_options_task(self, symbol: str, adapter_payload: Optional[dict] = No
                     if rows:
                         break
                 except Exception as e:
-                    # Don't spam logs with expected 404s for coins without options
-                    if "404" not in str(e):
+                    if "404" not in str(e): # Ignore expected 404s
                          logger.warning(f"Task {task_id}: Options fetch ({symbol}) failed: {e}")
         
         if not rows and adapter_payload is not None: rows = adapter_payload.get("rows", [])
@@ -150,6 +148,7 @@ def collect_options_task(self, symbol: str, adapter_payload: Optional[dict] = No
 # =============================================================================
 @celery_app.task(name="tasks.collect_futures", autoretry_for=(Exception,), retry_backoff=True, max_retries=3)
 def collect_futures_task(underlying_symbol: str):
+    # Note: Removed print() to reduce noise, rely on logger if needed
     use_binance = getattr(settings, "USE_BINANCE_FOR_DATA", True)
     
     if use_binance:
@@ -165,7 +164,6 @@ def collect_futures_task(underlying_symbol: str):
     try:
         ticker_data = adapter.get_ticker(futures_symbol, params=ticker_params)
     except Exception as fetch_e:
-        # Fail gracefully if symbol doesn't exist
         return
 
     if not ticker_data or not ticker_data.get('timestamp'):
@@ -195,9 +193,6 @@ def collect_futures_task(underlying_symbol: str):
             db_session.add(futures_data_record)
             db_session.commit()
             logger.info(f"[✔] Saved Futures: {norm_symbol}")
-        else:
-            pass
-
     except Exception as e:
         db_session.rollback()
         raise e
@@ -246,7 +241,7 @@ def collect_macro_data_task():
         db_session.close()
 
 # =============================================================================
-#  MASTER TASK: Run all collection jobs (HEAVILY THROTTLED)
+#  MASTER TASK: Run all collection jobs (DEV MODE: TOP 10)
 # =============================================================================
 @celery_app.task(name="tasks.collect_all_assets")
 def collect_all_assets_task():
@@ -259,21 +254,23 @@ def collect_all_assets_task():
              PAPER_MODE = bool(getattr(settings, "PAPER_TRADING", True))
              adapter = BybitAdapter(paper_mode=PAPER_MODE)
 
-        assets_bases = adapter.get_top_symbols_by_volume(limit=100)
+        # ✅ UPDATED: Fetch only TOP 10 assets for DEV mode
+        assets_bases = adapter.get_top_symbols_by_volume(limit=10)
+        
         if not assets_bases:
             print("[!] No symbols found. Aborting.")
             return
 
-        print(f"[*] Found top {len(assets_bases)} assets. Triggering tasks with 2.0s delay...")
+        print(f"[*] Found top {len(assets_bases)} assets. Triggering tasks with 5.0s delay...")
 
         # 1. Historical Data (Runs independently)
         if isinstance(adapter, BinanceDataAdapter):
             collect_binance_historical_data.delay()
 
         # 2. Options & Futures per asset
-        # ✅ CRITICAL: 2.0s delay to prevent IP Ban / Network Crash
         for i, asset in enumerate(assets_bases):
-            time.sleep(2.0) 
+            # Keep the delay to be safe, even with 10 assets
+            time.sleep(5.0) 
             
             collect_options_task.delay(asset)
             collect_futures_task.delay(asset)
@@ -281,14 +278,13 @@ def collect_all_assets_task():
             if i % 5 == 0:
                 print(f"[Master] Dispatched {i}/{len(assets_bases)} assets...")
 
-        # 3. RESTORED: Batch Tasks 
+        # 3. Batch Tasks
         from .sentiment_collector import collect_sentiment_all_sources
         collect_sentiment_all_sources.delay(assets_bases)
         
         from .orderbook_collector import collect_orderbook_snapshot_task
         collect_orderbook_snapshot_task.delay()
         
-        # 4. RESTORED: Missing tasks you requested
         from .funding_collector import collect_funding_rates_task
         collect_funding_rates_task.delay()
         
@@ -306,17 +302,19 @@ def collect_all_assets_task():
         print(f"[!] An error occurred in the master collection task: {e}")
 
 # =============================================================================
-#  Binance Historical Data Collector
+#  Binance Historical Data Collector (DEV MODE: TOP 10)
 # =============================================================================
 @celery_app.task(name="tasks.collect_binance_historical_data")
 def collect_binance_historical_data():
     logger.info("[*] Starting Binance historical data collection...")
     adapter = BinanceDataAdapter()
-    symbols_bases = adapter.get_top_symbols_by_volume(limit=100)
+    
+    # ✅ UPDATED: Fetch only TOP 10 assets for DEV mode
+    symbols_bases = adapter.get_top_symbols_by_volume(limit=10)
     
     processed = 0
     for sym_base in symbols_bases:
-        time.sleep(2.0) # Throttle historical too
+        time.sleep(2.0)
         
         sym_usdt = f"{sym_base}/USDT"
         db = SessionLocal()

@@ -6,7 +6,7 @@ from pydantic import Field
 
 # --- Load .env from project root ---
 ROOT_DIR = Path(__file__).resolve().parents[2]
-ENV_PATH = ROOT_DIR / ".env"
+ENV_PATH = ROOT_DIR / ".env.dev"
 load_dotenv(dotenv_path=ENV_PATH)
 print(f"✅ Loaded .env from: {ENV_PATH}")
 
@@ -38,12 +38,13 @@ class Settings(BaseSettings):
     # News & Sentiment APIs
     NEWSAPI_API_KEY: str
     
-    # --- FIX: Add the new API keys here ---
+    # --- Add the news API keys here ---
     SANTIMENT_API_KEY: str
     LUNARCRUSH_API_KEY: str
     CRYPTOPANIC_API_KEY: str
     COINMARKETCAP_API_KEY: str
-    # ------------------------------------
+    # -------Gemini Key-----------------------------
+    GEMINI_API_KEY:str
 
     class Config:
         env_file = ENV_PATH

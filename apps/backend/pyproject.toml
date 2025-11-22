@@ -1,5 +1,5 @@
 [tool.poetry]
-name = "MARS"
+name = "Nowa"
 version = "0.1.0"
 description = "FastAPI backend for ML trading"
 authors = ["Jiten <jtndra1988@gmail.com>"]
@@ -31,15 +31,15 @@ ccxt = "^4.3"
 transformers = "^4.45.0"
 psutil = "^5.9.8"
 stable-baselines3 = {extras = ["extra"], version = "*"}
-gym = "0.26.2" 
+gym = "0.26.2"
+scikit-learn = "^1.4.0"
+
 # --- ADDED NEW ML DEPENDENCIES ---
 torch = "^2.2.0"
 xgboost = "^2.0.3"
 joblib = "^1.3.2"
 google-generativeai = "^0.5.4"
 gymnasium = "^0.29.1"
-stable-baselines3 = {extras = ["extra"], version = "^2.3.2"}
-# ----------------------------------
 
 [tool.poetry.group.dev.dependencies]
 pytest = "^8.0.0"

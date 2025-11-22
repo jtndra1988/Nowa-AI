@@ -35,7 +35,6 @@ services:
       - db
       - redis
     restart: always
-
   # ---------------- Frontend (Next.js) ----------------
   frontend:
     build:

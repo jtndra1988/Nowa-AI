@@ -2,9 +2,9 @@ from __future__ import annotations
 
 import logging
 from datetime import datetime, timedelta, timezone
-from typing import Any, List, Optional, Literal
+from typing import Any, List, Literal
 
-from fastapi import APIRouter, Depends, HTTPException, Query
+from fastapi import APIRouter, Depends, Query
 from pydantic import BaseModel
 from sqlalchemy import desc, select
 from sqlalchemy.orm import Session
@@ -14,14 +14,10 @@ from app import db as db_pkg  # gives us db.models.*
 
 logger = logging.getLogger(__name__)
 
-router = APIRouter()
+router = APIRouter(prefix="/market-intel", tags=["market-intel"])
 
 
-# ---------------------------------------------------------------------------
-# DB helpers
-# ---------------------------------------------------------------------------
-
-def get_db() -> Session:
+def get_db():
     db = SessionLocal()
     try:
         yield db
@@ -36,10 +32,57 @@ def _get_model(name: str) -> Any | None:
     except Exception:
         return None
 
+def _get_model(name: str) -> Any | None:
+    """Safely get a model from app.db.models, or None if it doesn't exist."""
+    try:
+        return getattr(db_pkg.models, name)  # type: ignore[attr-defined]
+    except Exception:
+        return None
+
+def _symbol_candidates(symbol: str) -> List[str]:
+    """Return plausible symbol keys for intel lookups.
+
+    Accepts BTC-PERP / BTCUSDT / BTC/USDT etc and returns a small set
+    like [BTC-PERP, BTC, BTCUSDT, BTCUSD] so we can match whatever
+    we actually stored in the DB.
+    """
+    if not symbol:
+        return []
+    s = symbol.upper()
+
+    candidates: set[str] = set()
+    candidates.add(s)
+
+    # Split on common separators first, e.g. BTC-PERP -> BTC
+    base = s
+    for sep in ("-", "/", ":"):
+        if sep in base:
+            base = base.split(sep)[0]
+            break
+    candidates.add(base)
+
+    # Strip common suffixes
+    base_no_suf = base
+    for suf in ("USDT", "USD", "PERP"):
+        if base_no_suf.endswith(suf):
+            base_no_suf = base_no_suf[: -len(suf)]
+
+    # Handle embedded suffixes (BTCUSDT style)
+    for suf in ("USDT", "USD"):
+        if suf in base_no_suf and not base_no_suf.endswith(suf):
+            base_no_suf = base_no_suf.replace(suf, "")
+
+    if base_no_suf:
+        candidates.add(base_no_suf)          # BTC
+        candidates.add(base_no_suf + "USDT") # BTCUSDT
+        candidates.add(base_no_suf + "USD")  # BTCUSD
+
+    return [c for c in candidates if c]
 
 # ---------------------------------------------------------------------------
 # Schemas (match frontend types in api.ts)
 # ---------------------------------------------------------------------------
+
 
 class SentimentPoint(BaseModel):
     t: datetime
@@ -86,6 +129,7 @@ class MarketIntelResponse(BaseModel):
 # Core loader
 # ---------------------------------------------------------------------------
 
+
 def _load_market_intel_from_db(
     db: Session,
     symbol: str,
@@ -96,12 +140,9 @@ def _load_market_intel_from_db(
     lookback_hours = 24
     since = now - timedelta(hours=lookback_hours)
 
-    base = (
-        symbol.replace("USDT", "")
-        .replace("/USDT", "")
-        .replace("/", "")
-        .upper()
-    )
+    # Normalize symbol like BTC-PERP / BTC/USDT / BTCUSDT into
+    # a small candidate set we can use in .in_(...) filters.
+    candidates = _symbol_candidates(symbol)
 
     sentiment_history: List[SentimentPoint] = []
     onchain_history: List[OnChainPoint] = []
@@ -118,7 +159,7 @@ def _load_market_intel_from_db(
             db.execute(
                 select(SentimentFusion)
                 .where(
-                    SentimentFusion.symbol.in_([symbol, base]),
+                    SentimentFusion.symbol.in_(candidates),
                     SentimentFusion.timestamp >= since,
                 )
                 .order_by(desc(SentimentFusion.timestamp))
@@ -142,7 +183,7 @@ def _load_market_intel_from_db(
             db.execute(
                 select(OnchainMetrics)
                 .where(
-                    OnchainMetrics.symbol.in_([symbol, base, base.lower()]),
+                    OnchainMetrics.symbol.in_(candidates),
                     OnchainMetrics.timestamp >= since,
                 )
                 .order_by(desc(OnchainMetrics.timestamp))
@@ -155,7 +196,14 @@ def _load_market_intel_from_db(
             onchain_history.append(
                 OnChainPoint(
                     t=r.timestamp,
-                    active=float(getattr(r, "active_addresses", 0.0) or 0.0),
+                    active=float(
+                        getattr(
+                            r,
+                            "active_addresses",
+                            getattr(r, "total_active_addresses", 0.0),
+                        )
+                        or 0.0
+                    ),
                 )
             )
 
@@ -166,7 +214,7 @@ def _load_market_intel_from_db(
             db.execute(
                 select(OptionsDerivedMetrics)
                 .where(
-                    OptionsDerivedMetrics.symbol.in_([symbol, base]),
+                    OptionsDerivedMetrics.symbol.in_(candidates),
                     OptionsDerivedMetrics.timestamp >= since,
                 )
                 .order_by(desc(OptionsDerivedMetrics.timestamp))
@@ -183,7 +231,6 @@ def _load_market_intel_from_db(
                     v=float(getattr(r, "avg_iv_near_term", 0.0) or 0.0),
                 )
             )
-            # We may not have a dedicated OI field; fall back gracefully
             oi_val = (
                 getattr(r, "total_oi", None)
                 or getattr(r, "open_interest", None)
@@ -198,7 +245,7 @@ def _load_market_intel_from_db(
             db.execute(
                 select(FundingRate)
                 .where(
-                    FundingRate.symbol.in_([symbol, base]),
+                    FundingRate.symbol.in_(candidates),
                     FundingRate.timestamp >= since,
                 )
                 .order_by(desc(FundingRate.timestamp))
@@ -211,7 +258,8 @@ def _load_market_intel_from_db(
             funding_history.append(
                 SimpleSeriesPoint(
                     t=r.timestamp,
-                    v=float(getattr(r, "rate", 0.0) or 0.0),
+                    # IMPORTANT: column is funding_rate, not 'rate'
+                    v=float(getattr(r, "funding_rate", 0.0) or 0.0),
                 )
             )
 
@@ -222,7 +270,7 @@ def _load_market_intel_from_db(
             db.execute(
                 select(OrderbookSnapshot)
                 .where(
-                    OrderbookSnapshot.symbol == symbol,
+                    OrderbookSnapshot.symbol.in_(candidates),
                     OrderbookSnapshot.timestamp >= since,
                 )
                 .order_by(desc(OrderbookSnapshot.timestamp))
@@ -245,7 +293,7 @@ def _load_market_intel_from_db(
         cac = (
             db.execute(
                 select(CrossAssetCorr)
-                .where(CrossAssetCorr.base_symbol.in_([symbol, base]))
+                .where(CrossAssetCorr.base_symbol.in_(candidates))
                 .order_by(desc(CrossAssetCorr.timestamp))
                 .limit(1)
             )
@@ -270,16 +318,13 @@ def _load_market_intel_from_db(
     last_sentiment = sentiment_history[-1].score if sentiment_history else 0.0
     last_funding = funding_history[-1].v if funding_history else 0.0
 
-    regime: Literal["MOMENTUM", "MEAN-REVERT", "BALANCED"]
-    trend: Literal["UP", "DOWN", "FLAT"]
-
     if abs(last_sentiment) > 0.4 and abs(last_funding) > 0.0005:
-        regime = "MOMENTUM"
+        regime: Literal["MOMENTUM", "MEAN-REVERT", "BALANCED"] = "MOMENTUM"
     else:
         regime = "BALANCED"
 
     if last_sentiment > 0.1:
-        trend = "UP"
+        trend: Literal["UP", "DOWN", "FLAT"] = "UP"
     elif last_sentiment < -0.1:
         trend = "DOWN"
     else:
@@ -287,9 +332,9 @@ def _load_market_intel_from_db(
 
     radar = RadarIntel(
         regime=regime,
+        crowding="Normal positioning",
         trend=trend,
         liquidity="NORMAL",
-        crowding="Normal positioning",
         warning="",
     )
 
@@ -306,13 +351,22 @@ def _load_market_intel_from_db(
         radar=radar,
     )
 
+# ---------------------------------------------------------------------------
+# Mock / safe fallback (only for catastrophic errors)
+# ---------------------------------------------------------------------------
+
 
 def _build_mock_market_intel(symbol: str, mode: str) -> MarketIntelResponse:
-    """Safe fallback if DB is empty or errors out."""
+    """
+    Very small synthetic fallback so the UI never completely breaks.
+
+    This SHOULD be used only if _load_market_intel_from_db raises unexpectedly
+    (for example, during a migration). It does NOT try to be "smart".
+    """
     now = datetime.now(timezone.utc)
     points = 40
 
-    def series(scale: float = 1.0, bias: float = 0.0) -> List[SimpleSeriesPoint]:
+    def make_series(scale: float = 1.0, bias: float = 0.0) -> List[SimpleSeriesPoint]:
         out: List[SimpleSeriesPoint] = []
         for i in range(points):
             t = now - timedelta(minutes=(points - i) * 10)
@@ -320,17 +374,18 @@ def _build_mock_market_intel(symbol: str, mode: str) -> MarketIntelResponse:
             out.append(SimpleSeriesPoint(t=t, v=v))
         return out
 
-    sent = [
+    # Flat-ish sentiment and on-chain active addresses
+    sentiment = [
         SentimentPoint(
             t=now - timedelta(minutes=(points - i) * 10),
-            score=(i - points / 2) / points,
+            score=0.0,
         )
         for i in range(points)
     ]
     onchain = [
         OnChainPoint(
             t=now - timedelta(minutes=(points - i) * 10),
-            active=100_000 + i * 500,
+            active=100_000.0,
         )
         for i in range(points)
     ]
@@ -342,31 +397,16 @@ def _build_mock_market_intel(symbol: str, mode: str) -> MarketIntelResponse:
         liquidity="NORMAL",
         warning="Mock data – collectors not live yet",
     )
-    has_any_data = any(
-        len(arr)
-        for arr in (
-            sentiment_history,
-            onchain_history,
-            iv_history,
-            funding_history,
-            oi_history,
-            cvd_history,
-            correlations,
-        )
-    )
 
-    if not has_any_data:
-        # Return synthetic intel so the UI is always populated
-        return _build_mock_market_intel(symbol, mode)
     return MarketIntelResponse(
         symbol=symbol.upper(),
         mode=mode,
-        sentimentHistory=sent,
+        sentimentHistory=sentiment,
         onChainHistory=onchain,
-        ivHistory=series(0.1, 0.6),
-        fundingHistory=series(0.0005, 0.0),
-        oiHistory=series(10_000, 50_000),
-        cvdHistory=series(1000, 0.0),
+        ivHistory=make_series(0.1, 0.6),
+        fundingHistory=make_series(0.0005, 0.0),
+        oiHistory=make_series(10_000, 50_000),
+        cvdHistory=make_series(1000, 0.0),
         correlations=[
             CorrelationPoint(name="BTC vs ETH", val=0.65),
             CorrelationPoint(name="BTC vs DXY", val=-0.35),
@@ -376,13 +416,13 @@ def _build_mock_market_intel(symbol: str, mode: str) -> MarketIntelResponse:
 
 
 # ---------------------------------------------------------------------------
-# Public endpoint
+# Router
 # ---------------------------------------------------------------------------
 
+
 @router.get(
-    "/market-intel/{symbol}",
+    "/{symbol}",
     response_model=MarketIntelResponse,
-    tags=["market-intel"],
 )
 def market_intel(
     symbol: str,
@@ -395,6 +435,7 @@ def market_intel(
     Final URL (with main.py prefix): /api/v1/market-intel/{symbol}
     """
     try:
+        # Main path: always try to pull real DB-backed intel.
         return _load_market_intel_from_db(db, symbol=symbol, mode=mode)
     except Exception as e:
         logger.exception("market_intel failed, falling back to mock: %s", e)

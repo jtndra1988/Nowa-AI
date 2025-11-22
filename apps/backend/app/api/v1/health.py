@@ -7,10 +7,16 @@ from typing import Any, Dict
 
 from fastapi import APIRouter
 from app.db.database import SessionLocal
-from app.ml.adv.model_registry import model_registry
+
+# Optional: model registry if you have it; if missing, we just mark AI as not ready
+try:
+    from app.ml.adv.model_registry import model_registry  # type: ignore
+except Exception:
+    model_registry = None  # type: ignore
+
 # psutil is optional – if missing, we still don't crash
 try:
-    import psutil
+    import psutil  # type: ignore
 except ImportError:  # pragma: no cover
     psutil = None  # type: ignore
 
@@ -19,91 +25,66 @@ logger = logging.getLogger(__name__)
 router = APIRouter()
 
 
-def _utcnow_iso() -> str:
-    return datetime.now(timezone.utc).isoformat()
-
-
-# ---------------------------------------------------------------------------
-# Basic health endpoints
-# ---------------------------------------------------------------------------
-
-@router.get("/health/models", summary="Model versions & status")
-async def health_models() -> Dict[str, Any]:
-    meta = model_registry.all_metadata()
-    status = "ok" if meta else "degraded"
-    return {
-        "status": status,
-        "models": meta,
-    }
 @router.get("/healthz")
 def healthz() -> Dict[str, Any]:
+    """Basic liveness probe."""
     return {
         "status": "ok",
-        "time": _utcnow_iso(),
-        "host": socket.gethostname(),
-        "service": "ml-trading-api",
+        "time": datetime.now(timezone.utc).isoformat(),
+        "hostname": socket.gethostname(),
     }
-
-
-@router.get("/livez")
-def livez() -> Dict[str, Any]:
-    return {"status": "alive", "time": _utcnow_iso()}
 
 
 @router.get("/readyz")
 def readyz() -> Dict[str, Any]:
-    """
-    Readiness check: confirms DB connectivity.
-    """
-    ok = False
-    error: str | None = None
+    """Readiness probe – checks DB and basic AI model registry state."""
+    db_ok = True
     try:
-        db = SessionLocal()
-        try:
+        with SessionLocal() as db:
             db.execute("SELECT 1")
-            ok = True
-        finally:
-            db.close()
-    except Exception as e:
-        error = str(e)
-        logger.warning("readyz DB check failed: %s", e)
+    except Exception as exc:  # pragma: no cover
+        logger.exception("DB readiness check failed: %s", exc)
+        db_ok = False
 
+    ai_ready = False
+    try:
+        if model_registry is not None:
+            models = getattr(model_registry, "models", {})
+            ai_ready = bool(models)
+    except Exception:
+        ai_ready = False
+
+    status = "ok" if db_ok else "degraded"
     return {
-        "status": "ok" if ok else "error",
-        "db_ready": ok,
-        "error": error,
-        "time": _utcnow_iso(),
+        "status": status,
+        "db": db_ok,
+        "ai_models_loaded": ai_ready,
+        "time": datetime.now(timezone.utc).isoformat(),
     }
-
-
-# ---------------------------------------------------------------------------
-# System resources (shared helper + endpoint)
-# ---------------------------------------------------------------------------
 
 
 def get_system_resources() -> Dict[str, float]:
     """
-    Helper used by other modules (system.py, system_stream.py).
-    Safe: never raises.
+    Return CPU / RAM / GPU metrics for the System tab.
+    Uses psutil when available; otherwise returns zeros.
     """
     cpu_load = 0.0
     ram_usage = 0.0
     gpu_util = 0.0
 
-    if psutil is None:
-        # psutil not installed – return zeros instead of crashing
-        return {
-            "cpu_load": cpu_load,
-            "ram_usage": ram_usage,
-            "gpu_util": gpu_util,
-        }
+    if psutil is not None:  # pragma: no branch
+        try:
+            cpu_load = float(psutil.cpu_percent(interval=0.1))
+        except Exception as exc:  # pragma: no cover
+            logger.exception("Failed to read CPU load: %s", exc)
 
-    try:
-        cpu_load = float(psutil.cpu_percent(interval=None))
-        mem = psutil.virtual_memory()
-        ram_usage = float(mem.percent)
-    except Exception as e:
-        logger.exception("get_system_resources failed: %s", e)
+        try:
+            ram = psutil.virtual_memory()
+            ram_usage = float(ram.percent)
+        except Exception as exc:  # pragma: no cover
+            logger.exception("Failed to read RAM usage: %s", exc)
+
+        # GPU metrics can be wired later (pynvml / nvidia-smi)
 
     return {
         "cpu_load": cpu_load,

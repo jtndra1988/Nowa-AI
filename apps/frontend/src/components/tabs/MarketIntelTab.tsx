@@ -234,7 +234,7 @@ export const MarketIntelTab: React.FC<{
     return () => {
       alive = false;
     };
-  }, [symbol, mode]);
+  }, [symbol]);
 
   const pro: any = intel || {};
 
@@ -281,30 +281,35 @@ export const MarketIntelTab: React.FC<{
       ? "MEAN-REVERT"
       : "BALANCED");
 
-  const correlations: CorItem[] = Array.isArray(pro.correlations)
+      const correlations: CorItem[] = Array.isArray(pro.correlations)
     ? pro.correlations
-    : [
-        { name: "BTC.D", val: 0.42 },
-        { name: "ETH.D", val: 0.35 },
-        { name: "SPX", val: 0.18 },
-        { name: "DXY", val: -0.27 },
-        { name: "VIX", val: -0.31 },
-      ];
+    : [];
 
   // Radar Chart Logic normalization (Spot centric)
   const trendScore =
     latestScore > 0 ? 75 + latestScore * 25 : 25 + latestScore * 25;
-  const volumeScore = Math.min(Math.abs(cvdDelta / 1000), 100); // Mock normalization
+  const volumeScore = Math.min(Math.abs(cvdDelta / 1000), 100);
   const onChainScore = chainArr.length > 0 ? 80 : 40;
+  const corrScore =
+    correlations.length > 0
+      ? Math.min(
+          100,
+          Math.round(
+            (correlations.reduce((acc, c) => acc + Math.abs(c.val), 0) /
+              correlations.length) *
+              100
+          )
+        )
+      : 50;
 
   const radarData = [
     { subject: "Sentiment", A: trendScore, fullMark: 100 },
     { subject: "Volume", A: volumeScore, fullMark: 100 },
     { subject: "On-Chain", A: onChainScore, fullMark: 100 },
-    { subject: "Correlations", A: 60, fullMark: 100 }, // Static baseline
+    { subject: "Correlations", A: corrScore, fullMark: 100 },
     {
       subject: "Momentum",
-      A: regimeText === "MOMENTUM" ? 90 : 40,
+      A: regimeText === "MOMENTUM" ? 85 : regimeText === "MEAN-REVERT" ? 55 : 65,
       fullMark: 100,
     },
   ];
@@ -360,8 +365,48 @@ export const MarketIntelTab: React.FC<{
   if (directionMatch) confSignal = "positive";
   else confSignal = "warning";
 
-  const hasAnyData =
-    sentimentArr.length || chainArr.length || cvdArr.length || intel;
+    const hasAnyData =
+    sentimentArr.length > 0 ||
+    chainArr.length > 0 ||
+    cvdArr.length > 0 ||
+    correlations.length > 0 ||
+    !!(
+      intel &&
+      ((intel.ivHistory && intel.ivHistory.length > 0) ||
+        (intel.fundingHistory && intel.fundingHistory.length > 0) ||
+        (intel.oiHistory && intel.oiHistory.length > 0))
+    );
+
+  if (loading) {
+    return (
+      <Card className="border border-dashed border-slate-700 bg-slate-900/40">
+        <CardHeader>
+          <CardTitle className="text-sm">Loading Market Intel…</CardTitle>
+          <CardDescription className="text-xs">
+            Pulling sentiment, volume and on-chain context from the backend.
+          </CardDescription>
+        </CardHeader>
+      </Card>
+    );
+  }
+
+  if (error) {
+    return (
+      <Card className="border border-rose-500/40 bg-rose-950/40">
+        <CardHeader>
+          <CardTitle className="text-sm text-rose-200">
+            Failed to load intel
+          </CardTitle>
+          <CardDescription className="text-xs text-rose-300/80">
+            {error}
+          </CardDescription>
+        </CardHeader>
+      </Card>
+    );
+  }
+
+
+
 
   return (
     <div className="flex flex-col gap-6 pb-10 animate-in fade-in duration-500">
@@ -400,31 +445,6 @@ export const MarketIntelTab: React.FC<{
           </div>
         </div>
       </div>
-
-      {/* Loading / Error State */}
-      {loading && (
-        <Card className="border border-dashed border-slate-700 bg-slate-900/40">
-          <CardHeader>
-            <CardTitle className="text-sm">Loading Market Intel…</CardTitle>
-            <CardDescription className="text-xs">
-              Pulling sentiment, volume and on-chain context from the backend.
-            </CardDescription>
-          </CardHeader>
-        </Card>
-      )}
-
-      {!loading && error && (
-        <Card className="border border-rose-500/40 bg-rose-950/40">
-          <CardHeader>
-            <CardTitle className="text-sm text-rose-200">
-              Failed to load intel
-            </CardTitle>
-            <CardDescription className="text-xs text-rose-300/80">
-              {error}
-            </CardDescription>
-          </CardHeader>
-        </Card>
-      )}
 
       {/* --- KPI STATISTICS (SPOT ONLY) --- */}
       <div className="grid grid-cols-1 sm:grid-cols-2 lg:grid-cols-4 gap-4">
@@ -698,7 +718,7 @@ export const MarketIntelTab: React.FC<{
         </p>
       </div>
 
-      {!hasAnyData && !loading && !error && (
+      {!hasAnyData && (
         <Card className="border border-dashed border-slate-700 bg-slate-900/40">
           <CardHeader>
             <CardTitle className="text-sm">

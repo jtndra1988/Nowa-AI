@@ -57,7 +57,7 @@ class Settings(BaseSettings):
     COINMARKETCAP_API_KEY: str
     TELEGRAM_BOT_TOKEN:str
     TELEGRAM_CHAT_ID:str
-    GEMINI_API_KEY:str
+    GEMINI_API_KEY: str
     PROMETHEUS_ENABLED: bool = False
     PROMETHEUS_PORT: int = 9090
     class Config:

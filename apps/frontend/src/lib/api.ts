@@ -41,7 +41,7 @@ export const TOP_ASSETS: Asset[] = [
   "MATIC","LTC","SHIB","AVAX","LINK","UNI","ATOM","XLM","ETC","AAVE",
 ];
 
-export const MOCK = true;
+export const MOCK = false;
 
 // --- Types ---
 export type FeatureImportance = { name: string; weight: number };

@@ -64,15 +64,15 @@ def create_app() -> FastAPI:
     app.add_route("/metrics", handle_metrics)
 
     # Routers
-    app.include_router(health_router,tags=["health"])
-    app.include_router(core_router, prefix="/api", tags=["core"])
+    app.include_router(health_router, prefix="/api/v1", tags=["health"])
+    app.include_router(core_router, prefix="/api/v1", tags=["core"])
     app.include_router(v1_predict_router, prefix="/api/v1", tags=["predict"])
     app.include_router(brain_router, prefix="/api/v1", tags=["health"])
     app.include_router(risk_router, prefix="/api/risk", tags=["risk"])
     app.include_router(settings_router)
     app.include_router(market_intel.router, prefix="/api/v1", tags=["market-intel"])
     app.include_router(system_router, prefix="/api/v1", tags=["system"])
-    app.include_router(system_stream_router, prefix="/api/v1", tags=["system"])
+    app.include_router(system_stream_router, prefix="/api/v1", tags=["system-stream"])
 
     return app
 
